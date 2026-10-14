@@ -1,4 +1,4 @@
-name: Publish to PyPI
+name: Publish packages
 
 # PyPI rejects pull_request_target. A main push starts the merge gate below;
 # only a commit associated with a merged PR can reach the publishing job.
@@ -75,3 +75,37 @@ jobs:
           merge-multiple: true
       - name: Publish tested distributions
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+
+  publish-image:
+    needs: [checks, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.checks.outputs.image-artifact-id }}
+          path: ${{ runner.temp }}/docker-image
+          merge-multiple: true
+      - name: Load the exact tested image
+        run: |
+          docker image load --input "$RUNNER_TEMP/docker-image/image.tar"
+          expected=$(cat "$RUNNER_TEMP/docker-image/image-id.txt")
+          actual=$(docker image inspect --format '{{.Id}}' ytclone:ci)
+          test "$actual" = "$expected"
+      - name: Authenticate to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Publish the versioned image
+        env:
+          VERSION: ${{ needs.checks.outputs.version }}
+        run: |
+          image="ghcr.io/alvassin/ytclone:$VERSION"
+          docker image tag ytclone:ci "$image"
+          docker image push "$image"
+          echo "Docker image: $image" >> "$GITHUB_STEP_SUMMARY"
+      - name: Sign out of GHCR
+        if: always()
+        run: docker logout ghcr.io

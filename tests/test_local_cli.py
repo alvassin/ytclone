@@ -1,9 +1,10 @@
-"""Exercise installed CLI modules and real workers against disposable local services."""
+"""Exercise installed CLI modules or a Docker image against local services."""
 
 import contextlib
 import io
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -26,6 +27,24 @@ NODE_COUNT = 5
 CLI_TIMEOUT = 180
 
 
+def stop_container(*, docker, container, environment):
+    """Stop only this invocation's container before stopping its Docker client."""
+    for arguments, timeout in (
+        (("stop", "--time", "30", container), 40),
+        (("rm", "--force", container), 10),
+    ):
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            subprocess.run(
+                args=[docker, *arguments],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+                check=False,
+            )
+
+
 def run_cli(*, module, source, destination, directory, name, extra=()):
     """Use a clean environment and bound both execution and cancellation."""
     log_file = directory / (name + ".log")
@@ -42,10 +61,7 @@ def run_cli(*, module, source, destination, directory, name, extra=()):
         "YT_TOKEN_PATH": str(directory / "unused-token"),
         "YT_CONFIG_PATCHES": "{enable_token=%false;proxy={retries={count=1;};};};",
     }
-    command = [
-        sys.executable,
-        "-m",
-        module,
+    arguments = [
         source,
         destination,
         "--yt-proxy",
@@ -67,6 +83,38 @@ def run_cli(*, module, source, destination, directory, name, extra=()):
         "1",
         *extra,
     ]
+    command = [sys.executable, "-m", module, *arguments]
+    image = os.environ.get("YTCLONE_DOCKER_IMAGE")
+    container = None
+    if image:
+        docker = shutil.which("docker")
+        assert docker is not None, "YTCLONE_DOCKER_IMAGE requires Docker"
+        container = "ytclone-cli-test-" + uuid.uuid4().hex
+        command = [
+            docker,
+            "run",
+            "--rm",
+            "--name",
+            container,
+            "--network",
+            "host",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "--mount",
+            f"type=bind,source={directory},target={directory}",
+            "--workdir",
+            str(directory),
+        ]
+        for key, value in environment.items():
+            if key != "PATH":  # Preserve the image's virtualenv PATH.
+                command.extend(("--env", key + "=" + value))
+        executable = "ytclone-parallel" if module == "ytclone.parallel" else "ytclone"
+        command.extend((image, executable, *arguments))
+        # Docker needs the user's context, but none of it enters the container.
+        environment = {"PATH": os.defpath}
+        if "HOME" in os.environ:
+            environment["HOME"] = os.environ["HOME"]
+
     process = subprocess.Popen(
         args=command,
         cwd=directory,
@@ -81,6 +129,8 @@ def run_cli(*, module, source, destination, directory, name, extra=()):
     try:
         output, _ = process.communicate(timeout=CLI_TIMEOUT)
     except BaseException as error:
+        if container is not None:
+            stop_container(docker=docker, container=container, environment=environment)
         # The supervisor handles SIGTERM and stops its own worker sessions.
         # Never signal pytest's process group or unrelated local processes.
         with contextlib.suppress(ProcessLookupError):

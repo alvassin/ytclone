@@ -14,6 +14,36 @@ copy. Use `ytclone --help` or `ytclone-parallel --help` for the full option list
 For local Docker YTsaurus, use `--yt-proxy http://localhost:8000` with
 `--no-proxy-discovery`. See [local integration tests](CONTRIBUTING.md#test-with-local-ytsaurus-and-s3).
 
+## Docker
+
+Choose a published version from [GHCR](https://github.com/alvassin/ytclone/pkgs/container/ytclone)
+and replace `VERSION` below. Images use Python 3.12 on Debian slim and support
+`linux/amd64`; Apple Silicon requires x86_64 emulation. Tags match PyPI versions;
+there is no `latest` tag.
+
+With the [access variables](README.md#quick-start) already exported:
+
+```bash
+IMAGE=ghcr.io/alvassin/ytclone:VERSION
+mkdir -p logs
+docker run --rm --name ytclone-copy --platform linux/amd64 --stop-timeout 30 \
+  --user "$(id -u):$(id -g)" -v "$PWD/logs:/logs" \
+  -e YT_PROXY -e YT_TOKEN -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+  -e AWS_SESSION_TOKEN -e AWS_DEFAULT_REGION -e S3_ENDPOINT \
+  "$IMAGE" ytclone-parallel //home/analytics/events s3://my-bucket/export \
+  --processes 2 --concurrency 2 --log-file /logs/export.log
+```
+
+Use `ytclone` instead of `ytclone-parallel` for ordinary copying or restore, with
+the same arguments as a local installation. `docker run --rm "$IMAGE"` prints
+help. The default container user is non-root (UID 10001); the example uses your
+host UID so it can write the mounted logs. Credentials are passed at runtime.
+
+Stop a running copy with `docker stop --time 30 ytclone-copy`. The image includes
+an init process to forward signals and reap children; the grace period allows
+the supervisor to stop its workers. The known [aiomisc shutdown limitation](CONTRIBUTING.md#run-checks)
+also occurs on Python 3.12; this Python version does not avoid it.
+
 ## Copying a subset
 
 To restore one table or file, point to its path inside the archive:

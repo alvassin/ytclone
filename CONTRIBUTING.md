@@ -70,21 +70,46 @@ exist. To stop the services while keeping containers and data:
 docker compose stop
 ```
 
+## Build and test the Docker image
+
+The Dockerfile installs a prebuilt wheel and runtime dependencies from `uv.lock`.
+Build into an empty temporary directory so stale wheels cannot enter the image:
+
+```bash
+context=$(mktemp -d)
+cp Dockerfile .dockerignore pyproject.toml uv.lock "$context/"
+uv build --out-dir "$context/dist"
+docker build --platform linux/amd64 -t ytclone:ci "$context"
+# With the disposable local services above running:
+YTCLONE_LOCAL_TESTS=1 YTCLONE_DOCKER_IMAGE=ytclone:ci \
+  uv run --locked pytest -s tests/test_local_cli.py
+```
+
+The Docker test uses host networking, supported by Linux Docker Engine and
+compatible desktop runtimes. It runs the image's two installed commands with real
+workers and retains logs in pytest's temporary directory. The image includes no
+build tools or dependency caches. Base images are pinned by digest; update the
+pins explicitly when taking upstream updates.
+
 ## CI and releases
 
 [`ci.yml`](.github/workflows/ci.yml) runs on pull requests and pushes to `main`.
 The shared checks run Ruff and the offline suite on Linux x86_64 and macOS ARM64
 with Python 3.10, 3.11, and 3.14. They build and validate wheel/sdist packages and
 run all local integration tests against an installed wheel on Linux with Python
-3.10 and 3.14.
+3.10 and 3.14. A separate Docker job tests both commands, export/restore and
+repeated runs, and limits the unpacked image size to 200 MiB.
 
 [`release.yml`](.github/workflows/release.yml) starts on pushes to `main` and
 publishes only when GitHub confirms that the exact commit belongs to a merged
 PR targeting this repository's `main`. This covers merge, squash, and rebase
 merges. Direct pushes without a matching merged PR skip publication; tag pushes
 do not start the workflow. The release reruns the checks for that exact commit
-and uploads the tested artifacts through PyPI Trusted Publishing. It uses the
-`push` event because PyPI forbids Trusted Publishing from `pull_request_target`.
+and uploads the tested distributions through PyPI Trusted Publishing. After
+PyPI succeeds, it loads the tested Docker image artifact, verifies its image ID,
+and publishes `ghcr.io/alvassin/ytclone:<version>` without rebuilding. Only the
+image publishing job has `packages: write`. It uses the `push` event because
+PyPI forbids Trusted Publishing from `pull_request_target`.
 
 Versions come from [`scripts/release_version.py`](scripts/release_version.py):
 the nearest `vMAJOR.MINOR.PATCH` tag on the first-parent history sets the base;
@@ -118,3 +143,9 @@ For the initial PyPI setup, create the GitHub environment `pypi` and configure a
 with project `ytclone`, owner `alvassin`, repository `ytclone`, workflow
 `release.yml`, and environment `pypi`. The first successful upload creates the
 PyPI project; no PyPI API token is needed in GitHub.
+
+After the first GHCR publication, set the `ytclone` package visibility to public
+in its package settings and verify an anonymous pull. GitHub creates new packages
+private by default. Only version tags are published, so concurrent releases
+cannot overwrite a shared `latest` tag. PyPI and GHCR publication are separate;
+if one fails, rerun the failed jobs.

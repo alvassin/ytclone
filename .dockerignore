@@ -1,0 +1,9 @@
+# Keep credentials, checkout history and development files out of the build context.
+**
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!uv.lock
+!dist/
+dist/**
+!dist/*.whl
