@@ -19,6 +19,8 @@ on:
         value: ${{ jobs.build.outputs.version }}
       artifact-id:
         value: ${{ jobs.build.outputs.artifact-id }}
+      image-artifact-id:
+        value: ${{ jobs.docker.outputs.artifact-id }}
 
 permissions:
   contents: read
@@ -137,6 +139,77 @@ jobs:
           PYTHONPATH: ""
         working-directory: ${{ runner.temp }}/smoke-tests
         run: '"$RUNNER_TEMP/installed/bin/python" -m pytest -q'
+      - name: Service diagnostics
+        if: failure()
+        run: docker compose logs --tail=100 yt s3
+      - name: Stop disposable local services
+        if: always()
+        run: docker compose down --volumes
+
+  docker:
+    name: Docker image (Linux amd64)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.12"
+          enable-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: dist
+          merge-multiple: true
+      - name: Build image from the wheel artifact
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          docker build --platform linux/amd64 \
+            --build-arg "VERSION=$VERSION" \
+            --build-arg "REVISION=$(git rev-parse HEAD)" \
+            --tag ytclone:ci .
+      - name: Check image version, size and commands
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          installed=$(docker run --rm ytclone:ci python -c \
+            'from importlib.metadata import version; print(version("ytclone"))')
+          test "$installed" = "$VERSION"
+          size=$(docker image inspect --format '{{.Size}}' ytclone:ci)
+          echo "Docker image size: $size bytes ($((size / 1024 / 1024)) MiB); limit: 200 MiB." >> "$GITHUB_STEP_SUMMARY"
+          test "$size" -le 209715200
+          docker run --rm ytclone:ci
+          docker run --rm ytclone:ci ytclone --help
+          docker run --rm ytclone:ci ytclone-parallel --help
+      - name: Install integration test dependencies
+        run: uv sync --locked --group dev
+      - name: Start disposable local services
+        run: docker compose up -d --wait --wait-timeout 360 yt s3
+      - name: Export and restore through the Docker image
+        env:
+          YTCLONE_LOCAL_TESTS: "1"
+          YTCLONE_DOCKER_IMAGE: ytclone:ci
+        run: uv run --locked pytest -q tests/test_local_cli.py
+      - name: Save the tested image
+        run: |
+          mkdir "$RUNNER_TEMP/docker-image"
+          docker image save --output "$RUNNER_TEMP/docker-image/image.tar" ytclone:ci
+          docker image inspect --format '{{.Id}}' ytclone:ci > "$RUNNER_TEMP/docker-image/image-id.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        id: upload
+        with:
+          name: docker-image
+          path: ${{ runner.temp }}/docker-image/*
+          if-no-files-found: error
+          retention-days: 7
       - name: Service diagnostics
         if: failure()
         run: docker compose logs --tail=100 yt s3
