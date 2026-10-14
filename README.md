@@ -20,7 +20,7 @@ Requires **CPython 3.10+** on **Linux x86_64 with glibc** or **macOS ARM64**
 for them.
 
 Docker images include both commands and use the same version numbers as PyPI.
-See [running with Docker](USAGE.md#docker) for commands (`linux/amd64` only).
+See [running with Docker](https://github.com/alvassin/ytclone/blob/main/USAGE.md#docker) for commands (`linux/amd64` only).
 
 ## Quick start
 
