@@ -78,10 +78,13 @@ with Python 3.10, 3.11, and 3.14. They build and validate wheel/sdist packages a
 run all local integration tests against an installed wheel on Linux with Python
 3.10 and 3.14.
 
-[`release.yml`](.github/workflows/release.yml) publishes only after a pull request
-is merged into `main`. It reruns the checks for that exact merged commit and
-uploads the tested artifacts through PyPI Trusted Publishing. Direct pushes and
-tag pushes do not publish packages.
+[`release.yml`](.github/workflows/release.yml) starts on pushes to `main` and
+publishes only when GitHub confirms that the exact commit belongs to a merged
+PR targeting this repository's `main`. This covers merge, squash, and rebase
+merges. Direct pushes without a matching merged PR skip publication; tag pushes
+do not start the workflow. The release reruns the checks for that exact commit
+and uploads the tested artifacts through PyPI Trusted Publishing. It uses the
+`push` event because PyPI forbids Trusted Publishing from `pull_request_target`.
 
 Versions come from [`scripts/release_version.py`](scripts/release_version.py):
 the nearest `vMAJOR.MINOR.PATCH` tag on the first-parent history sets the base;
