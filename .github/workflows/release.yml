@@ -1,49 +1,61 @@
 name: Publish to PyPI
 
-# A closed, merged PR covers merge commits, squash merges and rebase merges.
-# Direct pushes and tag creation never publish.
+# PyPI rejects pull_request_target. A main push starts the merge gate below;
+# only a commit associated with a merged PR can reach the publishing job.
 on:
-  pull_request_target:
+  push:
     branches: [main]
-    types: [closed]
 
 permissions:
   contents: read
 
 concurrency:
-  group: pypi-${{ github.event.pull_request.merge_commit_sha || github.run_id }}
+  group: pypi-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
   merged-commit:
-    if: github.repository == 'alvassin/ytclone' && github.event.pull_request.merged == true
+    if: github.repository == 'alvassin/ytclone'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       sha: ${{ steps.verify.outputs.sha }}
     steps:
-      # Never check out the PR head in a pull_request_target workflow.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: refs/heads/main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Verify that the commit was merged into main
         id: verify
         env:
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           git rev-list --first-parent origin/main > "$RUNNER_TEMP/main-commits"
-          grep -Fx "$MERGE_SHA" "$RUNNER_TEMP/main-commits"
-          echo "sha=$MERGE_SHA" >> "$GITHUB_OUTPUT"
+          grep -Fx "$GITHUB_SHA" "$RUNNER_TEMP/main-commits"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            > "$RUNNER_TEMP/pulls.json"
+          merged=$(jq -r --arg sha "$GITHUB_SHA" --arg repo "$GITHUB_REPOSITORY" \
+            'any(.[][]; .merged_at != null and .base.ref == "main" and
+              .base.repo.full_name == $repo and .merge_commit_sha == $sha)' \
+            "$RUNNER_TEMP/pulls.json")
+          if [[ "$merged" != "true" ]]; then
+            echo "Skipped: this commit is not a merged PR into main." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
   checks:
     needs: merged-commit
+    if: needs.merged-commit.outputs.sha != ''
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ needs.merged-commit.outputs.sha }}
       require-tag: true
-      verified-merge: true
 
   publish:
     needs: checks
