@@ -1,0 +1,38 @@
+[project]
+name = "ytclone"
+version = "0.1.0"
+description = "Resumable copying of YTsaurus tables, files and directories to and from S3"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Alexander Vasin", email = "hi@alvass.in" }
+]
+requires-python = ">=3.10"
+# Native ytsaurus-yson wheels limit support to Linux x86_64 (glibc)
+# and macOS ARM64. See README.md for installation requirements.
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+]
+dependencies = [
+    "aiochannel>=1.3,<2",
+    "aiohttp>=3.14.3,<4",
+    "aiohttp-s3-client>=1.0.14,<2",
+    "aiomisc>=17.10.3,<19",
+    "argclass>=1.11.1,<2",
+    "ytsaurus-client>=0.13.54,<0.14",
+    "ytsaurus-yson>=0.4.10,<0.5",
+    "zstandard>=0.25.0,<1",
+]
+
+[project.scripts]
+ytclone = "ytclone:main"
+ytclone-parallel = "ytclone.parallel.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.16"]

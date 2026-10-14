@@ -1,0 +1,61 @@
+name: ytclone
+
+services:
+  yt:
+    # Official stable image, pinned for comparable runs; currently amd64-only.
+    image: ghcr.io/ytsaurus/local@sha256:6f0991f7c85b4824bebead742fa4d752c3508532c013ffcb778a1b14c0b50b22
+    platform: linux/amd64
+    hostname: yt
+    environment:
+      YT_FORCE_IPV4: "1"
+      YT_FORCE_IPV6: "0"
+      YT_USE_HOSTS: "0"
+      YTSERVER_ALL_PATH: /usr/bin/ytserver-all
+      YT_LOCAL_ROOT_PATH: /tmp
+    command:
+      - --fqdn
+      - yt
+      - --proxy-config
+      - '{coordinator={public_fqdn="yt:80"};}'
+      - --address-resolver-config
+      - '{enable_ipv4=%true;enable_ipv6=%false;}'
+      - --node-count
+      - "1"
+    ports:
+      - "127.0.0.1:8000:80"
+    healthcheck:
+      test: ["CMD", "yt", "--proxy", "http://localhost:80", "get", "//sys/@id"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+    stop_grace_period: 30s
+
+  s3:
+    # SeaweedFS 4.48, including its multi-architecture image index.
+    image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    command: ["mini", "-dir=/data", "-ip=s3", "-master.telemetry=false"]
+    environment:
+      AWS_ACCESS_KEY_ID: local-bench
+      AWS_SECRET_ACCESS_KEY: local-bench-secret
+      S3_BUCKET: yt-backup
+    ports:
+      - "127.0.0.1:8333:8333"
+    volumes:
+      - s3-data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent --head
+          --aws-sigv4 aws:amz:us-east-1:s3
+          --user "$${AWS_ACCESS_KEY_ID}:$${AWS_SECRET_ACCESS_KEY}"
+          http://localhost:8333/yt-backup > /dev/null
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    stop_grace_period: 30s
+
+volumes:
+  s3-data:
