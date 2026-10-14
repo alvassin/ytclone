@@ -1,4 +1,4 @@
-"""Exercise installed CLI modules or a Docker image against local services."""
+"""Exercise installed, Docker or portable CLI commands against local services."""
 
 import contextlib
 import io
@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import uuid
+from pathlib import Path
 
 import pytest
 import yt.wrapper as sdk
@@ -85,6 +86,15 @@ def run_cli(*, module, source, destination, directory, name, extra=()):
     ]
     command = [sys.executable, "-m", module, *arguments]
     image = os.environ.get("YTCLONE_DOCKER_IMAGE")
+    portable = os.environ.get("YTCLONE_PORTABLE_DIR")
+    assert not (image and portable), (
+        "Choose either YTCLONE_DOCKER_IMAGE or YTCLONE_PORTABLE_DIR"
+    )
+    executable = "ytclone-parallel" if module == "ytclone.parallel" else "ytclone"
+    if portable:
+        binary = Path(portable).absolute() / executable
+        assert binary.is_file() and os.access(binary, os.X_OK), binary
+        command = [str(binary), *arguments]
     container = None
     if image:
         docker = shutil.which("docker")
@@ -108,7 +118,6 @@ def run_cli(*, module, source, destination, directory, name, extra=()):
         for key, value in environment.items():
             if key != "PATH":  # Preserve the image's virtualenv PATH.
                 command.extend(("--env", key + "=" + value))
-        executable = "ytclone-parallel" if module == "ytclone.parallel" else "ytclone"
         command.extend((image, executable, *arguments))
         # Docker needs the user's context, but none of it enters the container.
         environment = {"PATH": os.defpath}

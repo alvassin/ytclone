@@ -109,3 +109,79 @@ jobs:
       - name: Sign out of GHCR
         if: always()
         run: docker logout ghcr.io
+
+  publish-release:
+    needs: [merged-commit, checks, publish-image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.checks.outputs.version }}
+      MERGED_SHA: ${{ needs.merged-commit.outputs.sha }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.checks.outputs.portable-linux-artifact-id }},${{ needs.checks.outputs.portable-macos-artifact-id }}
+          path: ${{ runner.temp }}/portable-release
+          merge-multiple: true
+      - name: Verify the tested archives
+        working-directory: ${{ runner.temp }}/portable-release
+        run: |
+          test "$MERGED_SHA" = "$GITHUB_SHA"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          for platform in linux-x86_64 macos-arm64; do
+            archive="ytclone-$VERSION-$platform.tar.gz"
+            test -s "$archive"
+            test -s "$archive.sha256"
+            sha256sum --check "$archive.sha256"
+          done
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 4
+      - name: Create or verify the release tag
+        run: |
+          # Only vMAJOR.MINOR.PATCH tags select the version baseline.
+          # Artifact release tags must not reset the commit-counting scheme.
+          tag="release-$VERSION"
+          ref="refs/tags/$tag"
+          gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
+            > "$RUNNER_TEMP/release-refs.json"
+          existing=$(jq -c --arg ref "$ref" \
+            '.[] | select(.ref == $ref)' "$RUNNER_TEMP/release-refs.json")
+          if [[ -z "$existing" ]]; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=$ref" -f "sha=$MERGED_SHA" > "$RUNNER_TEMP/release-ref.json"
+          else
+            printf '%s' "$existing" > "$RUNNER_TEMP/release-ref.json"
+          fi
+          # Never move an existing tag, including an unrelated annotated tag.
+          jq --exit-status --arg sha "$MERGED_SHA" \
+            '.object.type == "commit" and .object.sha == $sha' \
+            "$RUNNER_TEMP/release-ref.json"
+      - name: Publish the exact tested archives
+        working-directory: ${{ runner.temp }}/portable-release
+        run: |
+          tag="release-$VERSION"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" \
+            > "$RUNNER_TEMP/releases.json"
+          release=$(jq -c --arg tag "$tag" \
+            '.[][] | select(.tag_name == $tag)' "$RUNNER_TEMP/releases.json")
+          if [[ -n "$release" ]] && [[ "$(jq -r .draft <<< "$release")" == "false" ]]; then
+            # A retry may verify public assets, but must never replace them.
+            mkdir "$RUNNER_TEMP/published-assets"
+            for asset in ./*; do
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+                --pattern "$(basename "$asset")" --dir "$RUNNER_TEMP/published-assets"
+              cmp "$asset" "$RUNNER_TEMP/published-assets/$(basename "$asset")"
+            done
+          else
+            if [[ -z "$release" ]]; then
+              gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+                --verify-tag --target "$MERGED_SHA" --draft --latest=false \
+                --title "ytclone $VERSION" \
+                --notes "Standalone archives include Python and both ytclone commands. Extract the archive and run ./ytclone --help or ./ytclone-parallel --help. Linux x86_64 requires glibc 2.28 or newer; macOS ARM64 requires macOS 14 or newer. SHA256 checksums are provided alongside the archives."
+            fi
+            gh release upload "$tag" ./* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
+          fi
+          echo "Portable release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"

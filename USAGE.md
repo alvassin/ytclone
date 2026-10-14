@@ -14,6 +14,30 @@ copy. Use `ytclone --help` or `ytclone-parallel --help` for the full option list
 For local Docker YTsaurus, use `--yt-proxy http://localhost:8000` with
 `--no-proxy-discovery`. See [local integration tests](CONTRIBUTING.md#test-with-local-ytsaurus-and-s3).
 
+## Standalone downloads
+
+Download an archive and its matching `.tar.gz.sha256` file from
+[GitHub Releases](https://github.com/alvassin/ytclone/releases):
+`linux-x86_64` requires glibc 2.28 or newer; `macos-arm64` requires macOS 14 or
+newer on Apple Silicon. No installed Python or Docker is needed.
+
+Replace `VERSION` and `PLATFORM` with the downloaded archive's values, then verify
+and unpack it from the directory containing both downloaded files:
+
+```bash
+archive=ytclone-VERSION-PLATFORM.tar.gz
+sha256sum -c "$archive.sha256"
+tar -xzf "$archive"
+./ytclone-VERSION-PLATFORM/ytclone --help
+./ytclone-VERSION-PLATFORM/ytclone-parallel --help
+```
+
+On macOS, use `shasum -a256` instead of `sha256sum`. Keep the extracted directory
+intact: both commands share its `_internal` libraries. Use the same credentials
+and arguments as the PyPI commands. The macOS build is ad-hoc signed, without
+Apple Developer signing or notarization; macOS may require approval before its
+first launch.
+
 ## Docker
 
 Choose a published version from [GHCR](https://github.com/alvassin/ytclone/pkgs/container/ytclone)
