@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from importlib.metadata import version
 from types import SimpleNamespace
 
 import pytest
@@ -489,7 +490,40 @@ raise SystemExit(worker.main())
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
             assert b"active_copy_cleanup" in stderr
             assert not stdout
-            assert process.returncode == 130
+            dependency_version = version("aiomisc")
+            # aiomisc 18.0.33 cancels its own shutdown task in Runner.close()
+            # and reports a false 60-second timeout after cleanup already ran.
+            # Keep cleanup, protocol and termination checks mandatory; only
+            # this known dependency diagnostic is an expected failure.
+            if (
+                dependency_version == "18.0.33"
+                and process.returncode == 70
+                and b"aiomisc.entrypoint:Shutdown did not happen in 60.0 seconds, aborting."
+                in stderr
+                and b"Traceback (most recent call last)" not in stderr
+            ):
+                pytest.xfail(
+                    "aiomisc 18.0.33 reports a false shutdown timeout after cleanup"
+                )
+            # On Linux/Python 3.10, aiomisc 17.10.3 can stop the loop
+            # while its context manager is still awaiting shutdown.
+            if (
+                dependency_version == "17.10.3"
+                and sys.platform == "linux"
+                and sys.version_info[:2] == (3, 10)
+                and signal_name == "SIGINT"
+                and process.returncode == 1
+                and b"/aiomisc/entrypoint.py" in stderr
+                and b"loop.run_until_complete(self.__aexit__(exc_type, exc_val, exc_tb))"
+                in stderr
+                and stderr.rstrip().endswith(
+                    b"RuntimeError: Event loop stopped before Future completed."
+                )
+            ):
+                pytest.xfail(
+                    "aiomisc 17.10.3 stops its loop during SIGINT shutdown on Python 3.10"
+                )
+            assert process.returncode == 130, stderr.decode(errors="replace")
         finally:
             if process.returncode is None:
                 process.kill()

@@ -32,6 +32,14 @@ The offline suite uses in-memory fakes, local HTTP servers, and subprocesses. It
 needs no YTsaurus or S3 services or credentials. The six local integration cases
 are skipped unless explicitly enabled.
 
+Known limitation: aiomisc can exit incorrectly after coroutine cleanup completes.
+Version 18.0.33 reports a false shutdown timeout and exits 70 on SIGINT/SIGTERM;
+17.10.3 on Linux/Python 3.10 can exit 1 on SIGINT because it stops the event loop
+before shutdown finishes. The signal test marks only these exact versions,
+exit codes, and diagnostics as expected failures (`xfail`), after checking
+cleanup, protocol output, and timely process exit. Other failures still fail CI;
+the dependency fix is deferred.
+
 ## Test with local YTsaurus and S3
 
 Docker Compose provides YTsaurus on `http://localhost:8000` and an S3-compatible
