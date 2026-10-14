@@ -1,0 +1,65 @@
+name: Publish to PyPI
+
+# A closed, merged PR covers merge commits, squash merges and rebase merges.
+# Direct pushes and tag creation never publish.
+on:
+  pull_request_target:
+    branches: [main]
+    types: [closed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-${{ github.event.pull_request.merge_commit_sha || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  merged-commit:
+    if: github.repository == 'alvassin/ytclone' && github.event.pull_request.merged == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.verify.outputs.sha }}
+    steps:
+      # Never check out the PR head in a pull_request_target workflow.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify that the commit was merged into main
+        id: verify
+        env:
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          git rev-list --first-parent origin/main > "$RUNNER_TEMP/main-commits"
+          grep -Fx "$MERGE_SHA" "$RUNNER_TEMP/main-commits"
+          echo "sha=$MERGE_SHA" >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: merged-commit
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.merged-commit.outputs.sha }}
+      require-tag: true
+      verified-merge: true
+
+  publish:
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ytclone/${{ needs.checks.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      # Download only the artifact built and tested by this workflow run.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.checks.outputs.artifact-id }}
+          path: dist
+          merge-multiple: true
+      - name: Publish tested distributions
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1

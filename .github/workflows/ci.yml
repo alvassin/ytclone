@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact merged commit to validate
+        type: string
+        required: true
+      require-tag:
+        type: boolean
+        default: false
+      verified-merge:
+        description: Release gate verified this commit in main's first-parent history
+        type: boolean
+        default: false
+    outputs:
+      version:
+        value: ${{ jobs.build.outputs.version }}
+      artifact-id:
+        value: ${{ jobs.build.outputs.artifact-id }}
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.12.19"
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+        python: ["3.10", "3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+          # checkout v7 also guards already-merged fork PRs. Only the release
+          # gate may opt in, after verifying the commit belongs to main.
+          allow-unsafe-pr-checkout: ${{ inputs.verified-merge && github.event.pull_request.merged == true && inputs.ref == github.event.pull_request.merge_commit_sha }}
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python }}
+          enable-cache: false
+      - run: uv sync --locked --group dev
+      - name: Lint
+        if: matrix.os == 'ubuntu-24.04' && matrix.python == '3.10'
+        run: |
+          uv run --locked ruff check src tests scripts
+          uv run --locked ruff format --check src tests scripts
+      - name: Offline tests
+        env:
+          YTCLONE_LOCAL_TESTS: "0"
+        run: uv run --locked pytest -q -rx
+
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ inputs.verified-merge && github.event.pull_request.merged == true && inputs.ref == github.event.pull_request.merge_commit_sha }}
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.10"
+          enable-cache: false
+      - name: Calculate version
+        id: version
+        env:
+          REQUIRE_TAG: ${{ inputs.require-tag || false }}
+        run: |
+          args=()
+          if [[ "$REQUIRE_TAG" == "true" ]]; then args+=(--require-tag); fi
+          version=$(python scripts/release_version.py "${args[@]}")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          uv version --frozen "$version"
+          echo "Package version: $version" >> "$GITHUB_STEP_SUMMARY"
+      - name: Build and check distributions
+        run: |
+          uv build --out-dir "$RUNNER_TEMP/dist"
+          uvx --from twine==7.0.0 twine check --strict "$RUNNER_TEMP/dist/"*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        id: upload
+        with:
+          name: distributions
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  integration:
+    name: Installed wheel (Python ${{ matrix.python }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ inputs.verified-merge && github.event.pull_request.merged == true && inputs.ref == github.event.pull_request.merge_commit_sha }}
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python }}
+          enable-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/dist
+          merge-multiple: true
+      - name: Install wheel in a clean environment
+        run: |
+          uv venv "$RUNNER_TEMP/installed"
+          uv pip install --python "$RUNNER_TEMP/installed/bin/python" "$RUNNER_TEMP/dist/"*.whl pytest
+          "$RUNNER_TEMP/installed/bin/ytclone" --help
+          "$RUNNER_TEMP/installed/bin/ytclone-parallel" --help
+          mkdir "$RUNNER_TEMP/smoke-tests"
+          cp tests/test_local.py tests/test_local_cli.py "$RUNNER_TEMP/smoke-tests/"
+      - name: Start disposable local services
+        run: docker compose up -d --wait --wait-timeout 360 yt s3
+      - name: Export and restore through the installed wheel
+        env:
+          YTCLONE_LOCAL_TESTS: "1"
+          PYTHONPATH: ""
+        working-directory: ${{ runner.temp }}/smoke-tests
+        run: '"$RUNNER_TEMP/installed/bin/python" -m pytest -q'
+      - name: Service diagnostics
+        if: failure()
+        run: docker compose logs --tail=100 yt s3
+      - name: Stop disposable local services
+        if: always()
+        run: docker compose down --volumes
