@@ -19,6 +19,10 @@ Requires **CPython 3.10+** on **Linux x86_64 with glibc** or **macOS ARM64**
 [`ytsaurus-yson`](https://pypi.org/project/ytsaurus-yson/) dependency has no wheels
 for them.
 
+Standalone archives include both commands and need no installed Python or Docker.
+See [standalone downloads](https://github.com/alvassin/ytclone/blob/main/USAGE.md#standalone-downloads)
+for Linux x86_64 and macOS ARM64.
+
 Docker images include both commands and use the same version numbers as PyPI.
 See [running with Docker](https://github.com/alvassin/ytclone/blob/main/USAGE.md#docker) for commands (`linux/amd64` only).
 

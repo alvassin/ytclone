@@ -36,3 +36,4 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.16"]
+portable = ["pyinstaller==6.22.3"]

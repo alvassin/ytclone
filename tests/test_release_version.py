@@ -120,6 +120,7 @@ def test_multiple_tags_on_same_commit_are_rejected(repo):
         "v1.2.0-rc.1",
         "v1.2.0+build",
         "snapshot",
+        "release-9.0.0",
     ],
 )
 def test_nonrelease_tags_are_ignored(repo, tag):

@@ -24,8 +24,8 @@ Run the complete offline suite and lint checks:
 
 ```bash
 YTCLONE_LOCAL_TESTS=0 uv run --locked pytest
-uv run --locked ruff check src tests scripts
-uv run --locked ruff format --check src tests scripts
+uv run --locked ruff check src tests scripts packaging
+uv run --locked ruff format --check src tests scripts packaging
 ```
 
 The offline suite uses in-memory fakes, local HTTP servers, and subprocesses. It
@@ -91,6 +91,48 @@ workers and retains logs in pytest's temporary directory. The image includes no
 build tools or dependency caches. Base images are pinned by digest; update the
 pins explicitly when taking upstream updates.
 
+## Build standalone archives
+
+Portable builds use CPython 3.14 and PyInstaller from the locked `portable`
+dependency group. Install the wheel into a separate environment so the bundle
+contains that exact package, rather than the editable checkout. For the local
+development version:
+
+```bash
+build_dir=$(mktemp -d)
+uv build --wheel --out-dir "$build_dir/wheels"
+uv export --locked --no-dev --group portable --no-emit-project \
+  --output-file "$build_dir/requirements.txt"
+uv venv --python 3.14 "$build_dir/venv"
+uv pip install --python "$build_dir/venv/bin/python" --require-hashes \
+  -r "$build_dir/requirements.txt"
+uv pip install --python "$build_dir/venv/bin/python" --no-deps "$build_dir"/wheels/*.whl
+"$build_dir/venv/bin/python" scripts/build_portable.py \
+  --version 0.1.0 --output-dir "$build_dir/dist"
+```
+
+Build separately on each target platform. CI uses [`packaging/Dockerfile`](packaging/Dockerfile), with shared Python
+on `manylinux_2_28_x86_64`, to set the Linux glibc baseline and macOS 14 ARM64 for Apple Silicon. Building on a newer
+Linux system does not preserve the published glibc 2.28 compatibility promise.
+Each archive contains one executable, a `ytclone-parallel` symlink, and shared
+`_internal` libraries; it is accompanied by a `.tar.gz.sha256` file. macOS builds
+use ad-hoc signing, without an Apple Developer certificate or notarization.
+
+Extract the archive, then check its runtime and worker lifecycle:
+
+```bash
+uv run --locked python scripts/check_portable.py \
+  --bundle /path/to/extracted/ytclone-VERSION-PLATFORM \
+  --version VERSION
+# With the disposable local services above running:
+YTCLONE_LOCAL_TESTS=1 YTCLONE_PORTABLE_DIR=/path/to/extracted/ytclone-VERSION-PLATFORM \
+  uv run --locked pytest -s tests/test_local_cli.py
+```
+
+The offline check covers both commands, native codecs, TLS certificates, worker
+protocol and shutdown. Linux CI also runs the full CLI roundtrip against the
+extracted bundle; the known aiomisc shutdown exception is checked explicitly.
+
 ## CI and releases
 
 [`ci.yml`](.github/workflows/ci.yml) runs on pull requests and pushes to `main`.
@@ -98,7 +140,8 @@ The shared checks run Ruff and the offline suite on Linux x86_64 and macOS ARM64
 with Python 3.10, 3.11, and 3.14. They build and validate wheel/sdist packages and
 run all local integration tests against an installed wheel on Linux with Python
 3.10 and 3.14. A separate Docker job tests both commands, export/restore and
-repeated runs, and limits the unpacked image size to 200 MiB.
+repeated runs, and limits the unpacked image size to 200 MiB. Standalone jobs
+build and check Linux x86_64 and macOS ARM64 archives from the same wheel.
 
 [`release.yml`](.github/workflows/release.yml) starts on pushes to `main` and
 publishes only when GitHub confirms that the exact commit belongs to a merged
@@ -110,6 +153,13 @@ PyPI succeeds, it loads the tested Docker image artifact, verifies its image ID,
 and publishes `ghcr.io/alvassin/ytclone:<version>` without rebuilding. Only the
 image publishing job has `packages: write`. It uses the `push` event because
 PyPI forbids Trusted Publishing from `pull_request_target`.
+
+After PyPI and GHCR succeed, the workflow creates a GitHub Release at the exact
+merged commit and uploads the two tested standalone archives and their SHA256
+files. Assets are prepared in a draft before publication. Its `release-VERSION`
+tag does not affect the `vMAJOR.MINOR.PATCH` version baselines below. Published
+assets are never overwritten; a retry verifies that their bytes match. Releases
+do not automatically change GitHub's `latest` designation.
 
 Versions come from [`scripts/release_version.py`](scripts/release_version.py):
 the nearest `vMAJOR.MINOR.PATCH` tag on the first-parent history sets the base;
@@ -136,7 +186,7 @@ git push origin v0.2.0
 Use `v1.0.0` for a new major series. The next PR merge publishes the next computed
 version. Build jobs stamp that version in their checkout; the committed
 `pyproject.toml` version stays `0.1.0` for local development. No automatic version
-commits or patch tags are created.
+commits or `vMAJOR.MINOR.PATCH` patch tags are created.
 
 For the initial PyPI setup, create the GitHub environment `pypi` and configure a
 [pending publisher](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)
@@ -147,5 +197,5 @@ PyPI project; no PyPI API token is needed in GitHub.
 After the first GHCR publication, set the `ytclone` package visibility to public
 in its package settings and verify an anonymous pull. GitHub creates new packages
 private by default. Only version tags are published, so concurrent releases
-cannot overwrite a shared `latest` tag. PyPI and GHCR publication are separate;
-if one fails, rerun the failed jobs.
+cannot overwrite a shared `latest` tag. PyPI, GHCR, and GitHub Releases are
+separate publication steps; if one fails, rerun the failed jobs.

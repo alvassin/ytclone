@@ -21,6 +21,10 @@ on:
         value: ${{ jobs.build.outputs.artifact-id }}
       image-artifact-id:
         value: ${{ jobs.docker.outputs.artifact-id }}
+      portable-linux-artifact-id:
+        value: ${{ jobs.portable-linux.outputs.artifact-id }}
+      portable-macos-artifact-id:
+        value: ${{ jobs.portable-macos.outputs.artifact-id }}
 
 permissions:
   contents: read
@@ -52,8 +56,8 @@ jobs:
       - name: Lint
         if: matrix.os == 'ubuntu-24.04' && matrix.python == '3.10'
         run: |
-          uv run --locked ruff check src tests scripts
-          uv run --locked ruff format --check src tests scripts
+          uv run --locked ruff check src tests scripts packaging
+          uv run --locked ruff format --check src tests scripts packaging
       - name: Offline tests
         env:
           YTCLONE_LOCAL_TESTS: "0"
@@ -216,3 +220,141 @@ jobs:
       - name: Stop disposable local services
         if: always()
         run: docker compose down --volumes
+
+  portable-linux:
+    name: Portable archive (Linux x86_64)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.14"
+          enable-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/dist
+          merge-multiple: true
+      - name: Build from the wheel with a glibc 2.28 baseline
+        run: |
+          uv export --locked --no-dev --group portable --no-emit-project \
+            --output-file "$RUNNER_TEMP/portable-requirements.txt"
+          mkdir "$RUNNER_TEMP/portable"
+          docker build --platform linux/amd64 --file packaging/Dockerfile \
+            --tag ytclone-portable-builder packaging
+          docker run --rm --platform linux/amd64 --env VERSION \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/source,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/dist,target=/wheels,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/portable-requirements.txt,target=/requirements.txt,readonly" \
+            --mount "type=bind,source=$RUNNER_TEMP/portable,target=/output" \
+            ytclone-portable-builder /bin/bash -euo pipefail -c '
+              uv venv --python 3.14.7 /tmp/portable-env
+              python=/tmp/portable-env/bin/python
+              uv pip install --python "$python" --require-hashes --no-build \
+                --requirements /requirements.txt
+              uv pip install --python "$python" --no-deps /wheels/*.whl
+              uv pip check --python "$python"
+              "$python" /source/scripts/build_portable.py --version "$VERSION" --output-dir /output
+              mkdir /tmp/extracted
+              tar -xzf "/output/ytclone-$VERSION-linux-x86_64.tar.gz" -C /tmp/extracted
+              "$python" /source/scripts/check_portable.py \
+                --bundle "/tmp/extracted/ytclone-$VERSION-linux-x86_64" --version "$VERSION"
+            '
+      - name: Check the extracted archive
+        run: |
+          cd "$RUNNER_TEMP/portable"
+          sha256sum --check "ytclone-$VERSION-linux-x86_64.tar.gz.sha256"
+          mkdir "$RUNNER_TEMP/extracted"
+          tar -xzf "ytclone-$VERSION-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/extracted"
+          python "$GITHUB_WORKSPACE/scripts/check_portable.py" \
+            --bundle "$RUNNER_TEMP/extracted/ytclone-$VERSION-linux-x86_64" --version "$VERSION"
+          echo "Linux portable archive: $(wc -c < "ytclone-$VERSION-linux-x86_64.tar.gz") bytes." >> "$GITHUB_STEP_SUMMARY"
+      - name: Install integration test dependencies
+        run: uv sync --locked --group dev
+      - name: Start disposable local services
+        run: docker compose up -d --wait --wait-timeout 360 yt s3
+      - name: Export and restore through the portable commands
+        env:
+          YTCLONE_LOCAL_TESTS: "1"
+          YTCLONE_PORTABLE_DIR: ${{ runner.temp }}/extracted/ytclone-${{ needs.build.outputs.version }}-linux-x86_64
+        run: uv run --locked pytest -q tests/test_local_cli.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        id: upload
+        with:
+          name: portable-linux-x86_64
+          path: |
+            ${{ runner.temp }}/portable/*.tar.gz
+            ${{ runner.temp }}/portable/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+      - name: Service diagnostics
+        if: failure()
+        run: docker compose logs --tail=100 yt s3
+      - name: Stop disposable local services
+        if: always()
+        run: docker compose down --volumes
+
+  portable-macos:
+    name: Portable archive (macOS ARM64)
+    needs: build
+    runs-on: macos-14
+    timeout-minutes: 20
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.14"
+          enable-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/dist
+          merge-multiple: true
+      - name: Build from the wheel with locked dependencies
+        run: |
+          uv export --locked --no-dev --group portable --no-emit-project \
+            --output-file "$RUNNER_TEMP/portable-requirements.txt"
+          uv venv "$RUNNER_TEMP/portable-env"
+          python="$RUNNER_TEMP/portable-env/bin/python"
+          uv pip install --python "$python" --require-hashes --no-build \
+            --requirements "$RUNNER_TEMP/portable-requirements.txt"
+          uv pip install --python "$python" --no-deps "$RUNNER_TEMP/dist/"*.whl
+          uv pip check --python "$python"
+          "$python" scripts/build_portable.py --version "$VERSION" --output-dir "$RUNNER_TEMP/portable"
+      - name: Check the extracted archive
+        run: |
+          cd "$RUNNER_TEMP/portable"
+          shasum --algorithm 256 --check "ytclone-$VERSION-macos-arm64.tar.gz.sha256"
+          mkdir "$RUNNER_TEMP/extracted"
+          tar -xzf "ytclone-$VERSION-macos-arm64.tar.gz" -C "$RUNNER_TEMP/extracted"
+          python "$GITHUB_WORKSPACE/scripts/check_portable.py" \
+            --bundle "$RUNNER_TEMP/extracted/ytclone-$VERSION-macos-arm64" --version "$VERSION"
+          echo "macOS portable archive: $(wc -c < "ytclone-$VERSION-macos-arm64.tar.gz") bytes." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        id: upload
+        with:
+          name: portable-macos-arm64
+          path: |
+            ${{ runner.temp }}/portable/*.tar.gz
+            ${{ runner.temp }}/portable/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
