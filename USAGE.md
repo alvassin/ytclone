@@ -17,7 +17,7 @@ For local Docker YTsaurus, use `--yt-proxy http://localhost:8000` with
 ## Docker
 
 Choose a published version from [GHCR](https://github.com/alvassin/ytclone/pkgs/container/ytclone)
-and replace `VERSION` below. Images use Python 3.12 on Debian slim and support
+and replace `VERSION` below. Images use Python 3.14 on Debian slim and support
 `linux/amd64`; Apple Silicon requires x86_64 emulation. Tags match PyPI versions;
 there is no `latest` tag.
 
@@ -42,7 +42,7 @@ host UID so it can write the mounted logs. Credentials are passed at runtime.
 Stop a running copy with `docker stop --time 30 ytclone-copy`. The image includes
 an init process to forward signals and reap children; the grace period allows
 the supervisor to stop its workers. The known [aiomisc shutdown limitation](CONTRIBUTING.md#run-checks)
-also occurs on Python 3.12; this Python version does not avoid it.
+also occurs on Python 3.14 with aiomisc 18.0.33.
 
 ## Copying a subset
 
