@@ -111,18 +111,31 @@ def _attributes(*, client, path: str, names: list[bytes]) -> dict:
     return yson.loads(string=data, encoding=None).attributes
 
 
-def _resolve(*, client, path: str, create_parents: bool = False) -> str:
-    """Resolve through parent IDs, never through a link in any path component."""
+def _resolve_node(*, client, path: str) -> str:
+    """Return an existing node ID without following links in any path component."""
+    components = path_components(path)
+
+    # Suppress links in every component without reading ancestor nodes.
+    # _attributes adds the final '&'; subsequent requests use the returned ID.
+    attrs = _attributes(
+        client=client,
+        path="//" + "&/".join(components),
+        names=[b"id", b"type"],
+    )
+    return "#" + _text(attrs[b"id"])
+
+
+def _ensure_directory(*, client, path: str) -> str:
+    """Create missing directories without following links and return the final ID."""
     components = path_components(path)
     parent = "/"
     for index, component in enumerate(components):
         current = parent + "/" + component if parent != "/" else "//" + component
-        if create_parents:
-            client.create(type="map_node", path=current, ignore_existing=True)
+        client.create(type="map_node", path=current, ignore_existing=True)
 
         attrs = _attributes(client=client, path=current, names=[b"id", b"type"])
         kind = _text(attrs[b"type"])
-        if (index < len(components) - 1 or create_parents) and kind != "map_node":
+        if kind != "map_node":
             raise ValueError(
                 f"Ancestor is not a directory: {'//' + '/'.join(components[: index + 1])}"
             )
@@ -597,10 +610,9 @@ class Restore(RestoreSink):
         if len(components) == 1:
             target = self.path
         else:
-            parent = _resolve(
+            parent = _ensure_directory(
                 client=client,
                 path="//" + "/".join(components[:-1]),
-                create_parents=True,
             )
             target = parent + "/" + components[-1]
 
@@ -722,7 +734,7 @@ class Restore(RestoreSink):
     def mark(self):
         """Record completion only if committed content remains unchanged."""
         client = self.session.client
-        resolved = _resolve(client=client, path=self.path)
+        resolved = _resolve_node(client=client, path=self.path)
         if resolved != self.pinned:
             raise ValueError("Destination was replaced after restore commit")
         current = _read_node(client=client, pinned=self.pinned, path=self.path)
@@ -811,7 +823,7 @@ class YtWorker(YtBackend):
             client.config = bounded
             try:
                 # Each path lookup is bounded; this is not a whole-operation deadline.
-                pinned = _resolve(client=client, path=path)
+                pinned = _resolve_node(client=client, path=path)
                 usage = client.get(path=pinned + "&/@recursive_resource_usage")
                 return SourceEstimate(
                     node_count=_usage_integer(usage=usage, key="node_count", minimum=1),
@@ -835,7 +847,7 @@ class YtWorker(YtBackend):
 
         def inspect():
             """Validate source ancestry and read the root's change hints."""
-            pinned = _resolve(client=session.client, path=path)
+            pinned = _resolve_node(client=session.client, path=path)
             attrs = _attributes(
                 client=session.client, path=pinned, names=list(DISCOVERY_ATTRIBUTES)
             )
@@ -877,7 +889,7 @@ class YtWorker(YtBackend):
         """Create missing directories while preserving existing metadata."""
         async with self._transaction() as session:
             pinned = await session.call(
-                _resolve, client=session.client, path=path, create_parents=True
+                _ensure_directory, client=session.client, path=path
             )
             attrs = await session.call(
                 _attributes, client=session.client, path=pinned, names=[b"type"]
@@ -892,7 +904,7 @@ class YtWorker(YtBackend):
 
             def pin():
                 """Lock a resolved node and read its snapshot metadata."""
-                resolved = _resolve(client=session.client, path=path)
+                resolved = _resolve_node(client=session.client, path=path)
                 node_id = session.client.lock(path=resolved + "&", mode="snapshot")[
                     "node_id"
                 ]
@@ -911,7 +923,7 @@ class YtWorker(YtBackend):
         def check():
             """Compare the completion marker with the current node state."""
             try:
-                pinned = _resolve(client=session.client, path=path)
+                pinned = _resolve_node(client=session.client, path=path)
             except yt.YtResponseError as error:
                 if error.is_resolve_error():
                     return False

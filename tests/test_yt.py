@@ -107,23 +107,45 @@ class Client:
         return Transaction(self)
 
     def find(self, path):
-        path = str(path).removesuffix("&")
+        path = str(path)
+        follow_links = not path.endswith("&")
+        path = path.removesuffix("&")
+
         if path == "/":
             return "root"
-        if path.startswith("#"):
-            head, *rest = path[1:].split("/", maxsplit=1)
-            if head not in self.nodes:
+
+        if path.startswith("#") and "/" not in path:
+            key = path[1:]
+            if key not in self.nodes:
                 raise KeyError(path)
-            if not rest:
-                return head
-            parent, name = head, rest[0]
         else:
             parent_path, name = path.rsplit("/", maxsplit=1)
             parent = self.find(parent_path or "/")
-        for key, record in self.nodes.items():
-            if record["parent"] == parent and record["name"] == name:
-                return key
-        raise KeyError(path)
+            if self.nodes[parent]["type"] != "map_node":
+                raise yt_module.yt.YtResponseError(
+                    {"message": "Node cannot have children", "code": 500}
+                )
+
+            key = next(
+                (
+                    key
+                    for key, record in self.nodes.items()
+                    if record["parent"] == parent and record["name"] == name
+                ),
+                None,
+            )
+            if key is None:
+                raise KeyError(path)
+
+        record = self.nodes[key]
+        if (
+            follow_links
+            and record["type"] == "link"
+            and "target_path" in record["attrs"]
+        ):
+            return self.find(record["attrs"]["target_path"])
+
+        return key
 
     def attrs(self, key):
         record = self.nodes[key]
@@ -423,7 +445,7 @@ def test_snapshot_disk_size_is_metadata_only(
             )
 
     run(main())
-    assert len(requests) == (3 if dynamic else 4)
+    assert len(requests) == (2 if dynamic else 3)
     assert sum("resource_usage" in attributes for _, attributes in requests) == 1
     assert any(
         "dynamic" in attributes and "resource_usage" in attributes
@@ -616,7 +638,7 @@ def test_walk_yields_change_hints_without_extra_requests(
 
     run(main())
     calls = store.clients[0].calls
-    assert calls.count("get") == (2 if walk_root == "//tmp" else 3)
+    assert calls.count("get") == 2
     assert calls.count("list") == (walk_root == "//tmp") + (kind == "map_node")
     assert "transaction" not in calls
 
@@ -750,7 +772,7 @@ def test_snapshot_reads_attribute_revision_in_existing_request(
             )
 
     run(main())
-    assert len(requests) == 4
+    assert len(requests) == 3
     assert "attribute_revision" in requests[-1]
     assert sum("attribute_revision" in names for names in requests) == 1
 
@@ -849,7 +871,7 @@ def test_walk_requests_scale_with_directories(adapter, store, monkeypatch, leaf_
     run(main())
     gets = [kwargs for action, kwargs in requests if action == "get"]
     listings = [kwargs for action, kwargs in requests if action == "list"]
-    assert len(gets) == 4
+    assert len(gets) == 2
     assert [request["path"] for request in listings] == [
         "#" + root + "&",
         "#" + first + "&",
@@ -973,18 +995,121 @@ def test_walk_rejects_special_child_name_before_children(adapter, store):
     run(main())
 
 
-def test_walk_rejects_link_in_root_ancestor(adapter, store):
-    """The initial path cannot enter a subtree through a link."""
-    add_node(store=store, kind="link", name="link")
+@pytest.mark.parametrize("operation", ["walk", "snapshot"])
+@pytest.mark.parametrize("source_readable", [True, False])
+def test_source_access_is_independent_of_ancestor_read(
+    adapter, store, monkeypatch, operation, source_readable
+):
+    """Read an allowed subtree without requesting access to its parent."""
+    client = Client(store)
+    parent = client.create(type="map_node", path="//home")
+    source = client.create(type="map_node", path="//home/games")
+    child = client.create(type="file", path="//home/games/file")
+    denied = {parent} if source_readable else {parent, source}
+    original_get = Client.get
+    requested_ids = []
+
+    def get(self, *, path, **kwargs):
+        key = self.find(path)
+        requested_ids.append(key)
+        if key in denied:
+            raise yt_module.yt.YtResponseError(
+                {"message": "Access denied", "code": 901}
+            )
+
+        return original_get(self, path=path, **kwargs)
+
+    monkeypatch.setattr(Client, "get", get)
 
     async def main():
-        """Reject the initial linked ancestor before any directory listing."""
         async with adapter.worker() as worker:
-            with pytest.raises(ValueError, match="Ancestor"):
-                _ = [node.path async for node in worker.walk(path="//tmp/link/secret")]
+            if operation == "walk":
+                nodes = [node async for node in worker.walk(path="//home/games")]
+                assert [node.node_id for node in nodes] == [source, child]
+            else:
+                async with worker.snapshot(path="//home/games") as snapshot:
+                    assert snapshot.node.node_id == source
+
+    if source_readable:
+        run(main())
+        assert requested_ids
+        assert not denied.intersection(requested_ids)
+    else:
+        with pytest.raises(yt_module.yt.YtResponseError, match="Access denied"):
+            run(main())
+
+        assert requested_ids == [source]
+        calls = store.clients[0].calls
+        assert "list" not in calls
+        assert "lock:snapshot" not in calls
+
+
+def test_snapshot_keeps_resolved_id_when_path_is_replaced(adapter, store, monkeypatch):
+    """Replacing the source path after resolution cannot redirect its snapshot."""
+    source = add_node(store=store, kind="file", data=b"original")
+    target = add_node(store=store, kind="file", name="target", data=b"other")
+    original_get = Client.get
+    original_lock = Client.lock
+    locked = []
+    replaced = False
+
+    def get(self, *, path, **kwargs):
+        nonlocal replaced
+        response = original_get(self, path=path, **kwargs)
+
+        if not replaced and self.find(path) == source:
+            replaced = True
+            self.nodes[source]["name"] = "detached"
+            self.create(
+                type="link",
+                path="//tmp/source",
+                attributes={"target_path": "//tmp/target"},
+            )
+
+        return response
+
+    def lock(self, *, path, **kwargs):
+        locked.append(path)
+        return original_lock(self, path=path, **kwargs)
+
+    monkeypatch.setattr(Client, "get", get)
+    monkeypatch.setattr(Client, "lock", lock)
+
+    async def main():
+        async with (
+            adapter.worker() as worker,
+            worker.snapshot(path="//tmp/source") as snapshot,
+        ):
+            assert snapshot.node.node_id == source
+            assert snapshot.node.node_id != target
 
     run(main())
-    assert store.clients[0].calls.count("list") == 0
+    assert replaced
+    assert locked == ["#" + source + "&"]
+
+
+@pytest.mark.parametrize("link_path", ["//alias", "//tmp/alias", "//tmp/folder/alias"])
+def test_walk_rejects_link_in_root_ancestor(adapter, store, link_path):
+    """The initial path cannot enter a subtree through a link at any depth."""
+    add_node(store=store, kind="map_node", name="folder")
+    add_node(store=store, name="folder/source")
+    Client(store).create(
+        type="link",
+        path=link_path,
+        attributes={"target_path": "//tmp/folder"},
+    )
+
+    async def main():
+        async with adapter.worker() as worker:
+            with pytest.raises(
+                yt_module.yt.YtResponseError, match="cannot have children"
+            ):
+                _ = [node async for node in worker.walk(path=link_path + "/source")]
+
+    run(main())
+    calls = store.clients[0].calls
+    assert "list" not in calls
+    assert "lock:snapshot" not in calls
 
 
 def test_walk_uses_discovered_directory_id_after_path_replacement(
@@ -1014,7 +1139,9 @@ def test_walk_uses_discovered_directory_id_after_path_replacement(
                 assert (await paths.__anext__()).path == "//tmp/folder/source"
                 with pytest.raises(StopAsyncIteration):
                     await paths.__anext__()
-            with pytest.raises(ValueError, match="Ancestor"):
+            with pytest.raises(
+                yt_module.yt.YtResponseError, match="cannot have children"
+            ):
                 async with worker.snapshot(path="//tmp/folder/source"):
                     pass
 
@@ -1100,7 +1227,9 @@ def test_link_in_ancestor_is_rejected(adapter, store):
 
     async def main():
         async with adapter.worker() as worker:
-            with pytest.raises(ValueError, match="Ancestor"):
+            with pytest.raises(
+                yt_module.yt.YtResponseError, match="cannot have children"
+            ):
                 async with worker.snapshot(path="//tmp/link/secret"):
                     pass
 

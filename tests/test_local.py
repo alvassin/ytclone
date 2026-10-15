@@ -52,6 +52,90 @@ def rows(*, client, path):
         return list(yson.load(stream=stream, yson_type="list_fragment", encoding=None))
 
 
+def test_local_allowed_subtree_without_ancestor_read_does_not_follow_links():
+    """Read a guest-visible subtree without reading its denied parent or links."""
+    root = "//tmp/ytclone-acl-" + uuid.uuid4().hex[:12]
+    source = root + "/source"
+    folder = source + "/folder"
+    alias = source + "/alias"
+    client = local_client()
+    reader = local_client(config={"impersonation_user": "guest"})
+
+    def guest_client(*, proxy, config):
+        return local_client(
+            proxy=proxy,
+            config={**config, "impersonation_user": "guest"},
+        )
+
+    try:
+        if not client.exists(path="//sys/users/guest"):
+            pytest.skip("The disposable local cluster has no built-in guest user")
+
+        client.create(
+            type="map_node",
+            path=root,
+            attributes={
+                "inherit_acl": False,
+                "acl": [
+                    {"action": "deny", "subjects": ["guest"], "permissions": ["read"]}
+                ],
+            },
+        )
+        client.create(
+            type="map_node",
+            path=source,
+            attributes={
+                "inherit_acl": False,
+                "acl": [
+                    {"action": "allow", "subjects": ["guest"], "permissions": ["read"]}
+                ],
+            },
+        )
+        client.create(type="map_node", path=folder)
+        file_id = client.create(type="file", path=folder + "/file")
+        client.write_file(destination=folder + "/file", stream=io.BytesIO(b"payload"))
+        client.link(target_path=folder, link_path=alias)
+        link_id = client.get(path=alias + "&/@id")
+
+        with pytest.raises(sdk.YtResponseError) as denied:
+            reader.get(path=root + "/@id")
+        assert denied.value.is_access_denied()
+
+        with contextlib.closing(reader.read_file(path=folder + "/file")) as stream:
+            assert stream.read() == b"payload"
+
+        async def scenario():
+            yt = YtAdapter(
+                proxy="http://localhost:8000",
+                proxy_discovery=False,
+                client_factory=guest_client,
+            )
+            async with yt.worker() as worker:
+                node = await worker.inspect_node(path=folder + "/file")
+                assert node.kind == "file" and node.node_id == file_id
+
+                entries = [node async for node in worker.walk(path=source)]
+                assert {node.path for node in entries} == {
+                    source,
+                    folder,
+                    folder + "/file",
+                    alias,
+                }
+                link = next(node for node in entries if node.path == alias)
+                assert link.kind == "link" and link.node_id == link_id
+
+                with pytest.raises((sdk.YtResponseError, ValueError)):
+                    await worker.inspect_node(path=alias + "/file")
+
+        asyncio.run(scenario())
+    finally:
+        try:
+            client.remove(path=root, recursive=True, force=True)
+        finally:
+            reader._cleanup()
+            client._cleanup()
+
+
 def test_local_round_trip_restart_changes_and_corruption():
     run_id = uuid.uuid4().hex[:12]
     root = "//tmp/ytclone-main-" + run_id
