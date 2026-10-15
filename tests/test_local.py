@@ -59,7 +59,13 @@ def test_local_allowed_subtree_without_ancestor_read_does_not_follow_links():
     folder = source + "/folder"
     alias = source + "/alias"
     client = local_client()
-    reader = local_client(config={"impersonation_user": "guest"})
+    reader = local_client(
+        config={
+            "impersonation_user": "guest",
+            # This fixture is immutable; guest cannot create SDK snapshot transactions.
+            "read_retries": {"create_transaction_and_take_snapshot_lock": False},
+        },
+    )
 
     def guest_client(*, proxy, config):
         return local_client(
@@ -101,7 +107,9 @@ def test_local_allowed_subtree_without_ancestor_read_does_not_follow_links():
             reader.get(path=root + "/@id")
         assert denied.value.is_access_denied()
 
-        with contextlib.closing(reader.read_file(path=folder + "/file")) as stream:
+        with contextlib.closing(
+            reader.read_file(path=folder + "/file", enable_read_parallel=False)
+        ) as stream:
             assert stream.read() == b"payload"
 
         async def scenario():
