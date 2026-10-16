@@ -5,11 +5,12 @@ import contextlib
 import copy
 import functools
 import hashlib
+import io
 import logging
 import os
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import yt.wrapper as yt
@@ -23,6 +24,7 @@ from yt.wrapper.ypath import escape_ypath_literal
 
 from .codec import AsyncReader
 from .format import (
+    DOCUMENT_KIND,
     MIB,
     RESTORE_MARKER,
     ROW_FORMAT,
@@ -53,6 +55,7 @@ PORTABLE_SYSTEM = {
     "table": (b"schema", b"compression_codec", b"erasure_codec", b"optimize_for"),
     "file": (b"compression_codec", b"erasure_codec", b"file_name", b"executable"),
     "map_node": (),
+    DOCUMENT_KIND: (),
 }
 EXCLUDED = {
     b"acl",
@@ -103,12 +106,29 @@ def _attribute_path(*, path: str, name: bytes) -> str:
 def _attributes(*, client, path: str, names: list[bytes]) -> dict:
     """Fetch selected attributes without following the node itself."""
     data = client.get(
-        path=path + "&",
+        path=path + "&/@",
         attributes=[_text(name) for name in names],
-        max_size=0,
+        max_size=LIST_LIMIT,
         format=WIRE,
     )
-    return yson.loads(string=data, encoding=None).attributes
+    result = yson.loads(string=data, encoding=None)
+    if not isinstance(result, dict) or result.attributes.get(b"incomplete"):
+        raise ValueError("Invalid or incomplete YT attributes")
+    return result
+
+
+def _canonical_document(data: bytes) -> bytes:
+    """Validate one complete YSON value and preserve its types and attributes."""
+    return yson.dumps(
+        object=yson.loads(string=data, encoding=None),
+        yson_format="binary",
+        sort_keys=True,
+    )
+
+
+def _read_document(*, client, pinned: str) -> bytes:
+    """Read the complete opaque value, separately from Cypress node attributes."""
+    return _canonical_document(client.get(path=pinned + "/@value", format=WIRE))
 
 
 def _resolve_node(*, client, path: str) -> str:
@@ -116,7 +136,7 @@ def _resolve_node(*, client, path: str) -> str:
     components = path_components(path)
 
     # Suppress links in every component without reading ancestor nodes.
-    # _attributes adds the final '&'; subsequent requests use the returned ID.
+    # _attributes adds the final '&/@'; subsequent requests use the returned ID.
     attrs = _attributes(
         client=client,
         path="//" + "&/".join(components),
@@ -199,7 +219,7 @@ def _discovered_node(*, path: str, attrs: dict) -> DiscoveredNode:
         raise ValueError(f"Discovery omitted node id or type: {path}")
     kind = _text(kind)
     dynamic = attrs.get(b"dynamic")
-    if kind in ("file", "map_node"):
+    if kind in ("file", "map_node", DOCUMENT_KIND):
         dynamic = False
     elif isinstance(dynamic, (bool, yson.YsonBoolean)):
         dynamic = bool(dynamic)
@@ -280,6 +300,8 @@ def _read_node(*, client, pinned: str, path: str) -> Node:
         required.update({b"schema", b"row_count", b"content_revision", b"data_weight"})
     elif kind == "file":
         required.update({b"uncompressed_data_size", b"content_revision"})
+    elif kind == DOCUMENT_KIND:
+        required.add(b"content_revision")
     missing = required - metadata.keys()
     if missing:
         raise ValueError(f"Missing required YT attributes: {sorted(missing)!r}")
@@ -478,13 +500,14 @@ class _ReadStream:
 
 
 class Snapshot(SourceSnapshot):
-    def __init__(self, *, session: _Session, node: Node):
+    def __init__(self, *, session: _Session, node: Node, document: bytes | None = None):
         """Bind a pinned node to its reading session."""
         self.session = session
         self.node = node
         self.pinned = "#" + node.node_id
         self._stream = None
         self._reading = False
+        self.document = document
 
     def _open_part(self, *, part: Range, compression_level: int):
         """Open and compress one table-row or file-byte range."""
@@ -506,6 +529,12 @@ class Snapshot(SourceSnapshot):
                 length=part.stop - part.start,
                 enable_read_parallel=False,
             )
+        elif self.node.kind == DOCUMENT_KIND:
+            if self.document is None or part != Range(
+                index=0, start=0, stop=len(self.document)
+            ):
+                raise ValueError("Invalid document part")
+            raw = io.BytesIO(self.document)
         else:
             raise ValueError(f"Cannot read data of {self.node.kind}")
 
@@ -602,6 +631,7 @@ class Restore(RestoreSink):
         self.byte_count = 0
         self.committed_chunks = None
         self.expected_attributes = None
+        self.expected_document = None
 
     def prepare(self):
         """Create a replacement node or update a directory safely."""
@@ -682,6 +712,20 @@ class Restore(RestoreSink):
                     stream=chunks(),
                     force_create=False,
                 )
+            elif self.node.kind == DOCUMENT_KIND:
+                if self.part_count:
+                    raise ValueError("A document cannot have multiple parts")
+                payload = bytearray()
+                for chunk in chunks():
+                    if self.byte_count > self.node.data_size:
+                        raise ValueError("Document exceeds declared size")
+                    payload.extend(chunk)
+                if self.byte_count != self.node.data_size:
+                    raise ValueError("Document size mismatch")
+                data = _canonical_document(bytes(payload))
+                source.finish()
+                self.session.client.set(path=self.pinned, value=data, format=WIRE)
+                self.expected_document = attributes_hash(data)
             else:
                 raise ValueError("Directories cannot have data parts")
             # A SDK implementation returning before consuming the body must not
@@ -727,9 +771,22 @@ class Restore(RestoreSink):
             self.committed_chunks = _chunks_digest(
                 client=self.session.client, pinned=self.pinned
             )
+        if self.node.kind == DOCUMENT_KIND:
+            self._validate_document()
         self.expected_attributes = attributes_hash(current.attributes)
         if self.expected_attributes != attributes_hash(self.node.attributes):
             raise ValueError("Restored attributes differ from source attributes")
+
+    def _validate_document(self):
+        """Verify semantic YSON content, independent of map serialization order."""
+        if (
+            self.expected_document is None
+            or attributes_hash(
+                _read_document(client=self.session.client, pinned=self.pinned)
+            )
+            != self.expected_document
+        ):
+            raise ValueError("Restored document content mismatch")
 
     def mark(self):
         """Record completion only if committed content remains unchanged."""
@@ -744,6 +801,8 @@ class Restore(RestoreSink):
             _chunks_digest(client=client, pinned=self.pinned) != self.committed_chunks
         ):
             raise ValueError("Destination content changed after restore commit")
+        if self.node.kind == DOCUMENT_KIND:
+            self._validate_document()
         client.set(
             path=_attribute_path(path=self.pinned, name=RESTORE_MARKER.encode()),
             value={
@@ -913,7 +972,13 @@ class YtWorker(YtBackend):
                 )
 
             node = await session.call(pin)
-            yield Snapshot(session=session, node=node)
+            document = None
+            if node.kind == DOCUMENT_KIND:
+                document = await session.call(
+                    _read_document, client=session.client, pinned="#" + node.node_id
+                )
+                node = replace(node, data_size=len(document))
+            yield Snapshot(session=session, node=node, document=document)
 
     async def matches(self, *, path: str, fingerprint: str) -> bool:
         """Check whether a completed restore still matches its fingerprint."""

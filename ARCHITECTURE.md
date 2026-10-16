@@ -4,7 +4,8 @@
 
 This document describes the archive format, change detection and node lifecycle.
 The execution diagrams follow one table through export or restore. Files use the
-same pipeline with bytes instead of rows; directories carry metadata.
+same pipeline with bytes instead of rows; documents carry a complete YSON value
+and directories carry metadata.
 
 ## Storage
 
@@ -22,8 +23,11 @@ s3://my-bucket/export/
 ```
 
 Tables use binary YSON row fragments compressed with Zstandard. Files use compressed
-byte ranges (`.bin.zst`). Parts decompress independently. Directories and empty
-tables/files retain metadata without data parts. Node names are percent-encoded
+byte ranges (`.bin.zst`). Documents use exactly one binary YSON node compressed
+with Zstandard (`@data/part-000000.yson.zst`), including empty maps/lists and entity
+values. Their `data_size` is the serialized uncompressed byte count and `row_count`
+is zero; `--part-size-mib` does not split documents. Parts decompress independently.
+Directories and empty tables/files retain metadata without data parts. Node names are percent-encoded
 in S3 keys. Unicode, spaces and literal percent signs are supported. This version
 rejects YT selectors and names containing `\`, `[]{}<>&*@`; it never follows links.
 
@@ -33,11 +37,21 @@ Saved metadata includes user attributes and, for tables, `schema`,
 and optional `file_name`/`executable`. Ownership, ACLs, placement and expiration
 settings are excluded. The user attribute `yt_s3_state` is reserved for completion
 metadata. Directory attributes are updated without removing unrelated children;
-replacing a directory with a table/file or vice versa is rejected.
+replacing a directory with a table, file or document, or vice versa, is rejected.
 
 The archive format identifier remains `yt-s3-v1`, and the restore completion
 attribute remains `yt_s3_state`. Both names are retained for compatibility with
-existing archives and restored nodes created by `yt-s3`.
+existing archives and restored nodes created by `yt-s3`. Only document manifests
+extend `encoding` with `documents: binary_yson_node`; existing kinds keep their
+encoding and fingerprints unchanged. New readers accept old archives; old readers
+reject document manifests and cannot fully restore a tree containing documents.
+
+Documents are read through `/@value` under the same snapshot lock as their metadata.
+Node attributes are read separately through `/@`, so attributes on the YSON value
+cannot be confused with Cypress node metadata. Documents are buffered and parsed
+as a whole, unlike streamed table/file parts. They are intended for small metadata;
+very large documents require memory proportional to their serialized value and
+parsed YSON tree.
 
 ## Detecting changes
 
@@ -67,8 +81,11 @@ manifest's fingerprint. Skipping also requires verifying that the destination's
 data, schema, and saved attributes have not changed since import. The marker stores destination
 node ID, committed content revision and a hash of portable attributes. It is
 written after commit, after checking that chunk IDs and attributes still match
-the completed write. A matching marker alone is insufficient; if unchanged state
-cannot be established, copy again.
+the completed write. For documents, a SHA-256 digest of canonical binary YSON
+(including value attributes) is checked before and after commit instead of chunk
+IDs. Restore validates the declared payload size, complete YSON syntax and storage
+checksum before setting the document value. A matching marker alone is insufficient;
+if unchanged state cannot be established, copy again.
 
 Skipping compares metadata; it is not a full integrity scan of stored data. Part
 checksums verify data as it is transferred.
@@ -90,9 +107,10 @@ A successful replacement removes obsolete parts for that node. An interruption
 can leave data without a manifest or unfinished S3 multipart uploads; these need
 a retry or cleanup.
 
-YT destinations use a transaction per node to avoid exposing partial tables or
-files. When a table or file needs copying, an existing destination node is removed
-and recreated inside that transaction using only the portable archive attributes.
+YT destinations use a transaction per node to avoid exposing partial tables, files
+or documents. When a table, file or document needs copying, an existing destination
+node is removed and recreated inside that transaction using only the portable
+archive attributes.
 Its previous ACL, owner and account are not preserved; YTsaurus creation defaults
 and inheritance rules apply. Unchanged nodes are skipped without replacement.
 Existing directories are updated in place, keeping their identity, non-portable

@@ -1,4 +1,4 @@
-"""Copy YTsaurus static tables, files and directories to or from an S3 archive."""
+"""Copy YTsaurus static tables, files, documents and directories to or from an S3 archive."""
 
 import asyncio
 import logging
@@ -41,7 +41,7 @@ class Arguments(argclass.Parser):
     )
     region: str = argclass.Argument(env_var="AWS_DEFAULT_REGION", default="us-east-1")
     concurrency: int = argclass.Argument(
-        default=4, help="Maximum concurrent table/file transfers"
+        default=4, help="Maximum concurrent data node transfers"
     )
     queue_size: int = argclass.Argument(default=16, help="Maximum queued node paths")
     part_size_mib: int = argclass.Argument(

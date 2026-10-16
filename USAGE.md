@@ -70,7 +70,7 @@ also occurs on Python 3.14 with aiomisc 18.0.33.
 
 ## Copying a subset
 
-To restore one table or file, point to its path inside the archive:
+To restore one table, file, or document, point to its path inside the archive:
 
 ```bash
 ytclone s3://my-bucket/export/home/analytics/events/2026-01-01 \
@@ -152,7 +152,8 @@ recording completion can occur **after the data was committed**; inspect the log
 before assuming that the old destination is still present.
 
 After fixing a failure, [rerun the command](README.md#repeated-runs). Completed,
-unchanged nodes are skipped; an unfinished table or file starts from the beginning.
+unchanged nodes are skipped; an unfinished table, file, or document starts from
+the beginning.
 
 Configure an S3 lifecycle rule to expire incomplete multipart uploads. Known
 uploads are aborted on failure, but an upload whose creation response was lost

@@ -59,8 +59,10 @@ Each run creates unique `//tmp/ytclone-main-*`, `//tmp/ytclone-raw-retry-*`, and
 `//tmp/ytclone-cli-*` paths, plus `main-smoke-*`, `raw-retry-*`, and `cli-smoke-*`
 prefixes in the local `yt-backup` bucket. Tests cover export and restore, repeated
 copies, changed metadata, empty nodes, file parts, corruption rollback, and
-table-read retries within a snapshot. The CLI roundtrip exports five nodes using
-two real worker processes, restores them, and repeats both commands to verify
+table-read retries within a snapshot. Document tests also cover scalar, empty and
+attributed YSON, a value exceeding the default node-list limit, concurrent source
+changes, changed destinations, and corrupt-archive rollback. The CLI roundtrip
+exports six nodes using two real worker processes, restores them, and repeats both commands to verify
 unchanged objects are skipped.
 
 Fixtures are retained for inspection while the local containers and their storage
