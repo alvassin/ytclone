@@ -567,7 +567,7 @@ raise SystemExit(worker.main())
                 dependency_version == "17.10.3"
                 and sys.platform == "linux"
                 and sys.version_info[:2] == (3, 10)
-                and signal_name == "SIGINT"
+                and signal_name in ("SIGINT", "SIGTERM")
                 and process.returncode == 1
                 and b"/aiomisc/entrypoint.py" in stderr
                 and b"loop.run_until_complete(self.__aexit__(exc_type, exc_val, exc_tb))"
@@ -577,7 +577,7 @@ raise SystemExit(worker.main())
                 )
             ):
                 pytest.xfail(
-                    "aiomisc 17.10.3 stops its loop during SIGINT shutdown on Python 3.10"
+                    f"aiomisc 17.10.3 stops its loop during {signal_name} shutdown on Python 3.10"
                 )
             assert process.returncode == 130, stderr.decode(errors="replace")
         finally:
@@ -586,3 +586,34 @@ raise SystemExit(worker.main())
                 await process.wait()
 
     asyncio.run(scenario())
+
+
+def test_portable_smoke_configuration_starts_and_stops_worker(monkeypatch):
+    """The release check must keep using the worker's actual configuration schema."""
+    import runpy
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "check_portable.py"
+    config = runpy.run_path(str(script))["worker_config"]()
+    yt = FakeYt()
+    opened = {}
+
+    @asynccontextmanager
+    async def storage(**kwargs):
+        opened.update(kwargs)
+        yield object()
+
+    monkeypatch.setattr(worker, "YtAdapter", lambda **kwargs: yt)
+    monkeypatch.setattr(worker, "open_storage", storage)
+
+    async def scenario():
+        reader, writer = asyncio.StreamReader(), MemoryWriter()
+        feed(reader=reader, message_type="stop")
+        await worker.run_worker(reader=reader, writer=writer, config=config)
+        assert writer.messages == [{"type": "ready"}]
+
+    asyncio.run(scenario())
+    assert opened["location"].kind == "s3"
+    assert opened["location"].bucket == "portable-check"
+    assert opened["location"].prefix == "check"
+    assert len(yt.opened) == len(yt.closed) == config["concurrency"]

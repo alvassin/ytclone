@@ -35,7 +35,7 @@ service integration cases are skipped unless explicitly enabled.
 
 Known limitation: aiomisc can exit incorrectly after coroutine cleanup completes.
 Version 18.0.33 reports a false shutdown timeout and exits 70 on SIGINT/SIGTERM;
-17.10.3 on Linux/Python 3.10 can exit 1 on SIGINT because it stops the event loop
+17.10.3 on Linux/Python 3.10 can exit 1 on SIGINT/SIGTERM because it stops the event loop
 before shutdown finishes. The signal test marks only these exact versions,
 exit codes, and diagnostics as expected failures (`xfail`), after checking
 cleanup, protocol output, and timely process exit. Other failures still fail CI;
