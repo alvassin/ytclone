@@ -29,8 +29,9 @@ uv run --locked ruff format --check src tests scripts packaging
 ```
 
 The offline suite uses in-memory fakes, local HTTP servers, and subprocesses. It
-needs no YTsaurus or S3 services or credentials. The six local integration cases
-are skipped unless explicitly enabled.
+needs no YTsaurus or S3 services or credentials. Filesystem tests use temporary
+directories, including failure, cancellation and archive relocation cases. Local
+service integration cases are skipped unless explicitly enabled.
 
 Known limitation: aiomisc can exit incorrectly after coroutine cleanup completes.
 Version 18.0.33 reports a false shutdown timeout and exits 70 on SIGINT/SIGTERM;
@@ -48,7 +49,7 @@ The pinned YTsaurus image is x86_64 and requires emulation on Apple Silicon.
 
 ```bash
 docker compose up -d --wait --wait-timeout 360 yt s3
-YTCLONE_LOCAL_TESTS=1 uv run --locked pytest -s tests/test_local.py tests/test_local_cli.py
+YTCLONE_LOCAL_TESTS=1 uv run --locked pytest -s tests/test_local.py tests/test_local_cli.py tests/test_local_filesystem.py
 ```
 
 The tests use these local endpoints explicitly, disable YT token authentication
@@ -62,6 +63,11 @@ copies, changed metadata, empty nodes, file parts, corruption rollback, and
 table-read retries within a snapshot. The CLI roundtrip exports five nodes using
 two real worker processes, restores them, and repeats both commands to verify
 unchanged objects are skipped.
+
+`tests/test_local_filesystem.py` needs only the local YT service. It runs ordinary
+and parallel exports into temporary disk archives, relocates the root, restores
+through the CLI and checks unchanged reruns without AWS credentials. The installed
+wheel CI job includes these cases.
 
 Fixtures are retained for inspection while the local containers and their storage
 exist. To stop the services while keeping containers and data:

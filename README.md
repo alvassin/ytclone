@@ -1,10 +1,10 @@
 # ytclone
 
-Copy static tables, files, and directories between YTsaurus and S3, preserving
-schemas and portable attributes. Repeat a command to skip completed, unchanged
-nodes and retry unfinished copies.
+Copy static tables, files, and directories between YTsaurus and S3 or local disk,
+preserving schemas and portable attributes. Repeat a command to skip completed,
+unchanged nodes and retry unfinished copies.
 
-Restoring from S3 requires an archive created by `ytclone`.
+Restoring requires an archive created by `ytclone`.
 
 ## Installation
 
@@ -28,11 +28,29 @@ See [running with Docker](https://github.com/alvassin/ytclone/blob/main/USAGE.md
 
 ## Quick start
 
-Configure access to YTsaurus and S3:
+Configure access to YTsaurus:
 
 ```bash
 export YT_PROXY="https://yt.example.com"
 export YT_TOKEN="..."
+```
+
+**Copy to local disk and restore:**
+
+```bash
+ytclone //home/analytics/events ./dump --log-file export.log
+ytclone ./dump/home/analytics/events //home/analytics/events_copy --log-file restore.log
+```
+
+The export destination is the archive root. The full YT path is appended, so
+`events` is stored at `./dump/home/analytics/events/`. Use a new or empty directory
+for the first export. Move the whole `dump` directory, including `@archive.json`,
+to transfer the archive to another disk or machine. See [local archives](USAGE.md#local-archives)
+for path rules and filesystem limitations.
+
+**For S3**, also configure:
+
+```bash
 export AWS_ACCESS_KEY_ID="..."
 export AWS_SECRET_ACCESS_KEY="..."
 export AWS_DEFAULT_REGION="us-east-1"
@@ -69,7 +87,7 @@ unchanged nodes are skipped. New, changed, or incomplete nodes are copied again;
 an interrupted table or file starts from the beginning, not from its last part.
 
 Source data is never deleted. Destination nodes absent from the source are kept.
-Use a separate S3 prefix for each source cluster.
+Use a separate archive root or S3 prefix for each source cluster.
 
 ## Parallel export
 
@@ -80,15 +98,16 @@ ytclone-parallel //home/analytics/events s3://my-bucket/export \
   --processes 2 --concurrency 2 --log-file export.log
 ```
 
-This runs two processes with two transfers each, prioritizing directories and
-small nodes. One table still occupies one transfer slot. Parallel mode supports
-YT → S3; restore its archives with `ytclone` as above.
+Replace the S3 destination with `./dump` to export to local disk. This runs two
+processes with two transfers each, prioritizing directories and small nodes.
+One table still occupies one transfer slot. Parallel mode supports YT → S3 or
+local disk; restore its archives with `ytclone` as above.
 
 ## Before you copy
 
 - **Supported node types:** static tables, files, and directories. Dynamic tables
   are skipped and reported; links are unsupported.
-- **One current S3 copy.** There is no archive version history. Replacing a node
+- **One current archive copy.** There is no archive version history. Replacing a node
   makes its archive unavailable until completion; a failed replacement can lose
   the previous complete copy.
 - **Permissions are not copied.** ACLs, ownership, and account settings are

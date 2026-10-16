@@ -1,4 +1,4 @@
-"""Copy YTsaurus static tables, files and directories to or from an S3 archive."""
+"""Copy YTsaurus static tables, files and directories to or from S3 and local archives."""
 
 import asyncio
 import logging
@@ -7,18 +7,16 @@ import sys
 import time
 from contextlib import nullcontext, suppress
 
-import aiohttp
 import aiomisc
 import argclass
-from aiohttp_s3_client import S3Client
 from aiomisc.log import LogFormat
 
 from .engine import CopyOptions, export_tree, restore_tree
-from .format import MIB, parse_s3_url, path_components
+from .format import MIB
 from .logging import file_logging
 from .memory import estimate_memory_mib
 from .progress import Progress, ProgressReporter
-from .s3 import S3Storage
+from .storage import direction, open_storage, resolve_storage
 from .yt import YtAdapter
 
 log = logging.getLogger(__name__)
@@ -27,7 +25,7 @@ LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S %z"
 
 class Arguments(argclass.Parser):
     source: str = argclass.Argument(
-        "source", help="Source //YT/path or s3://bucket/prefix"
+        "source", help="Source //YT/path, s3://bucket/prefix or local archive path"
     )
     destination: str = argclass.Argument(
         "destination", help="Destination in the other storage"
@@ -49,7 +47,7 @@ class Arguments(argclass.Parser):
         help="Target uncompressed size per archive object; approximate for tables",
     )
     buffer_size_mib: int = argclass.Argument(
-        default=32, help="S3 multipart buffer per transfer, 5..512 MiB"
+        default=32, help="I/O buffer per transfer (S3 multipart or local), 5..512 MiB"
     )
     compression_level: int = argclass.Argument(
         default=3, help="Zstandard level, -7..22"
@@ -73,27 +71,13 @@ class Arguments(argclass.Parser):
     )
 
 
-def direction(*, source: str, destination: str) -> tuple[bool, str, str, str]:
-    """Validate paths and resolve direction, YT path, bucket and prefix."""
-    export = source.startswith("//") and destination.startswith("s3://")
-    restore = source.startswith("s3://") and destination.startswith("//")
-    if not (export or restore):
-        raise ValueError("Specify one YT path and one S3 URL; source comes first")
-    yt_path = source if export else destination
-    path_components(yt_path)
-    if any(c in yt_path for c in "\\[]{}<>&*@"):
-        raise ValueError(
-            "YT selectors, links and escaped/special node names are not supported"
-        )
-    bucket, prefix = parse_s3_url(destination if export else source)
-    return export, yt_path, bucket, prefix
-
-
 async def run(*, arguments: Arguments, options: CopyOptions) -> int:
     """Create adapters, run the copy and return its exit code."""
-    export, yt_path, bucket, prefix = direction(
+    export, yt_path, location = direction(
         source=arguments.source, destination=arguments.destination
     )
+
+    location = await resolve_storage(location=location, export=export)
 
     memory_budget = estimate_memory_mib(
         concurrency=options.concurrency,
@@ -104,7 +88,7 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
     log.info(
         "copy_started direction=%s concurrency=%d buffer_size_mib=%d "
         "memory_estimate_mib=%d",
-        "yt-to-s3" if export else "s3-to-yt",
+        f"yt-to-{location.kind}" if export else f"{location.kind}-to-yt",
         options.concurrency,
         options.chunk_size // MIB,
         memory_budget,
@@ -146,27 +130,19 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
             else None
         )
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(
-                    total=None, sock_connect=30, sock_read=300
-                )
-            ) as session:
-                client = S3Client(
-                    session=session,
-                    url=arguments.endpoint.rstrip("/") + "/" + bucket,
-                    region=arguments.region,
-                )
-                storage = S3Storage(
-                    client=client,
-                    chunk_size=options.chunk_size,
-                    progress=progress,
-                )
+            async with open_storage(
+                location=location,
+                endpoint=arguments.endpoint,
+                region=arguments.region,
+                chunk_size=options.chunk_size,
+                progress=progress,
+            ) as storage:
                 if export:
                     result = await export_tree(
                         yt=yt,
                         storage=storage,
                         source=yt_path,
-                        prefix=prefix,
+                        prefix=location.prefix,
                         cluster=arguments.yt_proxy.rstrip("/"),
                         options=options,
                         progress=progress,
@@ -175,7 +151,7 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
                     result = await restore_tree(
                         yt=yt,
                         storage=storage,
-                        source_prefix=prefix,
+                        source_prefix=location.prefix,
                         destination=yt_path,
                         options=options,
                         progress=progress,
