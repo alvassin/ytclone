@@ -60,13 +60,24 @@ Each run creates unique `//tmp/ytclone-main-*`, `//tmp/ytclone-raw-retry-*`, and
 `//tmp/ytclone-cli-*` paths, plus `main-smoke-*`, `raw-retry-*`, and `cli-smoke-*`
 prefixes in the local `yt-backup` bucket. Tests cover export and restore, repeated
 copies, changed metadata, empty nodes, file parts, corruption rollback, and
-table-read retries within a snapshot. The CLI roundtrip exports five nodes using
-two real worker processes, restores them, and repeats both commands to verify
-unchanged objects are skipped.
+table-read retries within a snapshot. Document tests also cover scalar, empty and
+attributed YSON, a value exceeding the default node-list limit, concurrent source
+changes, changed destinations, and corrupt-archive rollback. The CLI roundtrip
+exports six nodes using two real worker processes, restores them, and repeats
+both commands to verify unchanged objects are skipped. Its table spans multiple
+archive parts and uses concurrent export streams.
+
+Concurrent snapshot cases use unique `//tmp/ytclone-concurrent-*` source paths
+and `concurrent-smoke-*` S3 prefixes or temporary local archives. They synchronize
+two actual readers, rewrite the source while the snapshot is open, and verify
+that both ranges share one transaction and restore the original ordered rows
+and metadata. These cases also verify independent reader clients/threads and
+closed input streams.
 
 `tests/test_local_filesystem.py` needs only the local YT service. It runs ordinary
 and parallel exports into temporary disk archives, relocates the root, restores
-through the CLI and checks unchanged reruns without AWS credentials. The installed
+through the CLI and checks unchanged reruns without AWS credentials. Both CLI
+modes export a table with several parts using a shared stream limit. The installed
 wheel CI job includes these cases.
 
 Fixtures are retained for inspection while the local containers and their storage

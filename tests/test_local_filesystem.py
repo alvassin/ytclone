@@ -142,6 +142,9 @@ def local_tree():
     expected_rows = [
         {b"id": 1, b"payload": b"\x00\xff", b"u": yson.YsonUint64(2**64 - 1)},
         {b"id": 2, b"payload": None, b"u": None},
+    ] + [
+        {b"id": index, b"payload": bytes(range(256)) * 2048, b"u": None}
+        for index in range(3, 11)
     ]
     payload = bytes(range(256)) * 8192
     try:
@@ -196,7 +199,9 @@ def test_filesystem_cli_round_trip_relocation_restart_and_corruption(
 ):
     client, source, target, expected_rows, payload = local_tree
     archive = tmp_path / "disk archive"
-    extra = ("--processes", "2") if module == "ytclone.parallel" else ()
+    extra = ("--part-concurrency", "3", "--max-streams", "2")
+    if module == "ytclone.parallel":
+        extra += ("--processes", "2")
     for repeated in (False, True):
         output, logs = run_cli(
             module=module,
@@ -219,6 +224,16 @@ def test_filesystem_cli_round_trip_relocation_restart_and_corruption(
     relocated = tmp_path / "relocated archive"
     archive.rename(relocated)
     selected = relocated / source.removeprefix("//")
+    table_manifest = Manifest.from_bytes(
+        (selected / "table/@manifest.json").read_bytes()
+    )
+    assert len(table_manifest.parts) >= 3
+    assert table_manifest.parts[0].start == 0
+    assert table_manifest.parts[-1].stop == len(expected_rows)
+    assert all(
+        left.stop == right.start
+        for left, right in zip(table_manifest.parts, table_manifest.parts[1:])
+    )
     for repeated in (False, True):
         output, _ = run_cli(
             module="ytclone",

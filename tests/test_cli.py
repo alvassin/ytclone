@@ -36,6 +36,8 @@ def test_defaults_match_engine_and_aiomisc():
     parsed = arguments()
     defaults = CopyOptions()
     assert parsed.concurrency == defaults.concurrency == 4
+    assert parsed.part_concurrency == defaults.part_concurrency == 1
+    assert parsed.max_streams == defaults.max_streams == 0
     assert parsed.queue_size == defaults.queue_size == 16
     assert parsed.part_size_mib * MIB == defaults.part_size
     assert parsed.buffer_size_mib * MIB == defaults.chunk_size
@@ -200,7 +202,13 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
 ):
     """Log the memory budget before constructing transfer resources."""
     calls = {}
-    options = CopyOptions(concurrency=2, chunk_size=8 * MIB, compression_level=7)
+    options = CopyOptions(
+        concurrency=2,
+        part_concurrency=1 if restore else 3,
+        max_streams=0 if restore else 4,
+        chunk_size=8 * MIB,
+        compression_level=7,
+    )
     parsed = arguments(
         restore=restore, extra=("--no-proxy-discovery", "--endpoint", "http://s3.test/")
     )
@@ -215,9 +223,17 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
         async def __aexit__(self, *exc):
             calls["session_closed"] = True
 
-    def estimate_memory(*, concurrency, chunk_size, compression_level, export):
+    def estimate_memory(
+        *, concurrency, chunk_size, compression_level, export, reader_concurrency=None
+    ):
         """Record the actual transfer settings used for the startup estimate."""
-        calls["estimate"] = (concurrency, chunk_size, compression_level, export)
+        calls["estimate"] = (
+            concurrency,
+            chunk_size,
+            compression_level,
+            export,
+            reader_concurrency,
+        )
         return 512
 
     def yt_adapter(*, proxy, proxy_discovery, progress):
@@ -265,7 +281,13 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
 
     result = asyncio.run(cli.run(arguments=parsed, options=options))
     assert result == failures
-    assert calls["estimate"] == (2, 8 * MIB, 7, not restore)
+    assert calls["estimate"] == (
+        2 if restore else 4,
+        8 * MIB,
+        7,
+        not restore,
+        None if restore else 6,
+    )
     startup = calls["startup_logs"]
     expected_direction = "s3-to-yt" if restore else "yt-to-s3"
     expected_start = (
@@ -276,10 +298,10 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
         "Memory estimate is a planning budget; large rows, metadata and allocator "
         "overhead can exceed it."
     )
-    assert [record.getMessage() for record in startup] == [
-        expected_start,
-        expected_note,
-    ]
+    expected_logs = [expected_start, expected_note]
+    if not restore:
+        expected_logs.append("export_parallelism part_concurrency=3 max_streams=4")
+    assert [record.getMessage() for record in startup] == expected_logs
     assert all(record.levelno == logging.INFO for record in startup)
     assert calls["yt"] == ("https://yt.example.test", False)
     assert calls["s3"] == ("http://s3.test/bucket", "us-east-1")
@@ -300,6 +322,8 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
     "extra",
     [
         ("--concurrency", "0"),
+        ("--part-concurrency", "0"),
+        ("--max-streams", "-1"),
         ("--queue-size", "0"),
         ("--buffer-size-mib", "4"),
         ("--part-size-mib", "0"),
@@ -322,6 +346,26 @@ def test_main_rejects_invalid_options_before_starting_resources(monkeypatch, ext
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("archive", ["s3://bucket/archive", "./dump/source"])
+@pytest.mark.parametrize("extra", [("--part-concurrency", "3"), ("--max-streams", "4")])
+def test_restore_rejects_export_parallelism_before_runtime(
+    monkeypatch, capsys, archive, extra
+):
+    """Unsupported restore settings must fail before opening either storage."""
+
+    def unexpected_run(*args, **kwargs):
+        pytest.fail("Restore validation must precede resource construction")
+
+    monkeypatch.setattr(cli.aiomisc, "run", unexpected_run)
+    monkeypatch.setattr(
+        sys, "argv", ["ytclone", archive, "//restored", "--yt-proxy", "test", *extra]
+    )
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert "apply to export only" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -369,6 +413,10 @@ def test_main_passes_aiomisc_logging_options_and_copy_settings(
             "test",
             "--concurrency",
             "5",
+            "--part-concurrency",
+            "3",
+            "--max-streams",
+            "4",
             "--log-level",
             "debug",
             "--log-format",
@@ -377,6 +425,8 @@ def test_main_passes_aiomisc_logging_options_and_copy_settings(
     )
     assert cli.main() == 1
     assert seen["options"].concurrency == 5
+    assert seen["options"].part_concurrency == 3
+    assert seen["options"].max_streams == 4
     assert seen["runtime"] == (6, "debug", effective_format, date_format)
 
 

@@ -1,4 +1,4 @@
-"""Copy YTsaurus static tables, files and directories to or from S3 and local archives."""
+"""Copy YTsaurus tables, files, documents and directories to or from S3 and local archives."""
 
 import asyncio
 import logging
@@ -39,7 +39,14 @@ class Arguments(argclass.Parser):
     )
     region: str = argclass.Argument(env_var="AWS_DEFAULT_REGION", default="us-east-1")
     concurrency: int = argclass.Argument(
-        default=4, help="Maximum concurrent table/file transfers"
+        default=4, help="Maximum concurrent data node transfers"
+    )
+    part_concurrency: int = argclass.Argument(
+        default=1, help="Maximum concurrent parts per static table (export only)"
+    )
+    max_streams: int = argclass.Argument(
+        default=0,
+        help="Active data parts per process (export only); 0 = max(concurrency, part-concurrency)",
     )
     queue_size: int = argclass.Argument(default=16, help="Maximum queued node paths")
     part_size_mib: int = argclass.Argument(
@@ -80,7 +87,8 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
     location = await resolve_storage(location=location, export=export)
 
     memory_budget = estimate_memory_mib(
-        concurrency=options.concurrency,
+        concurrency=options.stream_limit if export else options.concurrency,
+        reader_concurrency=options.reader_limit if export else None,
         chunk_size=options.chunk_size,
         compression_level=options.compression_level,
         export=export,
@@ -97,6 +105,12 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
         "Memory estimate is a planning budget; large rows, metadata and "
         "allocator overhead can exceed it."
     )
+    if export:
+        log.info(
+            "export_parallelism part_concurrency=%d max_streams=%d",
+            options.part_concurrency,
+            options.stream_limit,
+        )
 
     progress = Progress() if arguments.log_file else None
     if progress is not None:
@@ -198,9 +212,19 @@ def main() -> int:
             or arguments.progress_interval <= 0
         ):
             raise ValueError("Progress interval must be positive and finite")
-        direction(source=arguments.source, destination=arguments.destination)
+        export, _, _ = direction(
+            source=arguments.source, destination=arguments.destination
+        )
+        if not export and (
+            arguments.part_concurrency != 1 or arguments.max_streams != 0
+        ):
+            raise ValueError(
+                "Part concurrency and maximum streams apply to export only"
+            )
         options = CopyOptions(
             concurrency=arguments.concurrency,
+            part_concurrency=arguments.part_concurrency,
+            max_streams=arguments.max_streams,
             queue_size=arguments.queue_size,
             part_size=arguments.part_size_mib * MIB,
             chunk_size=arguments.buffer_size_mib * MIB,

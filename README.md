@@ -1,8 +1,8 @@
 # ytclone
 
-Copy static tables, files, and directories between YTsaurus and S3 or local disk,
-preserving schemas and portable attributes. Repeat a command to skip completed,
-unchanged nodes and retry unfinished copies.
+Copy static tables, files, YSON documents, and directories between YTsaurus and
+S3 or local disk, preserving schemas and portable attributes. Repeat a command
+to skip completed, unchanged nodes and retry unfinished copies.
 
 Restoring requires an archive created by `ytclone`.
 
@@ -77,14 +77,15 @@ ytclone s3://my-bucket/export/home/analytics/events \
 
 The restore destination is used exactly as given: the children of `events` go
 directly under `//home/analytics/events_copy`. The same commands work for a single
-table or file. With `--log-file`, progress appears on the console and detailed
-logs are appended to the file.
+table, file, or document. With `--log-file`, progress appears on the console and
+detailed logs are appended to the file.
 
 ## Repeated runs
 
 Run the same command again after an interruption or a source update. Completed,
 unchanged nodes are skipped. New, changed, or incomplete nodes are copied again;
-an interrupted table or file starts from the beginning, not from its last part.
+an interrupted table, file, or document starts from the beginning, not from its
+last part.
 
 Source data is never deleted. Destination nodes absent from the source are kept.
 Use a separate archive root or S3 prefix for each source cluster.
@@ -99,20 +100,33 @@ ytclone-parallel //home/analytics/events s3://my-bucket/export \
 ```
 
 Replace the S3 destination with `./dump` to export to local disk. This runs two
-processes with two transfers each, prioritizing directories and small nodes.
-One table still occupies one transfer slot. Parallel mode supports YT → S3 or
-local disk; restore its archives with `ytclone` as above.
+processes with two node transfers each, prioritizing directories and small nodes.
+Parallel mode supports YT → S3 or local disk; restore its archives with `ytclone`
+as above.
+
+To export one large table using several concurrent row ranges:
+
+```bash
+ytclone //home/analytics/large_table s3://my-bucket/export \
+  --part-concurrency 4 --max-streams 4 --log-file export.log
+```
+
+Both commands support `--part-concurrency`; its default of `1` keeps table parts
+sequential. `--max-streams` caps active data transfers across all nodes in each
+process. All ranges of a table use one snapshot, and the archive retains row
+order. A table stays in one process; adding processes helps when exporting
+multiple nodes. See [large-table tuning](USAGE.md#large-tables) for the limits.
 
 ## Before you copy
 
-- **Supported node types:** static tables, files, and directories. Dynamic tables
-  are skipped and reported; links are unsupported.
+- **Supported node types:** static tables, files, YSON documents, and directories.
+  Dynamic tables are skipped and reported; links are unsupported.
 - **One current archive copy.** There is no archive version history. Replacing a node
   makes its archive unavailable until completion; a failed replacement can lose
   the previous complete copy.
 - **Permissions are not copied.** ACLs, ownership, and account settings are
-  excluded. Replacing an existing YT table or file recreates the node, so its
-  previous settings are not preserved either.
+  excluded. Replacing an existing YT table, file, or document recreates the node,
+  so its previous settings are not preserved either.
 - **Consistency is per node.** A directory tree is not a single point-in-time
   snapshot.
 - **Avoid overlapping writers.** Do not run commands that write to the same

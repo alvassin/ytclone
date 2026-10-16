@@ -6,6 +6,7 @@ import re
 import time
 from contextlib import aclosing
 from dataclasses import dataclass, replace
+from itertools import chain, islice
 
 import aiomisc
 from aiochannel import Channel
@@ -48,6 +49,8 @@ PART_RETRY_PAUSE = 1
 @dataclass(frozen=True)
 class CopyOptions:
     concurrency: int = 4
+    part_concurrency: int = 1
+    max_streams: int = 0
     queue_size: int = 16
     # Target uncompressed size per archive object; approximate for tables.
     part_size: int = 256 * MIB
@@ -57,14 +60,33 @@ class CopyOptions:
 
     def __post_init__(self):
         """Validate concurrency, buffer sizes and compression level."""
-        if min(self.concurrency, self.queue_size, self.part_size) < 1:
+        if (
+            min(
+                self.concurrency, self.part_concurrency, self.queue_size, self.part_size
+            )
+            < 1
+        ):
             raise ValueError(
                 "Concurrency, queue and archive part size must be positive"
+            )
+        if self.max_streams < 0:
+            raise ValueError(
+                "Maximum streams must be nonnegative (0 selects automatically)"
             )
         if not 5 * MIB <= self.chunk_size <= 512 * MIB:
             raise ValueError("Multipart buffer must be between 5 and 512 MiB")
         if not -7 <= self.compression_level <= 22:
             raise ValueError("Zstandard level must be between -7 and 22")
+
+    @property
+    def stream_limit(self) -> int:
+        """Cap active part pipelines across all nodes in one copy process."""
+        return self.max_streams or max(self.concurrency, self.part_concurrency)
+
+    @property
+    def reader_limit(self) -> int:
+        """Budget retained SDK readers, including idle sessions within snapshots."""
+        return self.concurrency * min(self.part_concurrency, self.stream_limit)
 
 
 @dataclass
@@ -150,6 +172,7 @@ class _SourceProgress:
     copied: float = 0
     fraction: float = 0
     skipped: int = 0
+    completed_units: int = 0
 
     def __enter__(self):
         """Keep accounting alive through snapshot exit and publication."""
@@ -180,7 +203,8 @@ class _SourceProgress:
         """Credit an uploaded part by its share of source rows or file bytes."""
         if not self.total:
             return
-        fraction = min(1, part.stop / self.total)
+        self.completed_units += part.stop - part.start
+        fraction = min(1, self.completed_units / self.total)
         copied = self.disk_size * fraction
         self.progress.source_copied_bytes += copied - self.copied
         self.progress.source_partial_nodes += fraction - self.fraction
@@ -284,6 +308,62 @@ async def copy_part(
     return await transfer()
 
 
+async def _export_parts(
+    *,
+    snapshot: SourceSnapshot,
+    storage: ObjectStorage,
+    target: str,
+    options: CopyOptions,
+    source_progress: _SourceProgress,
+    streams: asyncio.Semaphore,
+) -> list[Part]:
+    """Stream a bounded set of ranges and collect references in source order."""
+    node = snapshot.node
+    ranges = plan_parts(node=node, part_size=options.part_size)
+    concurrency = options.part_concurrency if node.kind == "table" else 1
+    # Seed only as many workers as there are ranges, without materializing the plan.
+    initial = list(islice(ranges, min(concurrency, options.stream_limit)))
+    if not initial:
+        return []
+    pending = chain(initial, ranges)
+    completed: list[tuple[int, Part]] = []
+
+    async def worker():
+        for part in pending:
+            # Include source retries and destination cleanup in the stream lifetime.
+            async with streams:
+                ref = await copy_part(
+                    snapshot=snapshot,
+                    storage=storage,
+                    key=data_key(prefix=target, kind=node.kind, index=part.index),
+                    part=part,
+                    compression_level=options.compression_level,
+                    chunk_size=options.chunk_size,
+                )
+            completed.append(
+                (part.index, Part(object=ref, start=part.start, stop=part.stop))
+            )
+            source_progress.advance(part=part)
+            log.info(
+                "part_uploaded path=%s part=%d bytes=%d",
+                node.path,
+                part.index,
+                ref.size,
+            )
+
+    tasks = [asyncio.create_task(worker()) for _ in initial]
+    completion = asyncio.gather(*tasks)
+    try:
+        await asyncio.shield(completion)
+    finally:
+        # A failed range must not leave readers using a transaction after its exit.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(completion, *tasks, return_exceptions=True)
+    return [part for _, part in sorted(completed, key=lambda item: item[0])]
+
+
 async def export_node(
     *,
     yt: YtBackend,
@@ -294,6 +374,7 @@ async def export_node(
     options: CopyOptions,
     progress: Progress | None = None,
     discovered: DiscoveredNode | None = None,
+    streams: asyncio.Semaphore | None = None,
 ):
     """Skip a verified listing state or publish one consistent source snapshot."""
     started = time.monotonic()
@@ -301,6 +382,9 @@ async def export_node(
     manifest_key = object_key(prefix=target, name="@manifest.json")
 
     progress = progress if progress is not None else Progress()
+    streams = (
+        streams if streams is not None else asyncio.Semaphore(options.stream_limit)
+    )
     with _SourceProgress(progress=progress) as source_progress:
         old = None
         complete = None
@@ -355,25 +439,14 @@ async def export_node(
                     key=object_key(prefix=target, name="@attributes.yson"),
                     data=node.attributes,
                 )
-                parts = []
-                for part in plan_parts(node=node, part_size=options.part_size):
-                    key = data_key(prefix=target, kind=node.kind, index=part.index)
-                    ref = await copy_part(
-                        snapshot=snapshot,
-                        storage=storage,
-                        key=key,
-                        part=part,
-                        compression_level=options.compression_level,
-                        chunk_size=options.chunk_size,
-                    )
-                    source_progress.advance(part=part)
-                    parts.append(Part(object=ref, start=part.start, stop=part.stop))
-                    log.info(
-                        "part_uploaded path=%s part=%d bytes=%d",
-                        path,
-                        part.index,
-                        ref.size,
-                    )
+                parts = await _export_parts(
+                    snapshot=snapshot,
+                    storage=storage,
+                    target=target,
+                    options=options,
+                    source_progress=source_progress,
+                    streams=streams,
+                )
 
         # A refreshed revision is trustworthy only after successful snapshot exit.
         source = _source_metadata(node=node, cluster=cluster)
@@ -420,8 +493,9 @@ async def export_tree(
     options: CopyOptions,
     progress: Progress | None = None,
 ) -> CopyResult:
-    """Walk a YT subtree and copy its nodes to an S3 prefix."""
+    """Walk a YT subtree and copy nodes with one shared stream budget."""
     progress = progress if progress is not None else Progress()
+    streams = asyncio.Semaphore(options.stream_limit)
 
     async def discover(*, channel: Channel[DiscoveredNode], yt: YtBackend):
         """Queue source identities and revisions from directory listings."""
@@ -443,6 +517,7 @@ async def export_tree(
             options=options,
             progress=progress,
             discovered=item,
+            streams=streams,
         )
 
     return await _pipeline(

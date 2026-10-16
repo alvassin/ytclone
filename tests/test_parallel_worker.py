@@ -334,6 +334,8 @@ def test_run_worker_builds_process_local_resources(monkeypatch):
                 "prefix": "snapshots",
             },
             "concurrency": 3,
+            "part_concurrency": 3,
+            "max_streams": 4,
             "part_size": 256 * 1024**2,
             "chunk_size": 32 * 1024**2,
             "compression_level": 3,
@@ -349,6 +351,8 @@ def test_run_worker_builds_process_local_resources(monkeypatch):
     assert seen["s3_options"]["region"] == "region-test"
     assert set(seen["s3_options"]) == {"session", "url", "region"}
     assert seen["serve"]["options"].concurrency == 3
+    assert seen["serve"]["options"].part_concurrency == 3
+    assert seen["serve"]["options"].max_streams == 4
     assert seen["serve"]["prefix"] == "snapshots"
     assert seen["serve"]["cluster"] == "https://yt.test"
     assert seen["yt_options"]["proxy_discovery"] is False

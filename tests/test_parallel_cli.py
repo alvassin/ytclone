@@ -32,6 +32,8 @@ def arguments(*extra):
         ("--small-table-mib", "-1"),
         ("--progress-interval", "nan"),
         ("--concurrency", "0"),
+        ("--part-concurrency", "0"),
+        ("--max-streams", "-1"),
     ],
 )
 def test_invalid_settings(flag, value):
@@ -56,6 +58,10 @@ def test_run_passes_nonsecret_config_and_reports_failure(monkeypatch, capsys):
         "3",
         "--concurrency",
         "2",
+        "--part-concurrency",
+        "3",
+        "--max-streams",
+        "4",
         "--endpoint",
         "https://s3.invalid",
         "--region",
@@ -65,6 +71,12 @@ def test_run_passes_nonsecret_config_and_reports_failure(monkeypatch, capsys):
     )
     captured = {}
     monkeypatch.setattr(cli, "YtAdapter", lambda **kwargs: object())
+
+    def estimate_memory(**kwargs):
+        captured["memory"] = kwargs
+        return 384
+
+    monkeypatch.setattr(cli, "estimate_memory_mib", estimate_memory)
 
     async def supervise(**kwargs):
         """Observe passed settings and simulate a failed node."""
@@ -77,6 +89,10 @@ def test_run_passes_nonsecret_config_and_reports_failure(monkeypatch, capsys):
     assert captured["small_size"] == 8 * 1024**2
     config = captured["config"]
     assert config["concurrency"] == 2
+    assert config["part_concurrency"] == 3
+    assert config["max_streams"] == 4
+    assert captured["memory"]["concurrency"] == 4
+    assert captured["memory"]["reader_concurrency"] == 6
     assert config["storage"] == {
         "kind": "s3",
         "bucket": "bucket",
@@ -85,7 +101,10 @@ def test_run_passes_nonsecret_config_and_reports_failure(monkeypatch, capsys):
     }
     assert config["endpoint"] == "https://s3.invalid" and config["region"] == "custom"
     assert not any("secret" in key.lower() or "token" in key.lower() for key in config)
-    assert "failed" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "failed" in output
+    assert "streams/process=4" in output
+    assert "RAM estimate: 1152 MiB" in output
 
 
 def test_local_coordinator_resolves_archive_before_spawning_workers(

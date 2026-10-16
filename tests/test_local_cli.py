@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(
 
 YT_PROXY = "http://localhost:8000"
 S3_ENDPOINT = "http://localhost:8333"
-NODE_COUNT = 5
+NODE_COUNT = 6
 CLI_TIMEOUT = 180
 
 
@@ -87,6 +87,8 @@ def run_cli(*, module, source, destination, directory, name, extra=()):
     command = [sys.executable, "-m", module, *arguments]
     image = os.environ.get("YTCLONE_DOCKER_IMAGE")
     portable = os.environ.get("YTCLONE_PORTABLE_DIR")
+    if not image and not portable and os.environ.get("PYTHONPATH"):
+        environment["PYTHONPATH"] = os.environ["PYTHONPATH"]
     assert not (image and portable), (
         "Choose either YTCLONE_DOCKER_IMAGE or YTCLONE_PORTABLE_DIR"
     )
@@ -194,7 +196,9 @@ def test_local_installed_parallel_export_and_cli_restore(tmp_path):
         ],
         attributes={"strict": True, "unique_keys": True},
     )
-    expected_rows = [{b"id": 1, b"payload": b"\x00\xff"}]
+    expected_rows = [{b"id": 1, b"payload": b"\x00\xff"}] + [
+        {b"id": index, b"payload": bytes(range(256)) * 2048} for index in range(2, 10)
+    ]
     payload = bytes(range(256)) * 8192
     client.create(
         type="map_node",
@@ -226,6 +230,13 @@ def test_local_installed_parallel_export_and_cli_restore(tmp_path):
     )
     client.write_file(destination=source + "/file", stream=io.BytesIO(payload))
 
+    document = {b"checkpoint": [yson.YsonUint64(2**64 - 1), b"\xff", None]}
+    client.create(
+        type="document",
+        path=source + "/document",
+        attributes={"value": document, "note": "document metadata"},
+    )
+
     for repeated in (False, True):
         output, logs = run_cli(
             module="ytclone.parallel",
@@ -233,7 +244,16 @@ def test_local_installed_parallel_export_and_cli_restore(tmp_path):
             destination=archive,
             directory=tmp_path,
             name="export-repeat" if repeated else "export",
-            extra=("--processes", "2", "--discovery-concurrency", "2"),
+            extra=(
+                "--processes",
+                "2",
+                "--discovery-concurrency",
+                "2",
+                "--part-concurrency",
+                "3",
+                "--max-streams",
+                "2",
+            ),
         )
         assert_summary(
             output=output,
@@ -256,6 +276,19 @@ def test_local_installed_parallel_export_and_cli_restore(tmp_path):
             copied=0 if repeated else NODE_COUNT,
             unchanged=NODE_COUNT if repeated else 0,
         )
+
+    assert client.get(path=destination + "/document/@type") == "document"
+    restored_document = yson.loads(
+        client.get(
+            path=destination + "/document/@value",
+            format=sdk.YsonFormat(attributes={"format": "binary"}),
+        ),
+        encoding=None,
+    )
+    assert yson.dumps(
+        restored_document, yson_format="binary", sort_keys=True
+    ) == yson.dumps(document, yson_format="binary", sort_keys=True)
+    assert client.get(path=destination + "/document/@note") == "document metadata"
 
     for name in ("table", "empty_table"):
         with contextlib.closing(

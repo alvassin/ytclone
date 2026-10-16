@@ -5,11 +5,12 @@ import contextlib
 import copy
 import functools
 import hashlib
+import io
 import logging
 import os
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import yt.wrapper as yt
@@ -23,6 +24,7 @@ from yt.wrapper.ypath import escape_ypath_literal
 
 from .codec import AsyncReader
 from .format import (
+    DOCUMENT_KIND,
     MIB,
     RESTORE_MARKER,
     ROW_FORMAT,
@@ -53,6 +55,7 @@ PORTABLE_SYSTEM = {
     "table": (b"schema", b"compression_codec", b"erasure_codec", b"optimize_for"),
     "file": (b"compression_codec", b"erasure_codec", b"file_name", b"executable"),
     "map_node": (),
+    DOCUMENT_KIND: (),
 }
 EXCLUDED = {
     b"acl",
@@ -103,12 +106,29 @@ def _attribute_path(*, path: str, name: bytes) -> str:
 def _attributes(*, client, path: str, names: list[bytes]) -> dict:
     """Fetch selected attributes without following the node itself."""
     data = client.get(
-        path=path + "&",
+        path=path + "&/@",
         attributes=[_text(name) for name in names],
-        max_size=0,
+        max_size=LIST_LIMIT,
         format=WIRE,
     )
-    return yson.loads(string=data, encoding=None).attributes
+    result = yson.loads(string=data, encoding=None)
+    if not isinstance(result, dict) or result.attributes.get(b"incomplete"):
+        raise ValueError("Invalid or incomplete YT attributes")
+    return result
+
+
+def _canonical_document(data: bytes) -> bytes:
+    """Validate one complete YSON value and preserve its types and attributes."""
+    return yson.dumps(
+        object=yson.loads(string=data, encoding=None),
+        yson_format="binary",
+        sort_keys=True,
+    )
+
+
+def _read_document(*, client, pinned: str) -> bytes:
+    """Read the complete opaque value, separately from Cypress node attributes."""
+    return _canonical_document(client.get(path=pinned + "/@value", format=WIRE))
 
 
 def _resolve_node(*, client, path: str) -> str:
@@ -116,7 +136,7 @@ def _resolve_node(*, client, path: str) -> str:
     components = path_components(path)
 
     # Suppress links in every component without reading ancestor nodes.
-    # _attributes adds the final '&'; subsequent requests use the returned ID.
+    # _attributes adds the final '&/@'; subsequent requests use the returned ID.
     attrs = _attributes(
         client=client,
         path="//" + "&/".join(components),
@@ -199,7 +219,7 @@ def _discovered_node(*, path: str, attrs: dict) -> DiscoveredNode:
         raise ValueError(f"Discovery omitted node id or type: {path}")
     kind = _text(kind)
     dynamic = attrs.get(b"dynamic")
-    if kind in ("file", "map_node"):
+    if kind in ("file", "map_node", DOCUMENT_KIND):
         dynamic = False
     elif isinstance(dynamic, (bool, yson.YsonBoolean)):
         dynamic = bool(dynamic)
@@ -280,6 +300,8 @@ def _read_node(*, client, pinned: str, path: str) -> Node:
         required.update({b"schema", b"row_count", b"content_revision", b"data_weight"})
     elif kind == "file":
         required.update({b"uncompressed_data_size", b"content_revision"})
+    elif kind == DOCUMENT_KIND:
+        required.add(b"content_revision")
     missing = required - metadata.keys()
     if missing:
         raise ValueError(f"Missing required YT attributes: {sorted(missing)!r}")
@@ -477,27 +499,40 @@ class _ReadStream:
             self.raw.close()
 
 
-class Snapshot(SourceSnapshot):
-    def __init__(self, *, session: _Session, node: Node):
-        """Bind a pinned node to its reading session."""
+class _SnapshotReader:
+    def __init__(
+        self,
+        *,
+        session: _Session,
+        owner: _Session,
+        node: Node,
+        document: bytes | None = None,
+    ):
+        """Keep one stream on its own client while borrowing the owner's snapshot."""
         self.session = session
+        self.owner = owner
         self.node = node
         self.pinned = "#" + node.node_id
         self._stream = None
         self._reading = False
+        self._leased = False
+        self._closed = False
+        self._pending = None
+        self._cleanup_task = None
+        self.document = document
 
     def _open_part(self, *, part: Range, compression_level: int):
         """Open and compress one table-row or file-byte range."""
         if self._stream is not None:
             raise RuntimeError("Read one part at a time within a snapshot")
-        self.session.check()
+        self.owner.check()
         client = self.session.client
         if self.node.kind == "table":
             raw = _read_table(
                 client=client,
                 pinned=self.pinned,
                 part=part,
-                transaction_id=self.session.transaction.transaction_id,
+                transaction_id=self.owner.transaction.transaction_id,
             )
         elif self.node.kind == "file":
             raw = client.read_file(
@@ -506,6 +541,12 @@ class Snapshot(SourceSnapshot):
                 length=part.stop - part.start,
                 enable_read_parallel=False,
             )
+        elif self.node.kind == DOCUMENT_KIND:
+            if self.document is None or part != Range(
+                index=0, start=0, stop=len(self.document)
+            ):
+                raise ValueError("Invalid document part")
+            raw = io.BytesIO(self.document)
         else:
             raise ValueError(f"Cannot read data of {self.node.kind}")
 
@@ -525,8 +566,15 @@ class Snapshot(SourceSnapshot):
 
     async def _read(self, function, /, **kwargs):
         """Translate only source-call failures into whole-part retry signals."""
+        if self._closed:
+            raise RuntimeError("Snapshot is closed")
+        if self.session.poisoned:
+            raise RuntimeError("YT reader cleanup failed")
         try:
-            return await self.session.call(function, operation="yt_read", **kwargs)
+            result = await self.session.call(function, operation="yt_read", **kwargs)
+            if self._closed:
+                raise RuntimeError("Snapshot is closed")
+            return result
         except Exception as error:
             if (
                 self.node.kind == "table"
@@ -542,16 +590,43 @@ class Snapshot(SourceSnapshot):
         if stream is not None:
             stream.close()
 
-    async def read_part(
+    async def _drain_stream(self):
+        """Drain prefetched SDK work before closing its stream on the same thread."""
+        pending, self._pending = self._pending, None
+        if pending is not None:
+            pending.cancel()
+            with contextlib.suppress(BaseException):
+                await pending
+        await self.session.call(self._close_part, operation=None)
+
+    async def _close_stream(self):
+        """Share cleanup between the consumer and snapshot exit, even on cancellation."""
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._drain_stream())
+        try:
+            await asyncio.shield(self._cleanup_task)
+        except asyncio.CancelledError:
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(self._cleanup_task)
+            raise
+        except BaseException:
+            self.session.poisoned = True
+            raise
+
+    async def _read_part(
         self, *, part: Range, compression_level: int, chunk_size: int
     ) -> AsyncIterator[bytes]:
         """Stream a compressed part with one chunk of prefetch."""
+        if self._closed:
+            raise RuntimeError("Snapshot is closed")
+        if self.session.poisoned:
+            raise RuntimeError("YT reader cleanup failed")
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
         if self._reading:
             raise RuntimeError("Read one part at a time within a snapshot")
         self._reading = True
-        pending = None
+        self._cleanup_task = None
         error = None
         try:
             stream = await self._read(
@@ -565,19 +640,17 @@ class Snapshot(SourceSnapshot):
                 pending = asyncio.create_task(
                     self._read(stream.compressed.read, size=chunk_size)
                 )
+                self._pending = pending
                 yield chunk
                 chunk = await pending
-                pending = None
+                if self._pending is pending:
+                    self._pending = None
         except BaseException as caught:
             error = caught
             raise
         finally:
-            if pending is not None:
-                pending.cancel()
-                with contextlib.suppress(BaseException):
-                    await pending
             try:
-                await self.session.call(self._close_part, operation=None)
+                await self._close_stream()
             except BaseException as cleanup_error:
                 self.session.poisoned = True
                 if error is None:
@@ -588,6 +661,82 @@ class Snapshot(SourceSnapshot):
                     raise error.__cause__ from cleanup_error
             finally:
                 self._reading = False
+
+
+class Snapshot(_SnapshotReader, SourceSnapshot):
+    def __init__(self, *, session: _Session, node: Node, document: bytes | None = None):
+        """Own one snapshot and lazily lend independent readers to concurrent parts."""
+        super().__init__(session=session, owner=session, node=node, document=document)
+        # Reuse the owner for sequential transfers; only overlapping table parts
+        # need extra clients. The engine bounds the number of concurrent leases.
+        self._readers = [self]
+        self._shutdown_task = None
+
+    async def read_part(
+        self, *, part: Range, compression_level: int, chunk_size: int
+    ) -> AsyncIterator[bytes]:
+        """Read one part using a reusable client with the same pinned transaction."""
+        if self._closed:
+            raise RuntimeError("Snapshot is closed")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        reader = next((item for item in self._readers if not item._leased), None)
+        if reader is None:
+            if self.node.kind != "table":
+                raise RuntimeError("Read one part at a time for files and documents")
+            reader = _SnapshotReader(
+                session=_Session(adapter=self.session.adapter),
+                owner=self.session,
+                node=self.node,
+            )
+            self._readers.append(reader)
+        reader._leased = True
+        try:
+            if reader.session.client is None:
+                await reader.session.call(reader.session.open, operation=None)
+            async with contextlib.aclosing(
+                reader._read_part(
+                    part=part,
+                    compression_level=compression_level,
+                    chunk_size=chunk_size,
+                )
+            ) as chunks:
+                async for chunk in chunks:
+                    if self._closed:
+                        raise RuntimeError("Snapshot is closed")
+                    yield chunk
+        finally:
+            reader._leased = False
+
+    async def _shutdown(self):
+        """Close every stream and borrowed client before the owner ends its transaction."""
+        for reader in self._readers:
+            reader._closed = True
+        results = await asyncio.gather(
+            *(reader._close_stream() for reader in self._readers),
+            return_exceptions=True,
+        )
+        results.extend(
+            await asyncio.gather(
+                *(reader.session.close() for reader in self._readers[1:]),
+                return_exceptions=True,
+            )
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def close(self):
+        """Do not release the snapshot transaction while reader cleanup is running."""
+        self._closed = True
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(self._shutdown())
+        try:
+            await asyncio.shield(self._shutdown_task)
+        except asyncio.CancelledError:
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(self._shutdown_task)
+            raise
 
 
 class Restore(RestoreSink):
@@ -602,6 +751,7 @@ class Restore(RestoreSink):
         self.byte_count = 0
         self.committed_chunks = None
         self.expected_attributes = None
+        self.expected_document = None
 
     def prepare(self):
         """Create a replacement node or update a directory safely."""
@@ -682,6 +832,20 @@ class Restore(RestoreSink):
                     stream=chunks(),
                     force_create=False,
                 )
+            elif self.node.kind == DOCUMENT_KIND:
+                if self.part_count:
+                    raise ValueError("A document cannot have multiple parts")
+                payload = bytearray()
+                for chunk in chunks():
+                    if self.byte_count > self.node.data_size:
+                        raise ValueError("Document exceeds declared size")
+                    payload.extend(chunk)
+                if self.byte_count != self.node.data_size:
+                    raise ValueError("Document size mismatch")
+                data = _canonical_document(bytes(payload))
+                source.finish()
+                self.session.client.set(path=self.pinned, value=data, format=WIRE)
+                self.expected_document = attributes_hash(data)
             else:
                 raise ValueError("Directories cannot have data parts")
             # A SDK implementation returning before consuming the body must not
@@ -727,9 +891,22 @@ class Restore(RestoreSink):
             self.committed_chunks = _chunks_digest(
                 client=self.session.client, pinned=self.pinned
             )
+        if self.node.kind == DOCUMENT_KIND:
+            self._validate_document()
         self.expected_attributes = attributes_hash(current.attributes)
         if self.expected_attributes != attributes_hash(self.node.attributes):
             raise ValueError("Restored attributes differ from source attributes")
+
+    def _validate_document(self):
+        """Verify semantic YSON content, independent of map serialization order."""
+        if (
+            self.expected_document is None
+            or attributes_hash(
+                _read_document(client=self.session.client, pinned=self.pinned)
+            )
+            != self.expected_document
+        ):
+            raise ValueError("Restored document content mismatch")
 
     def mark(self):
         """Record completion only if committed content remains unchanged."""
@@ -744,6 +921,8 @@ class Restore(RestoreSink):
             _chunks_digest(client=client, pinned=self.pinned) != self.committed_chunks
         ):
             raise ValueError("Destination content changed after restore commit")
+        if self.node.kind == DOCUMENT_KIND:
+            self._validate_document()
         client.set(
             path=_attribute_path(path=self.pinned, name=RESTORE_MARKER.encode()),
             value={
@@ -913,7 +1092,23 @@ class YtWorker(YtBackend):
                 )
 
             node = await session.call(pin)
-            yield Snapshot(session=session, node=node)
+            document = None
+            if node.kind == DOCUMENT_KIND:
+                document = await session.call(
+                    _read_document, client=session.client, pinned="#" + node.node_id
+                )
+                node = replace(node, data_size=len(document))
+            snapshot = Snapshot(session=session, node=node, document=document)
+            try:
+                yield snapshot
+            except BaseException:
+                try:
+                    await snapshot.close()
+                except BaseException:
+                    log.exception("snapshot_cleanup_failed path=%s", path)
+                raise
+            else:
+                await snapshot.close()
 
     async def matches(self, *, path: str, fingerprint: str) -> bool:
         """Check whether a completed restore still matches its fingerprint."""
