@@ -108,6 +108,7 @@ class Client:
 
     def find(self, path):
         path = str(path)
+        path = path.split("/@", maxsplit=1)[0]
         follow_links = not path.endswith("&")
         path = path.removesuffix("&")
 
@@ -193,11 +194,22 @@ class Client:
             attrs.pop(name, None)
         return attrs
 
-    def get(self, *, path, attributes, max_size, format):
+    def get(self, *, path, attributes=None, max_size=None, format=None):
         self.record("get")
-        attrs = self.attrs(self.find(path))
-        result = yson.to_yson_type(
-            None, attributes={name: attrs[name] for name in attributes if name in attrs}
+        try:
+            key = self.find(path)
+        except KeyError as error:
+            raise yt_module.yt.YtResponseError(
+                {"message": "No such node", "code": 500}
+            ) from error
+        if path.endswith("/@value"):
+            return self.nodes[key]["data"]
+        attrs = self.attrs(key)
+        selected = {name: attrs[name] for name in attributes or () if name in attrs}
+        result = (
+            selected
+            if path.endswith("/@")
+            else yson.to_yson_type(None, attributes=selected)
         )
         return yson.dumps(object=result, yson_format="binary")
 
@@ -249,8 +261,17 @@ class Client:
         else:
             del self.nodes[self.find(path)]
 
-    def set(self, *, path, value):
+    def set(self, *, path, value, format=None):
         self.record("set")
+        if "/@" not in path:
+            key = self.find(path)
+            assert self.nodes[key]["type"] == "document"
+            self.nodes[key]["data"] = value
+            if self.working is not None:
+                self.dirty.add(key)
+            else:
+                self.nodes[key]["revision"] += 1
+            return
         head, name = path.split("/@", maxsplit=1)
         self.nodes[self.find(head)]["attrs"][name] = value
 

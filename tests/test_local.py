@@ -555,3 +555,145 @@ def test_local_raw_read_retries_preserve_snapshot(monkeypatch, retry_rows, failu
             assert client.get(path=target + "/@note") == "snapshot metadata"
 
     asyncio.run(scenario())
+
+
+def test_local_documents_roundtrip_snapshot_changes_and_corruption():
+    """Real master-backed values retain YSON semantics through S3 and transactions."""
+    import json
+
+    from ytclone.format import plan_parts
+
+    client = local_client()
+    root = "//tmp/ytclone-documents-" + uuid.uuid4().hex[:12]
+    source, target = root + "/source", root + "/restored"
+    prefix = "documents-" + uuid.uuid4().hex[:12]
+    values = [
+        None,
+        {},
+        [],
+        b"",
+        b"\x00\xff",
+        True,
+        -(2**63),
+        yson.YsonUint64(2**64 - 1),
+        1.25,
+        {b"x": [None, b"\xff", yson.YsonUint64(1)]},
+        yson.to_yson_type({b"x": 1}, attributes={b"id": b"fake", b"type": b"file"}),
+        {b"x": yson.to_yson_type(b"\xff", attributes={b"tag": b"value"})},
+        list(range(66000)),
+    ]
+
+    def binary(value):
+        return yson.dumps(object=value, yson_format="binary", sort_keys=True)
+
+    def read(path):
+        return binary(
+            yson.loads(
+                client.get(path=path + "/@value", format=yt_adapter.WIRE), encoding=None
+            )
+        )
+
+    client.create(type="map_node", path=source, recursive=True)
+    for index, value in enumerate(values):
+        client.create(
+            type="document",
+            path=f"{source}/d{index}",
+            attributes={"value": value, "note": "portable metadata"},
+        )
+    expected = [binary(value) for value in values]
+    assert [read(f"{source}/d{index}") for index in range(len(values))] == expected
+
+    async def scenario():
+        yt = YtAdapter(
+            proxy="http://localhost:8000",
+            proxy_discovery=False,
+            client_factory=local_client,
+        )
+        options = CopyOptions(concurrency=2, part_size=1, chunk_size=5 * MIB)
+        async with aiohttp.ClientSession() as session:
+            s3 = S3Client(
+                session=session,
+                url="http://localhost:8333/yt-backup",
+                access_key_id="local-bench",
+                secret_access_key="local-bench-secret",
+                region="us-east-1",
+            )
+            storage = S3Storage(client=s3, chunk_size=options.chunk_size)
+            export_kwargs = {
+                "yt": yt,
+                "storage": storage,
+                "source": source,
+                "prefix": prefix,
+                "cluster": "local",
+                "options": options,
+            }
+            restore_kwargs = {
+                "yt": yt,
+                "storage": storage,
+                "source_prefix": node_prefix(prefix=prefix, path=source),
+                "destination": target,
+                "options": options,
+            }
+            for repeated in (False, True):
+                exported = await export_tree(**export_kwargs)
+                restored = await restore_tree(**restore_kwargs)
+                for result in (exported, restored):
+                    assert result.failed == 0
+                    assert (result.skipped if repeated else result.completed) == len(
+                        values
+                    ) + 1
+            for index, raw in enumerate(expected):
+                assert read(f"{target}/d{index}") == raw
+                assert client.get(path=f"{target}/d{index}/@type") == "document"
+                assert (
+                    client.get(path=f"{target}/d{index}/@note") == "portable metadata"
+                )
+
+            # A document is a single snapshot even when fields change concurrently.
+            async with (
+                yt.worker() as worker,
+                worker.snapshot(path=source + "/d9") as snapshot,
+            ):
+                client.set(path=source + "/d9/x", value=[2])
+                payload = b"".join(
+                    [
+                        chunk
+                        async for chunk in snapshot.read_part(
+                            part=next(plan_parts(node=snapshot.node, part_size=1)),
+                            compression_level=3,
+                            chunk_size=MIB,
+                        )
+                    ]
+                )
+                import zstandard
+
+                with zstandard.ZstdDecompressor().stream_reader(payload) as reader:
+                    assert reader.read() == expected[9]
+            changed = await export_tree(**export_kwargs)
+            assert (changed.completed, changed.skipped, changed.failed) == (
+                1,
+                len(values),
+                0,
+            )
+            restored = await restore_tree(**restore_kwargs)
+            assert (restored.completed, restored.failed) == (1, 0)
+            assert read(target + "/d9") == read(source + "/d9")
+
+            # A changed destination is recopied; corrupt input cannot replace it.
+            client.set(path=target + "/d9", value={b"keep": True})
+            destination_id = client.get(path=target + "/d9/@id")
+            manifest_key = (
+                node_prefix(prefix=prefix, path=source + "/d9") + "/@manifest.json"
+            )
+            raw = json.loads(await storage.read_bytes(key=manifest_key))
+            raw["parts"][0]["object"]["sha256"] = "0" * 64
+            await storage.put_bytes(key=manifest_key, data=json.dumps(raw).encode())
+            corrupted = await restore_tree(**restore_kwargs)
+            assert corrupted.failed == 1
+            assert client.get(path=target + "/d9/@id") == destination_id
+            assert read(target + "/d9") == binary({b"keep": True})
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        client._cleanup()

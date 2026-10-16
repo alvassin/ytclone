@@ -1,7 +1,7 @@
 # ytclone
 
-Copy static tables, files, and directories between YTsaurus and S3, preserving
-schemas and portable attributes. Repeat a command to skip completed, unchanged
+Copy static tables, files, YSON documents, and directories between YTsaurus and S3,
+preserving schemas and portable attributes. Repeat a command to skip completed, unchanged
 nodes and retry unfinished copies.
 
 Restoring from S3 requires an archive created by `ytclone`.
@@ -59,14 +59,15 @@ ytclone s3://my-bucket/export/home/analytics/events \
 
 The restore destination is used exactly as given: the children of `events` go
 directly under `//home/analytics/events_copy`. The same commands work for a single
-table or file. With `--log-file`, progress appears on the console and detailed
-logs are appended to the file.
+table, file, or document. With `--log-file`, progress appears on the console and
+detailed logs are appended to the file.
 
 ## Repeated runs
 
 Run the same command again after an interruption or a source update. Completed,
 unchanged nodes are skipped. New, changed, or incomplete nodes are copied again;
-an interrupted table or file starts from the beginning, not from its last part.
+an interrupted table, file, or document starts from the beginning, not from its
+last part.
 
 Source data is never deleted. Destination nodes absent from the source are kept.
 Use a separate S3 prefix for each source cluster.
@@ -86,14 +87,14 @@ YT → S3; restore its archives with `ytclone` as above.
 
 ## Before you copy
 
-- **Supported node types:** static tables, files, and directories. Dynamic tables
-  are skipped and reported; links are unsupported.
+- **Supported node types:** static tables, files, YSON documents, and directories.
+  Dynamic tables are skipped and reported; links are unsupported.
 - **One current S3 copy.** There is no archive version history. Replacing a node
   makes its archive unavailable until completion; a failed replacement can lose
   the previous complete copy.
 - **Permissions are not copied.** ACLs, ownership, and account settings are
-  excluded. Replacing an existing YT table or file recreates the node, so its
-  previous settings are not preserved either.
+  excluded. Replacing an existing YT table, file, or document recreates the node,
+  so its previous settings are not preserved either.
 - **Consistency is per node.** A directory tree is not a single point-in-time
   snapshot.
 - **Avoid overlapping writers.** Do not run commands that write to the same
