@@ -8,8 +8,10 @@ import pytest
 from aiomisc.log import LogFormat
 
 from ytclone import cli
+from ytclone import storage as archive_storage
 from ytclone.engine import CopyOptions, CopyResult
 from ytclone.format import MIB
+from ytclone.storage import StorageLocation
 
 
 @pytest.fixture(autouse=True)
@@ -18,9 +20,9 @@ def isolated_parser_environment(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
-def arguments(*, restore=False, extra=()):
+def arguments(*, restore=False, extra=(), paths=None):
     parser = cli.Arguments()
-    paths = (
+    paths = paths or (
         ["s3://bucket/archive", "//copy"]
         if restore
         else ["//source", "s3://bucket/archive"]
@@ -34,6 +36,8 @@ def test_defaults_match_engine_and_aiomisc():
     parsed = arguments()
     defaults = CopyOptions()
     assert parsed.concurrency == defaults.concurrency == 4
+    assert parsed.part_concurrency == defaults.part_concurrency == 1
+    assert parsed.max_streams == defaults.max_streams == 0
     assert parsed.queue_size == defaults.queue_size == 16
     assert parsed.part_size_mib * MIB == defaults.part_size
     assert parsed.buffer_size_mib * MIB == defaults.chunk_size
@@ -55,11 +59,25 @@ def test_environment_and_explicit_cli_override(monkeypatch):
 @pytest.mark.parametrize(
     "source,destination,expected",
     [
-        ("//source", "s3://bucket/archive", (True, "//source", "bucket", "archive")),
+        (
+            "//source",
+            "s3://bucket/archive",
+            (
+                True,
+                "//source",
+                StorageLocation(kind="s3", bucket="bucket", prefix="archive"),
+            ),
+        ),
         (
             "s3://bucket/archive/home/source",
             "//copy",
-            (False, "//copy", "bucket", "archive/home/source"),
+            (
+                False,
+                "//copy",
+                StorageLocation(
+                    kind="s3", bucket="bucket", prefix="archive/home/source"
+                ),
+            ),
         ),
     ],
 )
@@ -85,6 +103,98 @@ def test_invalid_addresses_are_rejected(source, destination):
         cli.direction(source=source, destination=destination)
 
 
+@pytest.mark.parametrize("path", ["./dump", "../dump", "dump", "/tmp/dump"])
+@pytest.mark.parametrize("restore", [False, True])
+def test_local_direction_preserves_paths(path, restore):
+    source, destination = (path, "//copy") if restore else ("//source", path)
+    export, yt_path, location = cli.direction(source=source, destination=destination)
+    assert export is not restore
+    assert yt_path == ("//copy" if restore else "//source")
+    assert location == StorageLocation(kind="local", root=path)
+
+
+def test_file_url_decodes_spaces_and_unicode():
+    _, _, location = cli.direction(
+        source="//source", destination="file:///tmp/my%20dump/%D1%82%D0%B5%D1%81%D1%82"
+    )
+    assert location == StorageLocation(kind="local", root="/tmp/my dump/тест")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "https://example.test/archive",
+        "ftp://example.test/archive",
+        "file:dump",
+        "file:/tmp/dump",
+        "file://localhost/tmp/dump",
+        "file:///tmp/dump?x=1",
+        "file:///tmp/dump#part",
+        "file:///tmp/dump?",
+        "file:///tmp/dump#",
+        "file:///tmp/%00",
+        "",
+        "dump\0",
+    ],
+)
+def test_invalid_local_addresses_are_rejected(path):
+    with pytest.raises(ValueError):
+        cli.direction(source="//source", destination=path)
+
+
+@pytest.mark.parametrize("restore", [False, True])
+def test_local_copy_never_constructs_s3_resources(
+    monkeypatch, caplog, tmp_path, restore
+):
+    """Local wiring works without AWS credentials and records the right direction."""
+    from pathlib import Path
+
+    calls = {}
+    for variable in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+        monkeypatch.delenv(variable, raising=False)
+
+    def unexpected(**kwargs):
+        pytest.fail("Local copies must not create HTTP or S3 clients")
+
+    async def resolve(*, path, export):
+        calls["resolve"] = (path, export)
+        return tmp_path, "home/source" if restore else ""
+
+    def local_storage(**kwargs):
+        calls["storage"] = kwargs
+        return "local-storage"
+
+    async def transfer(**kwargs):
+        calls["transfer"] = kwargs
+        return CopyResult(completed=1)
+
+    local_path = str(tmp_path / "home/source") if restore else str(tmp_path)
+    paths = [local_path, "//copy"] if restore else ["//source", local_path]
+    parsed = arguments(paths=paths)
+    monkeypatch.setattr(archive_storage, "resolve_local_archive", resolve)
+    monkeypatch.setattr(archive_storage.aiohttp, "ClientSession", unexpected)
+    monkeypatch.setattr(archive_storage, "S3Client", unexpected)
+    monkeypatch.setattr(archive_storage, "S3Storage", unexpected)
+    monkeypatch.setattr(archive_storage, "LocalStorage", local_storage)
+    monkeypatch.setattr(cli, "YtAdapter", lambda **kwargs: "yt-adapter")
+    monkeypatch.setattr(cli, "export_tree", transfer)
+    monkeypatch.setattr(cli, "restore_tree", transfer)
+    with caplog.at_level(logging.INFO):
+        assert asyncio.run(cli.run(arguments=parsed, options=CopyOptions())) == 0
+    assert calls["resolve"] == (local_path, not restore)
+    assert Path(calls["storage"]["root"]) == tmp_path
+    assert calls["transfer"]["storage"] == "local-storage"
+    if restore:
+        assert calls["transfer"]["source_prefix"] == "home/source"
+        assert calls["transfer"]["destination"] == "//copy"
+    else:
+        assert calls["transfer"]["prefix"] == ""
+        assert calls["transfer"]["source"] == "//source"
+    assert (
+        "direction=local-to-yt" if restore else "direction=yt-to-local"
+    ) in caplog.text
+
+
 @pytest.mark.parametrize("restore", [False, True])
 @pytest.mark.parametrize("failures", [0, 1])
 def test_run_wires_keyword_only_adapters_and_closes_session(
@@ -92,7 +202,13 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
 ):
     """Log the memory budget before constructing transfer resources."""
     calls = {}
-    options = CopyOptions(concurrency=2, chunk_size=8 * MIB, compression_level=7)
+    options = CopyOptions(
+        concurrency=2,
+        part_concurrency=1 if restore else 3,
+        max_streams=0 if restore else 4,
+        chunk_size=8 * MIB,
+        compression_level=7,
+    )
     parsed = arguments(
         restore=restore, extra=("--no-proxy-discovery", "--endpoint", "http://s3.test/")
     )
@@ -107,9 +223,17 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
         async def __aexit__(self, *exc):
             calls["session_closed"] = True
 
-    def estimate_memory(*, concurrency, chunk_size, compression_level, export):
+    def estimate_memory(
+        *, concurrency, chunk_size, compression_level, export, reader_concurrency=None
+    ):
         """Record the actual transfer settings used for the startup estimate."""
-        calls["estimate"] = (concurrency, chunk_size, compression_level, export)
+        calls["estimate"] = (
+            concurrency,
+            chunk_size,
+            compression_level,
+            export,
+            reader_concurrency,
+        )
         return 512
 
     def yt_adapter(*, proxy, proxy_discovery, progress):
@@ -148,16 +272,22 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
 
     caplog.set_level(logging.INFO, logger=cli.__name__)
     monkeypatch.setattr(cli, "estimate_memory_mib", estimate_memory)
-    monkeypatch.setattr(cli.aiohttp, "ClientSession", Session)
+    monkeypatch.setattr(archive_storage.aiohttp, "ClientSession", Session)
     monkeypatch.setattr(cli, "YtAdapter", yt_adapter)
-    monkeypatch.setattr(cli, "S3Client", s3_client)
-    monkeypatch.setattr(cli, "S3Storage", storage)
+    monkeypatch.setattr(archive_storage, "S3Client", s3_client)
+    monkeypatch.setattr(archive_storage, "S3Storage", storage)
     monkeypatch.setattr(cli, "export_tree", export_tree)
     monkeypatch.setattr(cli, "restore_tree", restore_tree)
 
     result = asyncio.run(cli.run(arguments=parsed, options=options))
     assert result == failures
-    assert calls["estimate"] == (2, 8 * MIB, 7, not restore)
+    assert calls["estimate"] == (
+        2 if restore else 4,
+        8 * MIB,
+        7,
+        not restore,
+        None if restore else 6,
+    )
     startup = calls["startup_logs"]
     expected_direction = "s3-to-yt" if restore else "yt-to-s3"
     expected_start = (
@@ -168,10 +298,10 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
         "Memory estimate is a planning budget; large rows, metadata and allocator "
         "overhead can exceed it."
     )
-    assert [record.getMessage() for record in startup] == [
-        expected_start,
-        expected_note,
-    ]
+    expected_logs = [expected_start, expected_note]
+    if not restore:
+        expected_logs.append("export_parallelism part_concurrency=3 max_streams=4")
+    assert [record.getMessage() for record in startup] == expected_logs
     assert all(record.levelno == logging.INFO for record in startup)
     assert calls["yt"] == ("https://yt.example.test", False)
     assert calls["s3"] == ("http://s3.test/bucket", "us-east-1")
@@ -192,6 +322,8 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
     "extra",
     [
         ("--concurrency", "0"),
+        ("--part-concurrency", "0"),
+        ("--max-streams", "-1"),
         ("--queue-size", "0"),
         ("--buffer-size-mib", "4"),
         ("--part-size-mib", "0"),
@@ -214,6 +346,26 @@ def test_main_rejects_invalid_options_before_starting_resources(monkeypatch, ext
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("archive", ["s3://bucket/archive", "./dump/source"])
+@pytest.mark.parametrize("extra", [("--part-concurrency", "3"), ("--max-streams", "4")])
+def test_restore_rejects_export_parallelism_before_runtime(
+    monkeypatch, capsys, archive, extra
+):
+    """Unsupported restore settings must fail before opening either storage."""
+
+    def unexpected_run(*args, **kwargs):
+        pytest.fail("Restore validation must precede resource construction")
+
+    monkeypatch.setattr(cli.aiomisc, "run", unexpected_run)
+    monkeypatch.setattr(
+        sys, "argv", ["ytclone", archive, "//restored", "--yt-proxy", "test", *extra]
+    )
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert "apply to export only" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -261,6 +413,10 @@ def test_main_passes_aiomisc_logging_options_and_copy_settings(
             "test",
             "--concurrency",
             "5",
+            "--part-concurrency",
+            "3",
+            "--max-streams",
+            "4",
             "--log-level",
             "debug",
             "--log-format",
@@ -269,6 +425,8 @@ def test_main_passes_aiomisc_logging_options_and_copy_settings(
     )
     assert cli.main() == 1
     assert seen["options"].concurrency == 5
+    assert seen["options"].part_concurrency == 3
+    assert seen["options"].max_streams == 4
     assert seen["runtime"] == (6, "debug", effective_format, date_format)
 
 
@@ -315,7 +473,7 @@ import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
-from ytclone import cli
+from ytclone import cli, storage as archive_storage
 from ytclone.engine import CopyResult
 from ytclone.format import SourceEstimate
 
@@ -349,7 +507,7 @@ async def transfer(*, progress, **kwargs):
     return CopyResult(completed=1, skipped=2)
 
 cli.YtAdapter = Yt
-cli.S3Client = lambda **kwargs: object()
+archive_storage.S3Client = lambda **kwargs: object()
 cli.export_tree = transfer
 sys.argv = ['ytclone', '//source', 's3://bucket', '--yt-proxy', 'unused',
             '--log-file', log_path, '--log-format', 'stream']

@@ -6,6 +6,7 @@ import copy
 import io
 import os
 import random
+import threading
 import uuid
 
 import aiohttp
@@ -20,6 +21,7 @@ import ytclone.yt as yt_adapter
 from ytclone.engine import CopyOptions, export_node, export_tree, restore_tree
 from ytclone.format import MIB, RESTORE_MARKER, ROW_FORMAT, Manifest, node_prefix
 from ytclone.interfaces import RetryableReadError
+from ytclone.local import LocalStorage, resolve_local_archive
 from ytclone.progress import Progress
 from ytclone.s3 import S3Storage
 from ytclone.yt import YtAdapter
@@ -697,3 +699,168 @@ def test_local_documents_roundtrip_snapshot_changes_and_corruption():
         asyncio.run(scenario())
     finally:
         client._cleanup()
+
+
+@pytest.mark.parametrize("storage_kind", ["s3", "local"])
+def test_local_concurrent_parts_share_snapshot(monkeypatch, tmp_path, storage_kind):
+    """Concurrent real readers keep one source version and restore ordered ranges."""
+    run_id = uuid.uuid4().hex[:12]
+    root = "//tmp/ytclone-concurrent-" + run_id
+    source, target = root + "/source", root + "/restored"
+    prefix = "concurrent-smoke-" + run_id
+    client = local_client()
+    rng = random.Random(73)
+    expected = [
+        {b"id": index, b"payload": rng.randbytes(512 * 1024)} for index in range(8)
+    ]
+    replacement = [{b"id": -1, b"payload": b"new source state"}]
+    barrier = threading.Barrier(2, timeout=30)
+    rewritten = threading.Event()
+    guard = threading.Lock()
+    commands, reads, streams = [], [], []
+
+    def traced_client(*, proxy, config):
+        instance = local_client(proxy=proxy, config=config)
+        session = _get_session(client=instance)
+        send = session.send
+
+        def traced_send(request, **kwargs):
+            commands.append(request.url.rsplit("/", 1)[-1].split("?", 1)[0])
+            return send(request=request, **kwargs)
+
+        session.send = traced_send
+        return instance
+
+    make_request = yt_adapter.make_request
+
+    def synchronized_request(*, command_name, params, **kwargs):
+        """Require two live readers before an independent writer changes the source."""
+        stream = make_request(command_name=command_name, params=params, **kwargs)
+        with guard:
+            ordinal = len(reads)
+            reads.append(
+                (copy.deepcopy(params), kwargs["client"], threading.get_ident())
+            )
+            streams.append(stream)
+        if ordinal >= 2:
+            return stream
+        original_read = stream.read
+        first_read = True
+
+        def synchronized_read(length=None):
+            nonlocal first_read
+            if first_read:
+                first_read = False
+                barrier.wait()
+                if ordinal == 0:
+                    writer = local_client()
+                    try:
+                        writer.write_table(table=source, input_stream=replacement)
+                        writer.set(path=source + "/@note", value="changed metadata")
+                    finally:
+                        writer._cleanup()
+                        rewritten.set()
+                else:
+                    assert rewritten.wait(timeout=30), "Source writer did not finish"
+            return original_read(length)
+
+        stream.read = synchronized_read
+        return stream
+
+    monkeypatch.setattr(yt_adapter, "make_request", synchronized_request)
+    options = CopyOptions(
+        concurrency=1,
+        part_concurrency=2,
+        max_streams=2,
+        part_size=MIB,
+        chunk_size=5 * MIB,
+    )
+
+    async def scenario():
+        yt = YtAdapter(
+            proxy="http://localhost:8000",
+            proxy_discovery=False,
+            client_factory=traced_client,
+        )
+        async with contextlib.AsyncExitStack() as stack:
+            if storage_kind == "s3":
+                session = await stack.enter_async_context(aiohttp.ClientSession())
+                s3 = S3Client(
+                    session=session,
+                    url="http://localhost:8333/yt-backup",
+                    access_key_id="local-bench",
+                    secret_access_key="local-bench-secret",
+                    region="us-east-1",
+                )
+                storage = S3Storage(client=s3, chunk_size=options.chunk_size)
+            else:
+                archive_root, _ = await resolve_local_archive(
+                    path=tmp_path / "archive", export=True
+                )
+                storage = LocalStorage(root=archive_root, chunk_size=options.chunk_size)
+            exported = await export_tree(
+                yt=yt,
+                storage=storage,
+                source=source,
+                prefix=prefix,
+                cluster="local",
+                options=options,
+            )
+            assert exported.failed == 0 and exported.completed == 1
+            assert rewritten.is_set()
+            assert len(reads) >= 3
+            assert len({id(instance) for _, instance, _ in reads}) >= 2
+            assert len({thread for _, _, thread in reads}) >= 2
+            assert len({str(params["transaction_id"]) for params, _, _ in reads}) == 1
+            assert {str(params["path"]) for params, _, _ in reads} == {"#" + source_id}
+            assert (
+                sum(name in ("start_tx", "start_transaction") for name in commands) == 1
+            )
+            assert commands.count("lock") == 1
+            assert all(stream.closed for stream in streams)
+
+            archive = node_prefix(prefix=prefix, path=source)
+            manifest = Manifest.from_bytes(
+                await storage.read_bytes(key=archive + "/@manifest.json")
+            )
+            assert len(manifest.parts) == len(reads)
+            assert manifest.parts[0].start == 0
+            assert manifest.parts[-1].stop == len(expected)
+            assert all(
+                left.stop == right.start
+                for left, right in zip(manifest.parts, manifest.parts[1:])
+            )
+            restored = await restore_tree(
+                yt=yt,
+                storage=storage,
+                source_prefix=archive,
+                destination=target,
+                options=CopyOptions(chunk_size=options.chunk_size),
+            )
+            assert restored.failed == 0 and restored.completed == 1
+            assert rows(client=client, path=target) == expected
+            assert rows(client=client, path=source) == replacement
+            assert client.get(path=target + "/@note") == "snapshot metadata"
+            assert client.get(path=source + "/@note") == "changed metadata"
+
+    try:
+        source_id = client.create(
+            type="table",
+            path=source,
+            recursive=True,
+            attributes={
+                "schema": [
+                    {"name": "id", "type": "int64", "sort_order": "ascending"},
+                    {"name": "payload", "type": "string"},
+                ],
+                "note": "snapshot metadata",
+            },
+        )
+        client.write_table(table=source, input_stream=expected)
+        asyncio.run(scenario())
+    finally:
+        barrier.abort()
+        try:
+            client.remove(path=root, recursive=True, force=True)
+        finally:
+            client._cleanup()

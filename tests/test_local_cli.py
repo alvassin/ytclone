@@ -87,6 +87,8 @@ def run_cli(*, module, source, destination, directory, name, extra=()):
     command = [sys.executable, "-m", module, *arguments]
     image = os.environ.get("YTCLONE_DOCKER_IMAGE")
     portable = os.environ.get("YTCLONE_PORTABLE_DIR")
+    if not image and not portable and os.environ.get("PYTHONPATH"):
+        environment["PYTHONPATH"] = os.environ["PYTHONPATH"]
     assert not (image and portable), (
         "Choose either YTCLONE_DOCKER_IMAGE or YTCLONE_PORTABLE_DIR"
     )
@@ -194,7 +196,9 @@ def test_local_installed_parallel_export_and_cli_restore(tmp_path):
         ],
         attributes={"strict": True, "unique_keys": True},
     )
-    expected_rows = [{b"id": 1, b"payload": b"\x00\xff"}]
+    expected_rows = [{b"id": 1, b"payload": b"\x00\xff"}] + [
+        {b"id": index, b"payload": bytes(range(256)) * 2048} for index in range(2, 10)
+    ]
     payload = bytes(range(256)) * 8192
     client.create(
         type="map_node",
@@ -240,7 +244,16 @@ def test_local_installed_parallel_export_and_cli_restore(tmp_path):
             destination=archive,
             directory=tmp_path,
             name="export-repeat" if repeated else "export",
-            extra=("--processes", "2", "--discovery-concurrency", "2"),
+            extra=(
+                "--processes",
+                "2",
+                "--discovery-concurrency",
+                "2",
+                "--part-concurrency",
+                "3",
+                "--max-streams",
+                "2",
+            ),
         )
         assert_summary(
             output=output,

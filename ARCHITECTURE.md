@@ -5,7 +5,8 @@
 This document describes the archive format, change detection and node lifecycle.
 The execution diagrams follow one table through export or restore. Files use the
 same pipeline with bytes instead of rows; documents carry a complete YSON value
-and directories carry metadata.
+and directories carry metadata. Both archive adapters implement `ObjectStorage`;
+YT snapshots, serialization, part planning and restore transactions are shared.
 
 ## Storage
 
@@ -53,12 +54,35 @@ as a whole, unlike streamed table/file parts. They are intended for small metada
 very large documents require memory proportional to their serialized value and
 parsed YSON tree.
 
+### Local storage
+
+Local archives use the same `yt-s3-v1` node records and compressed parts. The
+export directory is the storage root, with an additional `@archive.json` marker
+containing `{"format": "ytclone-local", "version": 1}`. Object keys are relative
+to this root, never absolute host paths. For example, exporting `//home/team`
+to `/backup` uses the key `home/team/@manifest.json`.
+
+Restore discovers the enclosing root marker, so `/backup/home/team` selects the
+logical prefix `home/team`. Moving `/backup` as a whole preserves every object
+reference. Initializing nested archive roots is rejected; a directory without a
+valid root marker is not inferred to be an archive. S3 manifests include their
+S3 prefix in object keys: copying archive bytes between storage types requires
+preserving that complete logical key layout, not stripping an arbitrary prefix.
+
+`LocalStorage` offloads filesystem work from the event loop, verifies streamed
+size and SHA-256 during restore, and publishes each object through a synchronized
+temporary file and atomic rename. A node becomes complete only when the engine
+publishes its manifest. Individual atomic file writes do not preserve the
+previous complete node during replacement. Directory traversal does not follow
+archive symlinks. Leftover temporary files from a killed process are not archive
+objects and are ignored by listing.
+
 ## Detecting changes
 
-For **YT -> S3**, discovery reads child IDs, types and revisions together with
+For **YT -> archive**, discovery reads child IDs, types and revisions together with
 each directory listing. A worker can skip a node without another YT request when
 its ID, `content_revision`, `attribute_revision` and copy settings match the
-manifest and all referenced S3 objects exist with their recorded sizes.
+manifest and all referenced objects exist with their recorded sizes.
 Directories are still traversed; their content revision is ignored when comparing
 their own metadata.
 
@@ -76,7 +100,7 @@ observation are picked up on a later run. Revision-based detection assumes write
 do not use `suppress_modification_tracking`: changes made with revision tracking
 disabled may go undetected. `content_revision` is a YT revision, not a hash of rows.
 
-For **S3 -> YT**, completion metadata on the destination node records the source
+For **archive -> YT**, completion metadata on the destination node records the source
 manifest's fingerprint. Skipping also requires verifying that the destination's
 data, schema, and saved attributes have not changed since import. The marker stores destination
 node ID, committed content revision and a hash of portable attributes. It is
@@ -94,18 +118,18 @@ checksums verify data as it is transferred.
 
 The manifest records the source fingerprint and references the attributes object
 and ordered data parts, with sizes and checksums. It is written last: without it,
-an S3 node is incomplete. A directory manifest confirms its own metadata, not
+an archive node is incomplete. A directory manifest confirms its own metadata, not
 completion of its descendants.
 
-S3 keeps **one current copy, without version history**. Replacing a node removes
+Each archive keeps **one current copy, without version history**. Replacing a node removes
 its manifest before changing data and publishes a new manifest when finished.
 The node is unavailable during replacement, and a failed replacement may lose the
 previous complete copy. Reading a node while it is being replaced, or writing it
 from multiple processes at once, is not supported.
 
 A successful replacement removes obsolete parts for that node. An interruption
-can leave data without a manifest or unfinished S3 multipart uploads; these need
-a retry or cleanup.
+can leave data without a manifest, unfinished S3 multipart uploads or local
+temporary files; these need a retry or cleanup.
 
 YT destinations use a transaction per node to avoid exposing partial tables, files
 or documents. When a table, file or document needs copying, an existing destination
@@ -122,6 +146,9 @@ which children are discovered; rerun after such changes to reconcile the tree.
 
 ## Execution
 
+The sequence diagrams below show the S3 adapter. Local copies use the same
+engine calls with `LocalStorage`; filesystem operations replace HTTP requests.
+
 The runtime below describes `ytclone`; see the [parallel export reference](USAGE.md#parallel-export)
 for coordinator scheduling and process recovery in `ytclone-parallel`.
 
@@ -131,8 +158,11 @@ Discover -> bounded queue -> compare metadata -> skip or copy -> complete node
 
 - Discovery and transfer overlap; copying starts before the entire tree is scanned.
 - One discovery worker feeds an `aiochannel` bounded by `--queue-size`; at most
-  `--concurrency` nodes are transferred at once. Each node's parts are sequential.
-  Buffers are bounded per transfer; increasing concurrency increases memory use.
+  `--concurrency` nodes are transferred at once. Export permits up to
+  `--part-concurrency` concurrent row ranges per table; file/document parts and all
+  restore parts are sequential. A process-wide `--max-streams` budget caps active
+  export data transfers across nodes. Buffers are bounded per stream; increasing this
+  budget increases memory use. Discovery and metadata do not consume stream slots.
 - Cypress discovery resolves the source root once, then lists each directory by
   ID with child IDs, types, revisions and source sizes. The queue carries these
   hints with each path; matching archives need no per-node YT requests. Workers
@@ -170,7 +200,9 @@ flowchart TB
 ```
 
 Solid arrows carry paths and, during export, discovered IDs and revisions.
-Dotted arrows show which clients a task uses.
+Dotted arrows show which clients a task uses. The diagram shows the default
+sequential part mode. Concurrent table export adds a bounded pool of reader
+client/thread pairs under the node's existing snapshot owner.
 
 - A **copy task** is the async `worker()` loop in `engine.py`. It takes a path,
   copies or skips that node, then takes the next path.
@@ -180,6 +212,10 @@ Dotted arrows show which clients a task uses.
   across nodes; full checks and copies use separate node transactions, while
   revision-matched export skips need none. The SDK manages HTTP sessions
   and transaction pings. An uncertain transaction cleanup prevents client reuse.
+- Concurrent table readers each have their own **YT client and dedicated thread**.
+  They use the snapshot owner's transaction ID and pinned node ID for every range;
+  they do not start independent transactions or acquire new snapshot locks. The
+  owner keeps the snapshot alive until all readers have finished and closed.
 - **S3 clients are shared** across all tasks and use async HTTP. Table/file bytes
   flow inside a copy task, without going through the node queue.
 
@@ -187,6 +223,9 @@ During restore, discovery finishes each parent directory before queuing its
 children. Clients and dedicated threads close when their tasks finish.
 
 ### Export: one table from YT to S3
+
+This diagram shows the default `--part-concurrency 1`. With concurrent parts, the
+range-transfer loop runs in a bounded group under the same snapshot.
 
 ```mermaid
 sequenceDiagram
@@ -231,8 +270,23 @@ sequenceDiagram
     end
 ```
 
-An archive part is one S3 object. S3 multipart upload chunks are buffers within
-that object. Parts are streamed through bounded buffers.
+An archive part is one S3 object or one local file. S3 multipart upload chunks
+are buffers within that object. Parts are streamed through bounded buffers.
+
+Concurrent table export schedules disjoint row ranges with deterministic object
+keys. Completion order does not change the ordered part list in the manifest.
+A shared per-process stream budget bounds simultaneous data transfers across
+all nodes; it is not multiplied by each node's part-concurrency setting. The
+scheduler keeps a bounded group of part tasks, rather than creating one task
+for every range of a large table. Each reader owns its stream and compressor.
+A terminal part failure cancels and drains sibling work before the snapshot
+ends; no manifest is published for that incomplete node.
+
+`ytclone-parallel` assigns a complete node to one process, so part concurrency
+runs within that process. It does not distribute one table across processes.
+Concurrency settings do not alter archive encoding or change detection. There
+is no persisted part checkpoint: a process restart or a lost snapshot still
+requires copying the unfinished table again.
 
 `Snapshot.read_part()` opens one fresh stream and compressor. Table reads use the
 SDK HTTP transport, preserving its framing and trailer error checks, without the
@@ -278,7 +332,9 @@ is reported failed and a repeated run can copy it again.
 | [engine.py](src/ytclone/engine.py) | `_pipeline`: queue and task lifetimes. `export_node` / `restore_node`: copying one node. `copy_part`: retrying a streamed part. |
 | [yt.py](src/ytclone/yt.py) | `YtAdapter`: worker factory. `YtWorker`: YT operations. `_Session`: client, thread and transaction lifecycle. |
 | [s3.py](src/ytclone/s3.py) | Object reads, multipart writes, integrity checks and cleanup. |
+| [local.py](src/ytclone/local.py) | Local archive roots, streamed file I/O, integrity checks and atomic publication. |
+| [storage.py](src/ytclone/storage.py) | Endpoint parsing, local root resolution and archive adapter construction. |
 | [format.py](src/ytclone/format.py) | Archive paths, manifests, fingerprints and range planning. |
-| [codec.py](src/ytclone/codec.py) | Async S3 input made readable by the synchronous YT writer. |
-| [interfaces.py](src/ytclone/interfaces.py) | Contracts for substituting adapters in tests. |
-| [cli.py](src/ytclone/cli.py) | Arguments, shared S3 client and dependency wiring. |
+| [codec.py](src/ytclone/codec.py) | Async archive input made readable by the synchronous YT writer. |
+| [interfaces.py](src/ytclone/interfaces.py) | Contracts shared by YT and archive adapters. |
+| [cli.py](src/ytclone/cli.py) | Arguments, progress and dependency wiring. |

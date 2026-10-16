@@ -134,7 +134,7 @@ jobs:
           "$RUNNER_TEMP/installed/bin/ytclone" --help
           "$RUNNER_TEMP/installed/bin/ytclone-parallel" --help
           mkdir "$RUNNER_TEMP/smoke-tests"
-          cp tests/test_local.py tests/test_local_cli.py "$RUNNER_TEMP/smoke-tests/"
+          cp tests/test_local.py tests/test_local_cli.py tests/test_local_filesystem.py "$RUNNER_TEMP/smoke-tests/"
       - name: Start disposable local services
         run: docker compose up -d --wait --wait-timeout 360 yt s3
       - name: Export and restore through the installed wheel

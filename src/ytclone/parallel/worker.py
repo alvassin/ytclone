@@ -7,10 +7,8 @@ import sys
 from collections.abc import Iterator
 from contextlib import AsyncExitStack, contextmanager, redirect_stdout, suppress
 
-import aiohttp
 import aiomisc
 from aiochannel import Channel
-from aiohttp_s3_client import S3Client
 from aiomisc.log import LogFormat
 from aiomisc_log import basic_config
 
@@ -19,7 +17,7 @@ from ..format import DiscoveredNode
 from ..interfaces import ObjectStorage, YtBackend, YtWorkerFactory
 from ..logging import file_logging
 from ..progress import Progress
-from ..s3 import S3Storage
+from ..storage import StorageLocation, open_storage
 from ..yt import YtAdapter
 from .protocol import MAX_MESSAGE_SIZE, read_message, write_message
 
@@ -49,6 +47,7 @@ async def serve_jobs(
 
     channel: Channel[tuple[int, DiscoveredNode]] = Channel(maxsize=options.concurrency)
     output_lock = asyncio.Lock()
+    streams = asyncio.Semaphore(options.stream_limit)
     pending: set[int] = set()
 
     async def send(*, message: dict) -> None:
@@ -98,6 +97,7 @@ async def serve_jobs(
                     options=options,
                     progress=progress,
                     discovered=node,
+                    streams=streams,
                 )
             except Exception as error:
                 status, reason = "failed", type(error).__name__
@@ -153,9 +153,11 @@ async def serve_jobs(
 async def run_worker(
     *, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, config: dict
 ) -> None:
-    """Create process-local YT and S3 clients and serve node assignments."""
+    """Create process-local YT and archive adapters and serve node assignments."""
     options = CopyOptions(
         concurrency=config["concurrency"],
+        part_concurrency=config.get("part_concurrency", 1),
+        max_streams=config.get("max_streams", 0),
         queue_size=config["concurrency"],
         part_size=config["part_size"],
         chunk_size=config["chunk_size"],
@@ -168,23 +170,20 @@ async def run_worker(
         progress=progress,
     )
 
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300)
-    ) as session:
-        client = S3Client(
-            session=session,
-            url=config["endpoint"].rstrip("/") + "/" + config["bucket"],
-            region=config["region"],
-        )
-        storage = S3Storage(
-            client=client, chunk_size=options.chunk_size, progress=progress
-        )
+    location = StorageLocation(**config["storage"])
+    async with open_storage(
+        location=location,
+        endpoint=config["endpoint"],
+        region=config["region"],
+        chunk_size=options.chunk_size,
+        progress=progress,
+    ) as storage:
         await serve_jobs(
             reader=reader,
             writer=writer,
             yt=yt,
             storage=storage,
-            prefix=config["prefix"],
+            prefix=location.prefix,
             cluster=config["yt_proxy"].rstrip("/"),
             options=options,
             progress=progress,
