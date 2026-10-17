@@ -11,6 +11,9 @@ copy. Use `ytclone --help` or `ytclone-parallel --help` for the full option list
 | `--endpoint` | `S3_ENDPOINT` | `https://s3.amazonaws.com` |
 | `--region` | `AWS_DEFAULT_REGION` | `us-east-1` |
 
+S3 settings and AWS credentials are used only for S3 endpoints. Local copies
+require only YTsaurus access and filesystem permissions.
+
 For local Docker YTsaurus, use `--yt-proxy http://localhost:8000` with
 `--no-proxy-discovery`. See [local integration tests](CONTRIBUTING.md#test-with-local-ytsaurus-and-s3).
 
@@ -68,6 +71,50 @@ an init process to forward signals and reap children; the grace period allows
 the supervisor to stop its workers. The known [aiomisc shutdown limitation](CONTRIBUTING.md#run-checks)
 also occurs on Python 3.14 with aiomisc 18.0.33.
 
+## Local archives
+
+One argument must be a `//YT/path`. The other may be an S3 URL, an absolute or
+relative filesystem path, or a `file:///absolute/path` URL. Plain filesystem
+paths are used literally; `file:` URLs use URL escaping. Remote file hosts,
+queries, fragments and unknown URL schemes are rejected.
+
+```bash
+ytclone //home/analytics/events ./dump
+ytclone ./dump/home/analytics/events //home/analytics/events_copy
+ytclone-parallel //home/analytics/events ./dump --processes 2 --concurrency 2
+```
+
+Export creates `@archive.json` at the destination root and appends the complete
+YT path beneath it, using the same encoded names, attributes, manifests and
+compressed data parts as an S3 archive. Tables are stored as binary YSON with
+their schemas; this command does not import arbitrary CSV/Parquet or ordinary
+files as YT nodes.
+
+The first export requires a new or empty directory. Later exports into the same
+root skip unchanged nodes and retry unfinished nodes. Put logs outside a new
+archive root, so they do not make it nonempty before initialization. Archive
+roots cannot be nested. Restoring a subtree locates its enclosing `@archive.json`;
+move the entire root, including that marker, to relocate an archive without
+changing its manifests. Moving only a subtree loses the root context.
+
+Local data parts are streamed through bounded buffers. Each object is written
+to a temporary sibling, synchronized and renamed into place; its node manifest
+is still published last. Disk-full, permission and checksum errors fail the
+copy. After correcting the cause, rerun the command. This does not retain the
+previous complete version while replacing a node, and overlapping writers or
+restoring during replacement remain unsupported.
+
+The local adapter targets POSIX filesystems on the supported Linux/macOS
+platforms. Symlinks inside archives and paths escaping the root are rejected.
+Names that collide on the destination filesystem or exceed its filename limits
+fail explicitly. Network filesystems must provide the required synchronization
+and atomic rename semantics. A killed process can leave temporary files, which
+are ignored when restoring; completed nodes remain usable.
+
+When running in Docker, mount the archive directory and pass its **container**
+path to `ytclone`, for example `-v "$PWD/dump:/archive"` and destination `/archive`.
+The container user needs write permission on the mount.
+
 ## Copying a subset
 
 To restore one table, file, or document, point to its path inside the archive:
@@ -80,6 +127,7 @@ ytclone s3://my-bucket/export/home/analytics/events/2026-01-01 \
 To expand an export from a child directory to its parent, keep the same S3 prefix.
 For example, export both `//home/analytics/events` and `//home/analytics` to
 `s3://my-bucket/export`. Existing unchanged nodes are skipped; siblings are added.
+The same rule applies to a local archive root such as `./dump`.
 
 ## Tuning
 
@@ -88,17 +136,20 @@ For example, export both `//home/analytics/events` and `//home/analytics` to
 | `--concurrency` | `4` | Concurrent node transfers; per process in parallel mode. |
 | `--queue-size` | `16` | Pending paths in ordinary mode; control messages per process in parallel mode. |
 | `--part-size-mib` | `256` | Target **uncompressed** bytes per archive object; approximate for tables. |
-| `--buffer-size-mib` | `32` | S3 multipart buffer per transfer, from 5 to 512 MiB. |
+| `--buffer-size-mib` | `32` | Transfer buffer, from 5 to 512 MiB; multipart buffer for S3. |
 | `--compression-level` | `3` | Zstandard level, from -7 to 22; higher levels use more CPU and memory. |
 
-An archive part is one S3 object; multipart buffers are chunks within that object.
-`--part-size-mib` does not allocate a whole part in RAM. Objects smaller than the
-buffer use a single PUT; objects at or above that size use multipart upload.
+An archive part is one S3 object or one local file; multipart buffers are chunks
+within an S3 object. `--part-size-mib` does not allocate a whole part in RAM.
+S3 objects smaller than the buffer use a single PUT; larger ones use multipart
+upload. Local objects are streamed directly into temporary files.
 
 Lower concurrency or buffer size to reduce memory use. The startup RAM estimate
 is a planning budget, **not a limit**: large rows, metadata, and allocator overhead
 can exceed it. Parallel mode multiplies transfer memory by process count and also
 keeps discovered metadata in RAM; `--queue-size` does not bound that metadata.
+Local exports use the same conservative estimate, including allowances for S3
+multipart buffers that they do not allocate.
 
 ## Progress and logs
 
@@ -122,7 +173,8 @@ be added together as total elapsed time.
 ## Parallel export
 
 `--processes N --concurrency C` allows up to N × C concurrent transfers. It
-supports YT → S3 only; one table still occupies one slot regardless of its size.
+supports YT → S3 and YT → local disk; one table still occupies one slot regardless
+of its size.
 
 - `--discovery-concurrency` (default: 4) controls concurrent directory listings.
 - Directories and smaller known nodes go first. While discovery runs, one slot is

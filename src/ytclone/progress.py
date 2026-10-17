@@ -182,10 +182,18 @@ def format_progress(
             )
         )
 
-    for name in ("yt_metadata", "yt_read", "yt_write", "s3", "s3_download"):
+    for name in (
+        "yt_metadata",
+        "yt_read",
+        "yt_write",
+        "s3",
+        "s3_download",
+        "local",
+        "local_read",
+    ):
         timing = progress.timings.get(name)
         if timing is not None and timing.count:
-            if name in ("yt_read", "yt_write", "s3_download"):
+            if name in ("yt_read", "yt_write", "s3_download", "local_read"):
                 fields.append(f"{name}={timing.seconds:.1f}s({timing.errors}errors)")
             else:
                 average_ms = timing.seconds * 1000 / timing.count

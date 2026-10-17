@@ -24,6 +24,7 @@ from ytclone.format import (
     make_fingerprint,
     plan_parts,
 )
+from ytclone.local import LocalStorage, resolve_local_archive
 from ytclone.yt import RESTORE_MARKER, YtAdapter
 
 VALUES = [
@@ -130,12 +131,19 @@ def test_document_format_requires_one_complete_value_and_preserves_legacy_encodi
 
 
 @pytest.mark.parametrize("value", VALUES)
-def test_document_roundtrip_preserves_types_attributes_and_unchanged_skips(value):
+@pytest.mark.parametrize("disk", [False, True])
+def test_document_roundtrip_preserves_types_attributes_and_unchanged_skips(
+    tmp_path, value, disk
+):
     store, key, adapter = setup_document(value)
-    storage = MemoryStorage(events=[])
     options = CopyOptions(part_size=1)
 
     async def scenario():
+        if disk:
+            root, _ = await resolve_local_archive(path=tmp_path, export=True)
+            storage = LocalStorage(root=root, chunk_size=3)
+        else:
+            storage = MemoryStorage(events=[])
         async with adapter.worker() as worker:
 
             async def export():
