@@ -40,10 +40,11 @@ def test_invalid_settings(flag, value):
         cli.validate(arguments(flag, value))
 
 
-def test_reject_restore():
+@pytest.mark.parametrize("archive", ["s3://bucket/prefix", "./dump/home/test"])
+def test_reject_restore(archive):
     """Do not apply export ordering to restore directory dependencies."""
     args = cli.Arguments()
-    args.parse_args(["s3://bucket/prefix", "//home/test", "--yt-proxy", "yt.invalid"])
+    args.parse_args([archive, "//home/test", "--yt-proxy", "yt.invalid"])
     with pytest.raises(ValueError, match="YT to S3"):
         cli.validate(args)
 
@@ -76,10 +77,47 @@ def test_run_passes_nonsecret_config_and_reports_failure(monkeypatch, capsys):
     assert captured["small_size"] == 8 * 1024**2
     config = captured["config"]
     assert config["concurrency"] == 2
-    assert config["bucket"] == "bucket" and config["prefix"] == "prefix"
+    assert config["storage"] == {
+        "kind": "s3",
+        "bucket": "bucket",
+        "prefix": "prefix",
+        "root": "",
+    }
     assert config["endpoint"] == "https://s3.invalid" and config["region"] == "custom"
     assert not any("secret" in key.lower() or "token" in key.lower() for key in config)
     assert "failed" in capsys.readouterr().out
+
+
+def test_local_coordinator_resolves_archive_before_spawning_workers(
+    monkeypatch, tmp_path
+):
+    """Relative destinations become one initialized, absolute root shared by workers."""
+    from ytclone import storage as archive_storage
+
+    monkeypatch.chdir(tmp_path)
+    args = cli.Arguments()
+    args.parse_args(["//home/test", "./dump", "--yt-proxy", "yt.invalid"])
+    captured = {}
+    monkeypatch.setattr(cli, "YtAdapter", lambda **kwargs: object())
+
+    def unexpected(**kwargs):
+        pytest.fail("A local coordinator must not construct HTTP or S3 clients")
+
+    monkeypatch.setattr(archive_storage.aiohttp, "ClientSession", unexpected)
+    monkeypatch.setattr(archive_storage, "S3Client", unexpected)
+
+    async def supervise(**kwargs):
+        captured.update(kwargs)
+        assert (tmp_path / "dump" / "@archive.json").is_file()
+
+    monkeypatch.setattr(cli, "supervise", supervise)
+    assert asyncio.run(cli.run(arguments=args, options=cli.validate(args))) == 0
+    assert captured["config"]["storage"] == {
+        "kind": "local",
+        "root": str(tmp_path / "dump"),
+        "bucket": "",
+        "prefix": "",
+    }
 
 
 @pytest.mark.parametrize(

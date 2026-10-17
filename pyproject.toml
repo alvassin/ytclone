@@ -1,7 +1,7 @@
 [project]
 name = "ytclone"
 version = "0.1.0"
-description = "Resumable copying of YTsaurus tables, files and directories to and from S3"
+description = "Resumable copying of YTsaurus tables, files and directories to and from S3 or local disk"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

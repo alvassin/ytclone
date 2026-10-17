@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from ytclone import storage as archive_storage
 from ytclone.engine import CopyOptions
 from ytclone.format import DiscoveredNode
 from ytclone.parallel import worker
@@ -312,10 +313,12 @@ def test_run_worker_builds_process_local_resources(monkeypatch):
         """Inspect transfer settings instead of consuming network data."""
         seen["serve"] = kwargs
 
-    monkeypatch.setattr(worker.aiohttp, "ClientSession", Session)
+    monkeypatch.setattr(archive_storage.aiohttp, "ClientSession", Session)
     monkeypatch.setattr(worker, "YtAdapter", adapter)
-    monkeypatch.setattr(worker, "S3Client", s3_client)
-    monkeypatch.setattr(worker, "S3Storage", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(archive_storage, "S3Client", s3_client)
+    monkeypatch.setattr(
+        archive_storage, "S3Storage", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
     monkeypatch.setattr(worker, "serve_jobs", serve_fake)
 
     async def scenario():
@@ -325,8 +328,11 @@ def test_run_worker_builds_process_local_resources(monkeypatch):
             "proxy_discovery": False,
             "endpoint": "https://s3.test/",
             "region": "region-test",
-            "bucket": "archive-bucket",
-            "prefix": "snapshots",
+            "storage": {
+                "kind": "s3",
+                "bucket": "archive-bucket",
+                "prefix": "snapshots",
+            },
             "concurrency": 3,
             "part_size": 256 * 1024**2,
             "chunk_size": 32 * 1024**2,
@@ -348,6 +354,52 @@ def test_run_worker_builds_process_local_resources(monkeypatch):
     assert seen["yt_options"]["proxy_discovery"] is False
 
 
+def test_local_worker_opens_resolved_root_without_initializing_it(
+    monkeypatch, tmp_path
+):
+    """Workers use the coordinator's root and never create S3 resources or markers."""
+    seen = {}
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("A local worker must only open its already resolved archive")
+
+    async def serve_fake(**kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(archive_storage.aiohttp, "ClientSession", unexpected)
+    monkeypatch.setattr(archive_storage, "S3Client", unexpected)
+    monkeypatch.setattr(archive_storage, "resolve_local_archive", unexpected)
+    monkeypatch.setattr(
+        archive_storage, "LocalStorage", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+    monkeypatch.setattr(worker, "YtAdapter", lambda **kwargs: FakeYt())
+    monkeypatch.setattr(worker, "serve_jobs", serve_fake)
+
+    async def scenario():
+        await worker.run_worker(
+            reader=asyncio.StreamReader(),
+            writer=MemoryWriter(),
+            config={
+                "yt_proxy": "https://yt.test/",
+                "proxy_discovery": False,
+                "endpoint": "https://unused.test",
+                "region": "unused",
+                "storage": {"kind": "local", "root": str(tmp_path), "prefix": ""},
+                "concurrency": 2,
+                "part_size": 256 * 1024**2,
+                "chunk_size": 8 * 1024**2,
+                "compression_level": 3,
+                "progress_interval": 5,
+            },
+        )
+
+    asyncio.run(scenario())
+    assert seen["storage"].root == str(tmp_path)
+    assert seen["storage"].chunk_size == 8 * 1024**2
+    assert seen["prefix"] == ""
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_entrypoint_stdout_contains_only_protocol(tmp_path):
     """Real subprocess pipes isolate logs and accidental prints from JSON output."""
     import os
@@ -359,6 +411,7 @@ def test_entrypoint_stdout_contains_only_protocol(tmp_path):
     script.write_text(
         """from contextlib import asynccontextmanager
 from ytclone.parallel import worker
+from ytclone import storage as archive_storage
 
 class FakeYt:
     def __init__(self, **kwargs):
@@ -375,8 +428,8 @@ async def transfer(**kwargs):
     return "completed", "copied"
 
 worker.YtAdapter = FakeYt
-worker.S3Client = lambda **kwargs: object()
-worker.S3Storage = lambda **kwargs: object()
+archive_storage.S3Client = lambda **kwargs: object()
+archive_storage.S3Storage = lambda **kwargs: object()
 worker.export_node = transfer
 raise SystemExit(worker.main())
 """
@@ -386,8 +439,7 @@ raise SystemExit(worker.main())
         "proxy_discovery": False,
         "endpoint": "https://unused.test",
         "region": "region-test",
-        "bucket": "bucket",
-        "prefix": "archive",
+        "storage": {"kind": "s3", "bucket": "bucket", "prefix": "archive"},
         "concurrency": 1,
         "part_size": 256 * 1024**2,
         "chunk_size": 32 * 1024**2,
@@ -511,7 +563,7 @@ raise SystemExit(worker.main())
                 dependency_version == "17.10.3"
                 and sys.platform == "linux"
                 and sys.version_info[:2] == (3, 10)
-                and signal_name == "SIGINT"
+                and signal_name in ("SIGINT", "SIGTERM")
                 and process.returncode == 1
                 and b"/aiomisc/entrypoint.py" in stderr
                 and b"loop.run_until_complete(self.__aexit__(exc_type, exc_val, exc_tb))"
@@ -521,7 +573,7 @@ raise SystemExit(worker.main())
                 )
             ):
                 pytest.xfail(
-                    "aiomisc 17.10.3 stops its loop during SIGINT shutdown on Python 3.10"
+                    f"aiomisc 17.10.3 stops its loop during {signal_name} shutdown on Python 3.10"
                 )
             assert process.returncode == 130, stderr.decode(errors="replace")
         finally:
@@ -530,3 +582,34 @@ raise SystemExit(worker.main())
                 await process.wait()
 
     asyncio.run(scenario())
+
+
+def test_portable_smoke_configuration_starts_and_stops_worker(monkeypatch):
+    """The release check must keep using the worker's actual configuration schema."""
+    import runpy
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "check_portable.py"
+    config = runpy.run_path(str(script))["worker_config"]()
+    yt = FakeYt()
+    opened = {}
+
+    @asynccontextmanager
+    async def storage(**kwargs):
+        opened.update(kwargs)
+        yield object()
+
+    monkeypatch.setattr(worker, "YtAdapter", lambda **kwargs: yt)
+    monkeypatch.setattr(worker, "open_storage", storage)
+
+    async def scenario():
+        reader, writer = asyncio.StreamReader(), MemoryWriter()
+        feed(reader=reader, message_type="stop")
+        await worker.run_worker(reader=reader, writer=writer, config=config)
+        assert writer.messages == [{"type": "ready"}]
+
+    asyncio.run(scenario())
+    assert opened["location"].kind == "s3"
+    assert opened["location"].bucket == "portable-check"
+    assert opened["location"].prefix == "check"
+    assert len(yt.opened) == len(yt.closed) == config["concurrency"]

@@ -1,4 +1,4 @@
-"""Resumable YTsaurus / S3 copying."""
+"""Resumable copying between YTsaurus and S3 or local disk."""
 
 
 def main() -> int:

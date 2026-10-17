@@ -87,6 +87,8 @@ def run_cli(*, module, source, destination, directory, name, extra=()):
     command = [sys.executable, "-m", module, *arguments]
     image = os.environ.get("YTCLONE_DOCKER_IMAGE")
     portable = os.environ.get("YTCLONE_PORTABLE_DIR")
+    if not image and not portable and os.environ.get("PYTHONPATH"):
+        environment["PYTHONPATH"] = os.environ["PYTHONPATH"]
     assert not (image and portable), (
         "Choose either YTCLONE_DOCKER_IMAGE or YTCLONE_PORTABLE_DIR"
     )

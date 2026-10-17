@@ -642,15 +642,15 @@ async def restore_tree(
             await channel.put(source_prefix)
             progress.queued = channel.qsize()
             return
-        seen = False
-        previous = None
+        listed: set[str] = set()
         listing_prefix = source_prefix + "/" if source_prefix else ""
         async for key in storage.list_keys(prefix=listing_prefix):
             prefix = _node_from_key(key=key, source_prefix=source_prefix)
-            if prefix is None or prefix == previous:
+            if prefix is None or prefix in listed:
                 continue
-            previous = prefix
-            seen = True
+            # Filesystem listings need not group a node's objects together.
+            # Queue each node once even when stale descendants appear between them.
+            listed.add(prefix)
             try:
                 await parents(prefix=prefix, yt=yt)
                 found(prefix)
@@ -669,7 +669,7 @@ async def restore_tree(
                 result.failed += 1
                 progress.record_result(status="failed", reason="archive")
                 log.exception("archive_node_failed prefix=%s", prefix)
-        if not seen:
+        if not listed:
             raise ValueError(f"No archive nodes found under {source_prefix}")
 
     return await _pipeline(

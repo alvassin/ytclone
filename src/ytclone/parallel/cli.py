@@ -1,22 +1,24 @@
-"""Copy a YT prefix to S3 with concurrent discovery and small-first processes."""
+"""Copy a YT prefix to S3 or disk with concurrent discovery and small-first processes."""
 
 import asyncio
 import logging
 import math
 import sys
 from contextlib import nullcontext
+from dataclasses import asdict
 
 import aiomisc
 import argclass
 from aiomisc.log import LogFormat
 
-from ..cli import LOG_DATE_FORMAT, direction
+from ..cli import LOG_DATE_FORMAT
 from ..cli import Arguments as CopyArguments
 from ..engine import CopyOptions
 from ..format import MIB
 from ..logging import file_logging
 from ..memory import estimate_memory_mib
 from ..progress import Progress, ProgressReporter
+from ..storage import direction, resolve_storage
 from ..yt import YtAdapter
 from .discovery import discover
 from .supervisor import supervise
@@ -50,11 +52,11 @@ class Arguments(CopyArguments):
 
 def validate(arguments: Arguments) -> CopyOptions:
     """Reject invalid settings before starting clients or child processes."""
-    export, _, _, _ = direction(
-        source=arguments.source, destination=arguments.destination
-    )
+    export, _, _ = direction(source=arguments.source, destination=arguments.destination)
     if not export:
-        raise ValueError("Parallel copying currently supports YT to S3 only")
+        raise ValueError(
+            "Parallel copying supports YT to S3 or local disk; use ytclone for restore"
+        )
     if min(arguments.processes, arguments.discovery_concurrency) < 1:
         raise ValueError("Process and discovery counts must be positive")
     if min(arguments.worker_restarts, arguments.small_table_mib) < 0:
@@ -75,9 +77,10 @@ def validate(arguments: Arguments) -> CopyOptions:
 
 async def run(*, arguments: Arguments, options: CopyOptions) -> int:
     """Own discovery, aggregate progress and the bounded process supervisor."""
-    _, source, bucket, prefix = direction(
+    _, source, location = direction(
         source=arguments.source, destination=arguments.destination
     )
+    location = await resolve_storage(location=location, export=True)
     progress = Progress(source_size_missing=True)
     yt = YtAdapter(
         proxy=arguments.yt_proxy,
@@ -89,8 +92,7 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
         "proxy_discovery": not arguments.no_proxy_discovery,
         "endpoint": arguments.endpoint,
         "region": arguments.region,
-        "bucket": bucket,
-        "prefix": prefix,
+        "storage": asdict(location),
         "concurrency": options.concurrency,
         "queue_size": options.queue_size,
         "part_size": options.part_size,
