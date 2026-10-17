@@ -25,7 +25,11 @@ class SourceSnapshot(Protocol):
     def read_part(
         self, *, part: Range, compression_level: int, chunk_size: int
     ) -> AsyncIterator[bytes]:
-        """Open a fresh compressed stream; temporary failures raise RetryableReadError."""
+        """Open a fresh stream; table ranges may run concurrently in one snapshot.
+
+        All readers must be closed before snapshot exit. Temporary source failures
+        raise RetryableReadError so a range can restart in that same snapshot.
+        """
         ...
 
 

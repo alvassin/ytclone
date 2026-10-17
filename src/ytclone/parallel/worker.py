@@ -49,6 +49,7 @@ async def serve_jobs(
 
     channel: Channel[tuple[int, DiscoveredNode]] = Channel(maxsize=options.concurrency)
     output_lock = asyncio.Lock()
+    streams = asyncio.Semaphore(options.stream_limit)
     pending: set[int] = set()
 
     async def send(*, message: dict) -> None:
@@ -98,6 +99,7 @@ async def serve_jobs(
                     options=options,
                     progress=progress,
                     discovered=node,
+                    streams=streams,
                 )
             except Exception as error:
                 status, reason = "failed", type(error).__name__
@@ -156,6 +158,8 @@ async def run_worker(
     """Create process-local YT and S3 clients and serve node assignments."""
     options = CopyOptions(
         concurrency=config["concurrency"],
+        part_concurrency=config.get("part_concurrency", 1),
+        max_streams=config.get("max_streams", 0),
         queue_size=config["concurrency"],
         part_size=config["part_size"],
         chunk_size=config["chunk_size"],

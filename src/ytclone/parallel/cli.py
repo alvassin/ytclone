@@ -66,6 +66,8 @@ def validate(arguments: Arguments) -> CopyOptions:
         raise ValueError("Progress interval must be positive and finite")
     return CopyOptions(
         concurrency=arguments.concurrency,
+        part_concurrency=arguments.part_concurrency,
+        max_streams=arguments.max_streams,
         queue_size=arguments.queue_size,
         part_size=arguments.part_size_mib * MIB,
         chunk_size=arguments.buffer_size_mib * MIB,
@@ -92,6 +94,8 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
         "bucket": bucket,
         "prefix": prefix,
         "concurrency": options.concurrency,
+        "part_concurrency": options.part_concurrency,
+        "max_streams": options.max_streams,
         "queue_size": options.queue_size,
         "part_size": options.part_size,
         "chunk_size": options.chunk_size,
@@ -102,13 +106,15 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
         "progress_interval": arguments.progress_interval,
     }
     budget = arguments.processes * estimate_memory_mib(
-        concurrency=options.concurrency,
+        concurrency=options.stream_limit,
+        reader_concurrency=options.reader_limit,
         chunk_size=options.chunk_size,
         compression_level=options.compression_level,
         export=True,
     )
     print(
         f"Parallel export: {arguments.processes} processes x {options.concurrency} workers; "
+        f"parts/table={options.part_concurrency}; streams/process={options.stream_limit}; "
         f"discovery={arguments.discovery_concurrency}; small-first <= {arguments.small_table_mib} MiB. "
         f"RAM estimate: {budget} MiB plus discovery metadata (planning budget, not a limit)",
         flush=True,

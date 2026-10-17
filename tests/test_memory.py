@@ -2,6 +2,7 @@
 
 import pytest
 
+from ytclone.engine import CopyOptions
 from ytclone.format import MIB
 from ytclone.memory import estimate_memory_mib
 
@@ -70,3 +71,27 @@ def test_restore_budget_does_not_assume_cli_compression_level_matches_archive():
     }
     assert len(estimates) == 1
     assert estimates.pop() >= 128 + 2 * (2 * 32 + 128)
+
+
+def test_export_budget_accounts_for_idle_readers_without_full_transfer_buffers():
+    """Multiple tables retain SDK clients after releasing their shared stream slots."""
+    options = CopyOptions(concurrency=4, part_concurrency=3, max_streams=2)
+    assert options.reader_limit == 8
+
+    def budget(*, streams, readers=None, export=True):
+        return estimate_memory_mib(
+            concurrency=streams,
+            reader_concurrency=readers,
+            chunk_size=32 * MIB,
+            compression_level=3,
+            export=export,
+        )
+
+    active_only = budget(streams=options.stream_limit)
+    with_idle = budget(streams=options.stream_limit, readers=options.reader_limit)
+    all_active = budget(streams=options.reader_limit)
+    assert active_only < with_idle < all_active
+    assert budget(streams=options.stream_limit, readers=1) == active_only
+    assert budget(streams=4, readers=options.reader_limit, export=False) == budget(
+        streams=4, export=False
+    )

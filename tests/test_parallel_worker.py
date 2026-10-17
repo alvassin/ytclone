@@ -328,6 +328,8 @@ def test_run_worker_builds_process_local_resources(monkeypatch):
             "bucket": "archive-bucket",
             "prefix": "snapshots",
             "concurrency": 3,
+            "part_concurrency": 3,
+            "max_streams": 4,
             "part_size": 256 * 1024**2,
             "chunk_size": 32 * 1024**2,
             "compression_level": 3,
@@ -343,6 +345,8 @@ def test_run_worker_builds_process_local_resources(monkeypatch):
     assert seen["s3_options"]["region"] == "region-test"
     assert set(seen["s3_options"]) == {"session", "url", "region"}
     assert seen["serve"]["options"].concurrency == 3
+    assert seen["serve"]["options"].part_concurrency == 3
+    assert seen["serve"]["options"].max_streams == 4
     assert seen["serve"]["prefix"] == "snapshots"
     assert seen["serve"]["cluster"] == "https://yt.test"
     assert seen["yt_options"]["proxy_discovery"] is False
@@ -511,7 +515,7 @@ raise SystemExit(worker.main())
                 dependency_version == "17.10.3"
                 and sys.platform == "linux"
                 and sys.version_info[:2] == (3, 10)
-                and signal_name == "SIGINT"
+                and signal_name in ("SIGINT", "SIGTERM")
                 and process.returncode == 1
                 and b"/aiomisc/entrypoint.py" in stderr
                 and b"loop.run_until_complete(self.__aexit__(exc_type, exc_val, exc_tb))"
@@ -521,7 +525,7 @@ raise SystemExit(worker.main())
                 )
             ):
                 pytest.xfail(
-                    "aiomisc 17.10.3 stops its loop during SIGINT shutdown on Python 3.10"
+                    f"aiomisc 17.10.3 stops its loop during {signal_name} shutdown on Python 3.10"
                 )
             assert process.returncode == 130, stderr.decode(errors="replace")
         finally:
@@ -530,3 +534,33 @@ raise SystemExit(worker.main())
                 await process.wait()
 
     asyncio.run(scenario())
+
+
+def test_portable_smoke_configuration_starts_and_stops_worker(monkeypatch):
+    """The release check must keep using the worker's actual configuration schema."""
+    import runpy
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "check_portable.py"
+    config = runpy.run_path(str(script))["worker_config"]()
+    yt = FakeYt()
+    opened = {}
+
+    @asynccontextmanager
+    async def session(**kwargs):
+        yield object()
+
+    monkeypatch.setattr(worker, "YtAdapter", lambda **kwargs: yt)
+    monkeypatch.setattr(worker.aiohttp, "ClientSession", session)
+    monkeypatch.setattr(worker, "S3Client", lambda **kwargs: opened.update(kwargs))
+    monkeypatch.setattr(worker, "S3Storage", lambda **kwargs: object())
+
+    async def scenario():
+        reader, writer = asyncio.StreamReader(), MemoryWriter()
+        feed(reader=reader, message_type="stop")
+        await worker.run_worker(reader=reader, writer=writer, config=config)
+        assert writer.messages == [{"type": "ready"}]
+
+    asyncio.run(scenario())
+    assert opened["url"] == "http://127.0.0.1:1/portable-check"
+    assert len(yt.opened) == len(yt.closed) == config["concurrency"]

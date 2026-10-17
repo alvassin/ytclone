@@ -87,8 +87,11 @@ IDs. Restore validates the declared payload size, complete YSON syntax and stora
 checksum before setting the document value. A matching marker alone is insufficient;
 if unchanged state cannot be established, copy again.
 
-Skipping compares metadata; it is not a full integrity scan of stored data. Part
-checksums verify data as it is transferred.
+Skipping is not a full integrity scan of stored data: export checks referenced
+object existence and size, so same-size corruption can go undetected. Upload
+records SHA-256 and size without reading the object back. An actual restore
+reads every referenced part and verifies its checksum and size; a restore skipped
+because its destination is unchanged does not read the parts.
 
 ## Completion and replacement
 
@@ -131,8 +134,11 @@ Discover -> bounded queue -> compare metadata -> skip or copy -> complete node
 
 - Discovery and transfer overlap; copying starts before the entire tree is scanned.
 - One discovery worker feeds an `aiochannel` bounded by `--queue-size`; at most
-  `--concurrency` nodes are transferred at once. Each node's parts are sequential.
-  Buffers are bounded per transfer; increasing concurrency increases memory use.
+  `--concurrency` nodes are transferred at once. Export permits up to
+  `--part-concurrency` concurrent row ranges per table; file/document parts and all
+  restore parts are sequential. A process-wide `--max-streams` budget caps active
+  export data transfers across nodes. Buffers are bounded per stream; increasing this
+  budget increases memory use. Discovery and metadata do not consume stream slots.
 - Cypress discovery resolves the source root once, then lists each directory by
   ID with child IDs, types, revisions and source sizes. The queue carries these
   hints with each path; matching archives need no per-node YT requests. Workers
@@ -170,7 +176,9 @@ flowchart TB
 ```
 
 Solid arrows carry paths and, during export, discovered IDs and revisions.
-Dotted arrows show which clients a task uses.
+Dotted arrows show which clients a task uses. The diagram shows the default
+sequential part mode. Concurrent table export adds a bounded pool of reader
+client/thread pairs under the node's existing snapshot owner.
 
 - A **copy task** is the async `worker()` loop in `engine.py`. It takes a path,
   copies or skips that node, then takes the next path.
@@ -180,6 +188,10 @@ Dotted arrows show which clients a task uses.
   across nodes; full checks and copies use separate node transactions, while
   revision-matched export skips need none. The SDK manages HTTP sessions
   and transaction pings. An uncertain transaction cleanup prevents client reuse.
+- Concurrent table readers each have their own **YT client and dedicated thread**.
+  They use the snapshot owner's transaction ID and pinned node ID for every range;
+  they do not start independent transactions or acquire new snapshot locks. The
+  owner keeps the snapshot alive until all readers have finished and closed.
 - **S3 clients are shared** across all tasks and use async HTTP. Table/file bytes
   flow inside a copy task, without going through the node queue.
 
@@ -187,6 +199,9 @@ During restore, discovery finishes each parent directory before queuing its
 children. Clients and dedicated threads close when their tasks finish.
 
 ### Export: one table from YT to S3
+
+This diagram shows the default `--part-concurrency 1`. With concurrent parts, the
+range-transfer loop runs in a bounded group under the same snapshot.
 
 ```mermaid
 sequenceDiagram
@@ -233,6 +248,21 @@ sequenceDiagram
 
 An archive part is one S3 object. S3 multipart upload chunks are buffers within
 that object. Parts are streamed through bounded buffers.
+
+Concurrent table export schedules disjoint row ranges with deterministic object
+keys. Completion order does not change the ordered part list in the manifest.
+A shared per-process stream budget bounds simultaneous data transfers across
+all nodes; it is not multiplied by each node's part-concurrency setting. The
+scheduler keeps a bounded group of part tasks, rather than creating one task
+for every range of a large table. Each reader owns its stream and compressor.
+A terminal part failure cancels and drains sibling work before the snapshot
+ends; no manifest is published for that incomplete node.
+
+`ytclone-parallel` assigns a complete node to one process, so part concurrency
+runs within that process. It does not distribute one table across processes.
+Concurrency settings do not alter archive encoding or change detection. There
+is no persisted part checkpoint: a process restart or a lost snapshot still
+requires copying the unfinished table again.
 
 `Snapshot.read_part()` opens one fresh stream and compressor. Table reads use the
 SDK HTTP transport, preserving its framing and trailer error checks, without the

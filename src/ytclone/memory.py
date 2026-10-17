@@ -11,7 +11,12 @@ BUDGET_STEP = 64 * MIB
 
 
 def estimate_memory_mib(
-    *, concurrency: int, chunk_size: int, compression_level: int, export: bool
+    *,
+    concurrency: int,
+    chunk_size: int,
+    compression_level: int,
+    export: bool,
+    reader_concurrency: int | None = None,
 ) -> int:
     """Estimate a rounded RAM budget for the configured copy direction."""
     if export:
@@ -32,4 +37,8 @@ def estimate_memory_mib(
     # CCtx/DCtx estimates exclude streaming window and input/output buffers.
     worker_memory = buffers + codec_memory + window + MIB + WORKER_HEADROOM
     total = PROCESS_HEADROOM + concurrency * worker_memory
+    if export and reader_concurrency is not None:
+        # A snapshot reuses idle SDK clients/threads after releasing a stream slot.
+        # Their compressors and data buffers have already been closed.
+        total += max(0, reader_concurrency - concurrency) * WORKER_HEADROOM
     return ((total + BUDGET_STEP - 1) // BUDGET_STEP) * (BUDGET_STEP // MIB)

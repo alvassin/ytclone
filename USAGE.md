@@ -86,6 +86,8 @@ For example, export both `//home/analytics/events` and `//home/analytics` to
 | Option | Default | Effect |
 | --- | --- | --- |
 | `--concurrency` | `4` | Concurrent node transfers; per process in parallel mode. |
+| `--part-concurrency` | `1` | Concurrent parts of each table during export. Files/documents remain sequential. |
+| `--max-streams` | `0` | Shared cap on active export data transfers per process; `0` uses `max(concurrency, part-concurrency)`. |
 | `--queue-size` | `16` | Pending paths in ordinary mode; control messages per process in parallel mode. |
 | `--part-size-mib` | `256` | Target **uncompressed** bytes per archive object; approximate for tables. |
 | `--buffer-size-mib` | `32` | S3 multipart buffer per transfer, from 5 to 512 MiB. |
@@ -95,10 +97,48 @@ An archive part is one S3 object; multipart buffers are chunks within that objec
 `--part-size-mib` does not allocate a whole part in RAM. Objects smaller than the
 buffer use a single PUT; objects at or above that size use multipart upload.
 
-Lower concurrency or buffer size to reduce memory use. The startup RAM estimate
-is a planning budget, **not a limit**: large rows, metadata, and allocator overhead
-can exceed it. Parallel mode multiplies transfer memory by process count and also
+Lower the active stream limit or buffer size to reduce memory use. The startup
+RAM estimate is a planning budget, **not a limit**: large rows, metadata, and
+allocator overhead can exceed it. Parallel mode multiplies transfer memory by process count and also
 keeps discovered metadata in RAM; `--queue-size` does not bound that metadata.
+
+### Large tables
+
+Use concurrent parts to export a large static table to S3:
+
+```bash
+ytclone //home/analytics/large_table s3://my-bucket/export \
+  --part-concurrency 4 --max-streams 4
+```
+
+`--part-concurrency K` allows up to K active row ranges per table. The shared
+`--max-streams` limit caps data transfers across all nodes in the process,
+including files and documents. For example,
+`--concurrency 4 --part-concurrency 4 --max-streams 6` can copy four nodes with at
+most six active data transfers in total. A table with fewer parts uses fewer
+streams. Files and documents use one stream per node, and metadata/discovery
+requests are outside this data-transfer cap.
+
+The default `--max-streams 0` chooses the larger of `--concurrency` and
+`--part-concurrency`, preserving the default four-stream budget. These limits
+apply separately to each process in `ytclone-parallel`; two processes with
+`--max-streams 6` can transfer twelve parts in total. A single table always stays
+in one process.
+
+Each part reads a disjoint row range of the same pinned snapshot, using its own
+YT client and thread. Completed parts may arrive out of order; the manifest
+records them in row order and is published after all parts finish. The archive
+format and restore command are unchanged. Increasing concurrency can help until
+network bandwidth, YT read throughput, compression or destination storage becomes
+the bottleneck; it does not promise proportional speedup. Throughput gains have
+not yet been benchmarked.
+
+`--part-size-mib` sets the approximate uncompressed size of each range. It affects
+request overhead and how much data must be repeated after a failed part. Temporary
+read failures retry that part in the same snapshot. If the snapshot is lost or
+the process stops, rerunning still copies the unfinished table from the beginning.
+Restore reads table parts sequentially. Nondefault `--part-concurrency` or
+`--max-streams` settings are export-only and are rejected for restore.
 
 ## Progress and logs
 
@@ -109,7 +149,7 @@ file, ordinary mode writes detailed logs to the console.
 | Counter | Meaning |
 | --- | --- |
 | `copied / unchanged / skipped / errors` | Completed nodes, matching copies, reported skips, and node/discovery errors. |
-| `queued / active` | Pending nodes and busy transfer slots. |
+| `queued / active` | Pending nodes and busy node slots; `active` does not count concurrent parts. |
 | `uploaded / published` | Compressed bytes sent versus bytes belonging to completed archive nodes. |
 | `downloaded / restored` | Compressed bytes received versus bytes belonging to completed restores. |
 
@@ -121,8 +161,10 @@ be added together as total elapsed time.
 
 ## Parallel export
 
-`--processes N --concurrency C` allows up to N × C concurrent transfers. It
-supports YT → S3 only; one table still occupies one slot regardless of its size.
+`--processes N --concurrency C` allows up to N × C concurrent node transfers.
+It supports YT → S3. One table occupies one node slot in one process;
+`--part-concurrency` controls that table's active ranges and `--max-streams` caps
+all data transfers within each process. See [large tables](#large-tables).
 
 - `--discovery-concurrency` (default: 4) controls concurrent directory listings.
 - Directories and smaller known nodes go first. While discovery runs, one slot is

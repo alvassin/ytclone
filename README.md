@@ -81,9 +81,22 @@ ytclone-parallel //home/analytics/events s3://my-bucket/export \
   --processes 2 --concurrency 2 --log-file export.log
 ```
 
-This runs two processes with two transfers each, prioritizing directories and
-small nodes. One table still occupies one transfer slot. Parallel mode supports
-YT → S3; restore its archives with `ytclone` as above.
+This runs two processes with two node transfers each, prioritizing directories
+and small nodes. Parallel mode supports YT → S3; restore its archives with
+`ytclone` as above.
+
+To export one large table using several concurrent row ranges:
+
+```bash
+ytclone //home/analytics/large_table s3://my-bucket/export \
+  --part-concurrency 4 --max-streams 4 --log-file export.log
+```
+
+Both commands support `--part-concurrency`; its default of `1` keeps table parts
+sequential. `--max-streams` caps active data transfers across all nodes in each
+process. All ranges of a table use one snapshot, and the archive retains row
+order. A table stays in one process; adding processes helps when exporting
+multiple nodes. See [large-table tuning](USAGE.md#large-tables) for the limits.
 
 ## Before you copy
 
