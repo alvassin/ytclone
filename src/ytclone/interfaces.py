@@ -19,14 +19,12 @@ class RetryableRestoreError(Exception):
     """A temporary restore failure whose destination transaction was rolled back."""
 
 
+class WorkerLifecycleError(RuntimeError):
+    """A data worker cannot reset its client safely for another range."""
+
+
 class SourceSnapshot(Protocol):
     node: Node
-
-    def read_part(
-        self, *, part: Range, compression_level: int, chunk_size: int
-    ) -> AsyncIterator[bytes]:
-        """Open a fresh compressed stream; temporary failures raise RetryableReadError."""
-        ...
 
 
 class RestoreSink(Protocol):
@@ -54,6 +52,22 @@ class YtBackend(Protocol):
 
     def snapshot(self, *, path: str) -> AbstractAsyncContextManager[SourceSnapshot]:
         """Pin a source node while its metadata and data are read."""
+        ...
+
+    def read_part(
+        self,
+        *,
+        snapshot: SourceSnapshot,
+        part: Range,
+        compression_level: int,
+        chunk_size: int,
+    ) -> AsyncIterator[bytes]:
+        """Read one range with this worker's reusable client and thread.
+
+        The snapshot may belong to another worker from the same factory. Close
+        the stream before its snapshot exits; one worker reads one range at a
+        time. Temporary table-read failures raise RetryableReadError.
+        """
         ...
 
     async def ensure_directory(self, *, path: str) -> None:

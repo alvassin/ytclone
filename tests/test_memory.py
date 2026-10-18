@@ -57,6 +57,33 @@ def test_export_budget_includes_compression_level_cost():
     assert high > low
 
 
+def test_snapshot_owners_add_headroom_without_multiplying_data_buffers():
+    """More admitted nodes retain metadata clients while the data pool stays fixed."""
+    one_owner = estimate_memory_mib(
+        concurrency=4,
+        snapshot_concurrency=1,
+        chunk_size=32 * MIB,
+        compression_level=3,
+        export=True,
+    )
+    many_owners = estimate_memory_mib(
+        concurrency=4,
+        snapshot_concurrency=9,
+        chunk_size=32 * MIB,
+        compression_level=3,
+        export=True,
+    )
+    many_streams = estimate_memory_mib(
+        concurrency=12,
+        snapshot_concurrency=1,
+        chunk_size=32 * MIB,
+        compression_level=3,
+        export=True,
+    )
+    assert 0 < many_owners - one_owner < many_streams - one_owner
+    assert many_owners - one_owner < 8 * 32
+
+
 def test_restore_budget_does_not_assume_cli_compression_level_matches_archive():
     """Allow the largest supported archive window regardless of CLI level."""
     estimates = {

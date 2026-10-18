@@ -409,7 +409,8 @@ def test_snapshot_ranges_and_thread_affinity(adapter, store):
                 data = b"".join(
                     [
                         value
-                        async for value in snapshot.read_part(
+                        async for value in worker.read_part(
+                            snapshot=snapshot,
                             part=Range(index=0, start=1, stop=2),
                             compression_level=3,
                             chunk_size=4,
@@ -1648,7 +1649,7 @@ def test_dynamic_snapshot_does_not_fetch_full_metadata(adapter, store, monkeypat
 def test_prefetch_overlaps_upload_and_propagates_errors(
     adapter, store, monkeypatch, fail
 ):
-    from ytclone.yt import Snapshot, _ReadStream
+    from ytclone.yt import _PartReader, _ReadStream
 
     add_node(store=store)
     entered = threading.Event()
@@ -1679,14 +1680,15 @@ def test_prefetch_overlaps_upload_and_propagates_errors(
         self._stream = _ReadStream(raw=io.BytesIO(), compressed=reader)
         return self._stream
 
-    monkeypatch.setattr(Snapshot, "_open_part", open_part)
+    monkeypatch.setattr(_PartReader, "_open_part", open_part)
 
     async def main():
         async with (
             adapter.worker() as worker,
             worker.snapshot(path="//tmp/source") as snapshot,
         ):
-            parts = snapshot.read_part(
+            parts = worker.read_part(
+                snapshot=snapshot,
                 part=Range(index=0, start=0, stop=2),
                 compression_level=3,
                 chunk_size=10,
@@ -1709,7 +1711,7 @@ def test_prefetch_overlaps_upload_and_propagates_errors(
 
 
 def test_closing_prefetch_waits_before_closing_source(adapter, store, monkeypatch):
-    from ytclone.yt import Snapshot, _ReadStream
+    from ytclone.yt import _PartReader, _ReadStream
 
     add_node(store=store)
     entered = threading.Event()
@@ -1739,14 +1741,15 @@ def test_closing_prefetch_waits_before_closing_source(adapter, store, monkeypatc
         self._stream = _ReadStream(raw=io.BytesIO(), compressed=reader)
         return self._stream
 
-    monkeypatch.setattr(Snapshot, "_open_part", open_part)
+    monkeypatch.setattr(_PartReader, "_open_part", open_part)
 
     async def main():
         async with (
             adapter.worker() as worker,
             worker.snapshot(path="//tmp/source") as snapshot,
         ):
-            parts = snapshot.read_part(
+            parts = worker.read_part(
+                snapshot=snapshot,
                 part=Range(index=0, start=0, stop=2),
                 compression_level=3,
                 chunk_size=10,
@@ -1781,7 +1784,8 @@ def test_cancelling_initial_read_closes_created_stream(adapter, store, monkeypat
             adapter.worker() as worker,
             worker.snapshot(path="//tmp/source") as snapshot,
         ):
-            parts = snapshot.read_part(
+            parts = worker.read_part(
+                snapshot=snapshot,
                 part=Range(index=0, start=0, stop=2),
                 compression_level=3,
                 chunk_size=10,
@@ -2238,7 +2242,8 @@ def test_progress_classifies_metadata_read_and_write(adapter, store):
                 node = snapshot.node
                 data = [
                     chunk
-                    async for chunk in snapshot.read_part(
+                    async for chunk in worker.read_part(
+                        snapshot=snapshot,
                         part=Range(index=0, start=0, stop=2),
                         compression_level=3,
                         chunk_size=4,
@@ -2646,7 +2651,8 @@ def test_raw_read_classifies_only_transient_errors(
                 adapter.worker() as worker,
                 worker.snapshot(path="//tmp/source") as snapshot,
             ):
-                async for _ in snapshot.read_part(
+                async for _ in worker.read_part(
+                    snapshot=snapshot,
                     part=Range(index=0, start=0, stop=2),
                     compression_level=3,
                     chunk_size=10,
@@ -2702,10 +2708,15 @@ def test_second_read_attempt_uses_fresh_response_and_compressor(
                 "chunk_size": 10,
             }
             with pytest.raises(RetryableReadError):
-                async for _ in snapshot.read_part(**options):
+                async for _ in worker.read_part(snapshot=snapshot, **options):
                     pass
             assert streams[0].closed
-            data = b"".join([chunk async for chunk in snapshot.read_part(**options)])
+            data = b"".join(
+                [
+                    chunk
+                    async for chunk in worker.read_part(snapshot=snapshot, **options)
+                ]
+            )
             with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(data)) as reader:
                 assert reader.read() == payload
 
@@ -2748,8 +2759,8 @@ def test_lost_pinger_prevents_another_read_attempt(adapter, store, monkeypatch):
                     "chunk_size": 10,
                 }
                 with pytest.raises(RetryableReadError):
-                    await snapshot.read_part(**options).__anext__()
-                await snapshot.read_part(**options).__anext__()
+                    await worker.read_part(snapshot=snapshot, **options).__anext__()
+                await worker.read_part(snapshot=snapshot, **options).__anext__()
 
     run(main())
     assert len(calls) == 1
@@ -2767,7 +2778,8 @@ def test_consumer_error_is_not_classified_as_source_error(adapter, store, monkey
             adapter.worker() as worker,
             worker.snapshot(path="//tmp/source") as snapshot,
         ):
-            chunks = snapshot.read_part(
+            chunks = worker.read_part(
+                snapshot=snapshot,
                 part=Range(index=0, start=0, stop=2),
                 compression_level=3,
                 chunk_size=1,
@@ -2776,7 +2788,7 @@ def test_consumer_error_is_not_classified_as_source_error(adapter, store, monkey
             with pytest.raises(type(error)) as caught:
                 await chunks.athrow(error)
             assert caught.value is error
-            assert snapshot._stream is None
+            assert worker._reader is None
 
     run(main())
 
@@ -2813,7 +2825,8 @@ def test_cleanup_failure_preserves_primary_error_and_forbids_retry(
         async with adapter.worker() as worker:
             with pytest.raises(type(source_error)) as caught:
                 async with worker.snapshot(path="//tmp/source") as snapshot:
-                    await snapshot.read_part(
+                    await worker.read_part(
+                        snapshot=snapshot,
                         part=Range(index=0, start=0, stop=2),
                         compression_level=3,
                         chunk_size=10,
@@ -2843,7 +2856,8 @@ def test_file_read_failure_is_left_to_sdk_retries(adapter, store, monkeypatch):
                 adapter.worker() as worker,
                 worker.snapshot(path="//tmp/source") as snapshot,
             ):
-                await snapshot.read_part(
+                await worker.read_part(
+                    snapshot=snapshot,
                     part=Range(index=0, start=0, stop=11),
                     compression_level=3,
                     chunk_size=10,

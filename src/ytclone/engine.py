@@ -11,6 +11,7 @@ import aiomisc
 from aiochannel import Channel
 from yt import yson
 
+from .export_pool import PartPool
 from .format import (
     KINDS,
     MIB,
@@ -48,6 +49,7 @@ PART_RETRY_PAUSE = 1
 @dataclass(frozen=True)
 class CopyOptions:
     concurrency: int = 4
+    max_streams: int = 0
     queue_size: int = 16
     # Target uncompressed size per archive object; approximate for tables.
     part_size: int = 256 * MIB
@@ -61,10 +63,17 @@ class CopyOptions:
             raise ValueError(
                 "Concurrency, queue and archive part size must be positive"
             )
+        if self.max_streams < 0:
+            raise ValueError("Maximum streams must be nonnegative")
         if not 5 * MIB <= self.chunk_size <= 512 * MIB:
             raise ValueError("Multipart buffer must be between 5 and 512 MiB")
         if not -7 <= self.compression_level <= 22:
             raise ValueError("Zstandard level must be between -7 and 22")
+
+    @property
+    def stream_limit(self) -> int:
+        """Use one process-wide reader budget independent of admitted nodes."""
+        return self.max_streams or self.concurrency
 
 
 @dataclass
@@ -82,6 +91,7 @@ async def _pipeline(
     options: CopyOptions,
     result: CopyResult,
     progress: Progress,
+    pool: PartPool | None = None,
 ) -> CopyResult:
     """Run discovery and copy workers, each with its own persistent YT client."""
     channel: Channel[str | DiscoveredNode] = Channel(maxsize=options.queue_size)
@@ -116,6 +126,8 @@ async def _pipeline(
                         result.completed += 1
                         log.info("node_completed path=%s reason=%s", path, reason)
                 except Exception:
+                    if pool is not None:
+                        pool.check()
                     result.failed += 1
                     progress.record_result(status="failed", reason="node")
                     log.exception("node_failed path=%s", path)
@@ -126,16 +138,34 @@ async def _pipeline(
     tasks.append(asyncio.create_task(producer()))
 
     completion = asyncio.gather(*tasks)
-    try:
-        # Cancel children only in finally, so cleanup is not cancelled twice.
-        await asyncio.shield(completion)
-    finally:
+
+    async def shutdown():
+        """Cancel owners once; their range waits retain snapshots until drain."""
         channel.close()
         for task in tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(completion, *tasks, return_exceptions=True)
-        progress.queued = 0
+        try:
+            if pool is not None:
+                await pool.close()
+        finally:
+            await asyncio.gather(completion, *tasks, return_exceptions=True)
+            progress.queued = 0
+
+    try:
+        await asyncio.shield(completion)
+    finally:
+        cleanup = asyncio.create_task(shutdown())
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    pass
+            cleanup.result()
+            raise
 
     return result
 
@@ -150,6 +180,7 @@ class _SourceProgress:
     copied: float = 0
     fraction: float = 0
     skipped: int = 0
+    completed_units: int = 0
 
     def __enter__(self):
         """Keep accounting alive through snapshot exit and publication."""
@@ -180,7 +211,8 @@ class _SourceProgress:
         """Credit an uploaded part by its share of source rows or file bytes."""
         if not self.total:
             return
-        fraction = min(1, part.stop / self.total)
+        self.completed_units += part.stop - part.start
+        fraction = min(1, self.completed_units / self.total)
         copied = self.disk_size * fraction
         self.progress.source_copied_bytes += copied - self.copied
         self.progress.source_partial_nodes += fraction - self.fraction
@@ -237,6 +269,7 @@ def _source_metadata(*, node: Node, cluster: str) -> dict:
 
 async def copy_part(
     *,
+    reader: YtBackend,
     snapshot: SourceSnapshot,
     storage: ObjectStorage,
     key: str,
@@ -263,7 +296,8 @@ async def copy_part(
 
         try:
             async with aclosing(
-                snapshot.read_part(
+                reader.read_part(
+                    snapshot=snapshot,
                     part=part,
                     compression_level=compression_level,
                     chunk_size=chunk_size,
@@ -284,8 +318,44 @@ async def copy_part(
     return await transfer()
 
 
+async def _export_parts(
+    *,
+    pool: PartPool,
+    snapshot: SourceSnapshot,
+    storage: ObjectStorage,
+    target: str,
+    options: CopyOptions,
+    source_progress: _SourceProgress,
+) -> list[Part]:
+    """Register a node's lazy ranges with the shared data workers."""
+    node = snapshot.node
+
+    async def transfer(*, reader: YtBackend, part: Range) -> Part:
+        ref = await copy_part(
+            reader=reader,
+            snapshot=snapshot,
+            storage=storage,
+            key=data_key(prefix=target, kind=node.kind, index=part.index),
+            part=part,
+            compression_level=options.compression_level,
+            chunk_size=options.chunk_size,
+        )
+        source_progress.advance(part=part)
+        log.info(
+            "part_uploaded path=%s part=%d bytes=%d", node.path, part.index, ref.size
+        )
+        return Part(object=ref, start=part.start, stop=part.stop)
+
+    return await pool.copy(
+        parts=plan_parts(node=node, part_size=options.part_size),
+        transfer=transfer,
+        parallel=node.kind == "table",
+    )
+
+
 async def export_node(
     *,
+    pool: PartPool,
     yt: YtBackend,
     storage: ObjectStorage,
     path: str,
@@ -296,6 +366,7 @@ async def export_node(
     discovered: DiscoveredNode | None = None,
 ):
     """Skip a verified listing state or publish one consistent source snapshot."""
+    pool.check()
     started = time.monotonic()
     target = node_prefix(prefix=prefix, path=path)
     manifest_key = object_key(prefix=target, name="@manifest.json")
@@ -349,31 +420,21 @@ async def export_node(
                 unchanged = complete
 
             if not unchanged:
+                pool.check()
                 # Readers must not see the previous manifest while its objects change.
                 await storage.delete(key=manifest_key)
                 attributes = await storage.put_bytes(
                     key=object_key(prefix=target, name="@attributes.yson"),
                     data=node.attributes,
                 )
-                parts = []
-                for part in plan_parts(node=node, part_size=options.part_size):
-                    key = data_key(prefix=target, kind=node.kind, index=part.index)
-                    ref = await copy_part(
-                        snapshot=snapshot,
-                        storage=storage,
-                        key=key,
-                        part=part,
-                        compression_level=options.compression_level,
-                        chunk_size=options.chunk_size,
-                    )
-                    source_progress.advance(part=part)
-                    parts.append(Part(object=ref, start=part.start, stop=part.stop))
-                    log.info(
-                        "part_uploaded path=%s part=%d bytes=%d",
-                        path,
-                        part.index,
-                        ref.size,
-                    )
+                parts = await _export_parts(
+                    pool=pool,
+                    snapshot=snapshot,
+                    storage=storage,
+                    target=target,
+                    options=options,
+                    source_progress=source_progress,
+                )
 
         # A refreshed revision is trustworthy only after successful snapshot exit.
         source = _source_metadata(node=node, cluster=cluster)
@@ -435,6 +496,7 @@ async def export_tree(
     async def transfer(*, item: DiscoveredNode, yt: YtBackend):
         """Export or skip one queued source state."""
         return await export_node(
+            pool=pool,
             yt=yt,
             storage=storage,
             path=item.path,
@@ -445,14 +507,16 @@ async def export_tree(
             discovered=item,
         )
 
-    return await _pipeline(
-        yt=yt,
-        discover=discover,
-        transfer=transfer,
-        options=options,
-        result=CopyResult(),
-        progress=progress,
-    )
+    async with PartPool(yt=yt, concurrency=options.stream_limit) as pool:
+        return await _pipeline(
+            yt=yt,
+            discover=discover,
+            transfer=transfer,
+            options=options,
+            result=CopyResult(),
+            progress=progress,
+            pool=pool,
+        )
 
 
 async def _manifest(*, storage: ObjectStorage, prefix: str) -> Manifest | None:

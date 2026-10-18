@@ -193,6 +193,7 @@ def arguments(
         "discover": discover,
         "config": {
             "concurrency": concurrency,
+            "max_streams": 0,
             "queue_size": 1,
             "fake_root": str(tmp_path),
             "fake_mode": mode,

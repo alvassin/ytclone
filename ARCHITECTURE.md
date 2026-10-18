@@ -131,8 +131,15 @@ Discover -> bounded queue -> compare metadata -> skip or copy -> complete node
 
 - Discovery and transfer overlap; copying starts before the entire tree is scanned.
 - One discovery worker feeds an `aiochannel` bounded by `--queue-size`; at most
-  `--concurrency` nodes are transferred at once. Each node's parts are sequential.
-  Buffers are bounded per transfer; increasing concurrency increases memory use.
+  `--concurrency` node lifecycles are active at once.
+- Export has one fixed pool of `--max-streams` range workers per process, with
+  `0` resolving to `--concurrency`. One static table can fill the pool. Registered
+  nodes supply ranges lazily in round-robin order; files and documents allow only
+  one active range each. There are no tasks or readers allocated for every part.
+  Restore still transfers each node's parts sequentially.
+- Buffers are bounded per active stream. Increasing `--max-streams` increases
+  export buffer and reader memory; `--concurrency` separately controls the number
+  of open node lifecycles and snapshots.
 - Cypress discovery resolves the source root once, then lists each directory by
   ID with child IDs, types, revisions and source sizes. The queue carries these
   hints with each path; matching archives need no per-node YT requests. Workers
@@ -149,42 +156,63 @@ Discover -> bounded queue -> compare metadata -> skip or copy -> complete node
 flowchart TB
     discover["Discovery task<br/>Export: walk YT<br/>Restore: list S3 and prepare directories"]
     queue["Bounded aiochannel<br/>Paths and discovery metadata"]
-    worker1["Copy task 1<br/>One node at a time"]
-    workerN["Copy task N<br/>N = concurrency"]
+    worker1["Node task 1<br/>One node at a time"]
+    workerC["Node task C<br/>C = concurrency"]
+    pool["Shared export range pool<br/>N = max-streams, or C when 0<br/>Lazy round-robin scheduling"]
 
     discover -->|enqueue| queue
     queue -->|take next node| worker1
-    queue -->|take next node| workerN
+    queue -->|take next node| workerC
+    worker1 -->|register ranges| pool
+    workerC -->|register ranges| pool
 
     discoveryYT["Own YtWorker + _Session<br/>YtClient and dedicated thread"]
     yt1["Own YtWorker + _Session<br/>YtClient and dedicated thread"]
-    ytN["Own YtWorker + _Session<br/>YtClient and dedicated thread"]
+    ytC["Own YtWorker + _Session<br/>YtClient and dedicated thread"]
+    readers["N range workers<br/>Each owns a persistent YtClient and thread"]
     s3["Shared S3Storage<br/>S3Client + aiohttp.ClientSession"]
 
     discover -.->|YT operations| discoveryYT
     worker1 -.->|YT operations| yt1
-    workerN -.->|YT operations| ytN
+    workerC -.->|metadata and snapshot lifecycle| ytC
+    pool -.->|read ranges in the owner's snapshot| readers
     discover -.->|S3 discovery and directory metadata| s3
-    worker1 -.->|S3 operations| s3
-    workerN -.->|S3 operations| s3
+    worker1 -.->|S3 metadata| s3
+    workerC -.->|S3 metadata| s3
+    pool -.->|upload parts| s3
 ```
 
 Solid arrows carry paths and, during export, discovered IDs and revisions.
 Dotted arrows show which clients a task uses.
 
-- A **copy task** is the async `worker()` loop in `engine.py`. It takes a path,
-  copies or skips that node, then takes the next path.
-- A **`YtWorker`** is that task's async interface to one synchronous YT client.
+- A **node task** is the async `worker()` loop in `engine.py`. It takes a path,
+  copies or skips that node, then takes the next path. It owns the snapshot
+  transaction and publishes the manifest only after the snapshot succeeds.
+- A **`YtWorker`** is an async interface to one synchronous YT client.
   `_Session.call()` runs blocking SDK calls and compression in its dedicated thread.
-- **`YtAdapter.worker()`** creates and closes this client/thread pair. It is kept
-  across nodes; full checks and copies use separate node transactions, while
+- **`YtAdapter.worker()`** creates and closes this client/thread pair. Node tasks
+  keep it across nodes; full checks and copies use separate node transactions, while
   revision-matched export skips need none. The SDK manages HTTP sessions
   and transaction pings. An uncertain transaction cleanup prevents client reuse.
-- **S3 clients are shared** across all tasks and use async HTTP. Table/file bytes
-  flow inside a copy task, without going through the node queue.
+- **`PartPool`** in `export_pool.py` owns N async range workers. Each creates its
+  YT client/thread pair on its first assignment and reuses it until pool shutdown.
+  Readers use the node owner's snapshot; they do not own its transaction or pings.
+  A worker holds its range through read, compression, S3 upload, and part retries.
+- **S3 clients are shared** across all tasks and use async HTTP. Export bytes
+  flow through range workers, without going through the node queue.
 
-During restore, discovery finishes each parent directory before queuing its
-children. Clients and dedicated threads close when their tasks finish.
+When a range fails, its node stops supplying new ranges. The node waits for all
+its active ranges to finish cleanup before leaving the snapshot. Global
+cancellation follows the same ordering before closing the pool and clients.
+Successful parts are ordered by range index in the manifest, regardless of their
+completion order. Parts of an interrupted node are not durable resume checkpoints.
+
+`ytclone-parallel` creates one pool per worker process. Its coordinator assigns
+whole nodes to processes; a single table never spans their pools.
+
+Restore uses the node task's client directly and does not use the range pool.
+Its discovery finishes each parent directory before queuing its children. Clients
+and dedicated threads close when their tasks finish.
 
 ### Export: one table from YT to S3
 
@@ -192,7 +220,8 @@ children. Clients and dedicated threads close when their tasks finish.
 sequenceDiagram
     participant D as Discovery task
     participant W as Copy task<br/>export_node
-    participant Y as YtWorker<br/>YtClient
+    participant Y as Node owner<br/>YtWorker
+    participant P as Shared PartPool<br/>Range readers
     participant S as S3Storage<br/>S3Client
 
     D-->>W: Enqueue path, ID, type and revisions from LIST
@@ -213,16 +242,17 @@ sequenceDiagram
             Note over W: Report skipped
         else Copy required
             W->>S: Delete old manifest, upload attributes
-            loop Each archive part, in order
-                W->>Y: Read snapshot range, compress with zstd
-                Y-->>W: Stream compressed chunks
-                W->>S: Upload part, record size and SHA-256
+            W->>P: Register lazy ranges and shared snapshot
+            loop Concurrent ranges, up to the shared stream limit
+                P->>P: Read snapshot range, compress with zstd
+                P->>S: Upload part, record size and SHA-256
                 opt Temporary table-read failure
-                    W->>S: Abort unfinished multipart upload
-                    W->>Y: Reopen the same range in the same snapshot
-                    Note over W,S: Retry the whole part, up to 3 attempts
+                    P->>S: Abort unfinished multipart upload
+                    P->>P: Reopen the same range in the same snapshot
+                    Note over P,S: Retry the whole part, up to 3 attempts
                 end
             end
+            P-->>W: All ranges complete, results in range order
             W->>Y: Successfully finish snapshot transaction
             W->>S: Remove obsolete parts of this node
             W->>S: Write manifest last, with snapshot revisions
@@ -234,7 +264,8 @@ sequenceDiagram
 An archive part is one S3 object. S3 multipart upload chunks are buffers within
 that object. Parts are streamed through bounded buffers.
 
-`Snapshot.read_part()` opens one fresh stream and compressor. Table reads use the
+`YtWorker.read_part()` opens one fresh stream and compressor using the supplied
+snapshot. Table reads use the
 SDK HTTP transport, preserving its framing and trailer error checks, without the
 SDK row parser. `copy_part()` retries only `RetryableReadError`, raised by the YT
 adapter for temporary table-read failures. S3 request retries stay in `S3Storage`;
@@ -276,6 +307,7 @@ is reported failed and a repeated run can copy it again.
 | File | Responsibility |
 | --- | --- |
 | [engine.py](src/ytclone/engine.py) | `_pipeline`: queue and task lifetimes. `export_node` / `restore_node`: copying one node. `copy_part`: retrying a streamed part. |
+| [export_pool.py](src/ytclone/export_pool.py) | `PartPool`: fixed range workers, lazy fair scheduling, node failure and cancellation draining. |
 | [yt.py](src/ytclone/yt.py) | `YtAdapter`: worker factory. `YtWorker`: YT operations. `_Session`: client, thread and transaction lifecycle. |
 | [s3.py](src/ytclone/s3.py) | Object reads, multipart writes, integrity checks and cleanup. |
 | [format.py](src/ytclone/format.py) | Archive paths, manifests, fingerprints and range planning. |

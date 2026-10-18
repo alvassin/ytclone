@@ -3,6 +3,7 @@
 import contextlib
 import io
 import os
+import random
 import re
 import shutil
 import signal
@@ -46,7 +47,17 @@ def stop_container(*, docker, container, environment):
             )
 
 
-def run_cli(*, module, source, destination, directory, name, extra=()):
+def run_cli(
+    *,
+    module,
+    source,
+    destination,
+    directory,
+    name,
+    concurrency=2,
+    max_streams=0,
+    extra=(),
+):
     """Use a clean environment and bound both execution and cancellation."""
     log_file = directory / (name + ".log")
     config_file = directory / "yt-client.conf"
@@ -73,7 +84,9 @@ def run_cli(*, module, source, destination, directory, name, extra=()):
         "--region",
         "us-east-1",
         "--concurrency",
-        "2",
+        str(concurrency),
+        "--max-streams",
+        str(max_streams),
         "--part-size-mib",
         "1",
         "--buffer-size-mib",
@@ -173,6 +186,95 @@ def assert_summary(*, output, copied, unchanged):
     assert fields["unchanged"] == str(unchanged), summaries[0]
     assert fields["skipped"] == "0", summaries[0]
     assert fields["errors"] == "0", summaries[0]
+
+
+def test_local_single_table_export_with_three_streams_and_cli_restore(tmp_path):
+    """Round-trip ordered table ranges through the CLI with one node and three readers."""
+    run_id = uuid.uuid4().hex[:12]
+    root = "//tmp/ytclone-cli-streams-" + run_id
+    source, destination = root + "/source", root + "/restored"
+    archive = "s3://yt-backup/cli-streams-" + run_id
+    client = sdk.YtClient(
+        proxy=YT_PROXY,
+        config={
+            "enable_token": False,
+            "proxy": {"enable_proxy_discovery": False, "retries": {"count": 1}},
+        },
+    )
+    rng = random.Random(73)
+    expected = [
+        {b"id": index, b"payload": rng.randbytes(256 * 1024)} for index in range(24)
+    ]
+    schema = yson.to_yson_type(
+        [
+            {"name": "id", "type": "int64", "sort_order": "ascending"},
+            {"name": "payload", "type": "string"},
+        ],
+        attributes={"strict": True, "unique_keys": True},
+    )
+    try:
+        client.create(
+            type="table",
+            path=source,
+            recursive=True,
+            attributes={"schema": schema, "note": "parallel ranges"},
+        )
+        client.write_table(table=source, input_stream=expected)
+
+        for repeated in (False, True):
+            output, logs = run_cli(
+                module="ytclone",
+                source=source,
+                destination=archive,
+                directory=tmp_path,
+                name="streams-export-repeat" if repeated else "streams-export",
+                concurrency=1,
+                max_streams=3,
+            )
+            assert_summary(
+                output=output, copied=0 if repeated else 1, unchanged=int(repeated)
+            )
+            assert "export_parallelism max_streams=3" in logs
+            if not repeated:
+                indices = [
+                    int(index)
+                    for index in re.findall(
+                        r"part_uploaded path=" + re.escape(source) + r" part=(\d+)",
+                        logs,
+                    )
+                ]
+                assert len(indices) >= 3, logs
+                assert sorted(indices) == list(range(len(indices)))
+
+            output, _ = run_cli(
+                module="ytclone",
+                source=archive + "/" + source.removeprefix("//"),
+                destination=destination,
+                directory=tmp_path,
+                name="streams-restore-repeat" if repeated else "streams-restore",
+                concurrency=1,
+            )
+            assert_summary(
+                output=output, copied=0 if repeated else 1, unchanged=int(repeated)
+            )
+
+        with contextlib.closing(
+            client.read_table(
+                table=destination,
+                format=sdk.YsonFormat(attributes=ROW_FORMAT),
+                raw=True,
+            )
+        ) as stream:
+            restored = list(
+                yson.load(stream=stream, yson_type="list_fragment", encoding=None)
+            )
+        assert restored == expected
+        assert client.get(path=destination + "/@schema") == client.get(
+            path=source + "/@schema"
+        )
+        assert client.get(path=destination + "/@note") == "parallel ranges"
+    finally:
+        client._cleanup()
 
 
 def test_local_installed_parallel_export_and_cli_restore(tmp_path):

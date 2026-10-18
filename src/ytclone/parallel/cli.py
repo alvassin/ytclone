@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 class Arguments(CopyArguments):
     processes: int = argclass.Argument(default=2, help="Persistent copy processes")
     concurrency: int = argclass.Argument(
-        default=4, help="Concurrent node transfers per copy process"
+        default=4, help="Concurrent node lifecycles per copy process"
     )
     discovery_concurrency: int = argclass.Argument(
         default=4, help="Concurrent YT directory listings in the coordinator"
@@ -66,6 +66,7 @@ def validate(arguments: Arguments) -> CopyOptions:
         raise ValueError("Progress interval must be positive and finite")
     return CopyOptions(
         concurrency=arguments.concurrency,
+        max_streams=arguments.max_streams,
         queue_size=arguments.queue_size,
         part_size=arguments.part_size_mib * MIB,
         chunk_size=arguments.buffer_size_mib * MIB,
@@ -92,6 +93,7 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
         "bucket": bucket,
         "prefix": prefix,
         "concurrency": options.concurrency,
+        "max_streams": options.max_streams,
         "queue_size": options.queue_size,
         "part_size": options.part_size,
         "chunk_size": options.chunk_size,
@@ -102,13 +104,15 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
         "progress_interval": arguments.progress_interval,
     }
     budget = arguments.processes * estimate_memory_mib(
-        concurrency=options.concurrency,
+        concurrency=options.stream_limit,
+        snapshot_concurrency=options.concurrency,
         chunk_size=options.chunk_size,
         compression_level=options.compression_level,
         export=True,
     )
     print(
-        f"Parallel export: {arguments.processes} processes x {options.concurrency} workers; "
+        f"Parallel export: {arguments.processes} processes x "
+        f"{options.concurrency} node slots / {options.stream_limit} data workers; "
         f"discovery={arguments.discovery_concurrency}; small-first <= {arguments.small_table_mib} MiB. "
         f"RAM estimate: {budget} MiB plus discovery metadata (planning budget, not a limit)",
         flush=True,
