@@ -104,10 +104,11 @@ incomplete. A directory manifest confirms its own metadata, not completion of it
 descendants.
 
 S3 keeps **one current generation, without version history**. Export reads the
-existing manifest and its ETag, then writes a unique generation while retaining
-the old manifest and objects. Once every upload and the source snapshot have
-succeeded, it atomically publishes the manifest with `If-Match` for that ETag, or
-`If-None-Match: *` if the node had no manifest. Metadata-only manifest refreshes
+existing manifest and its ETag before opening the source snapshot, including
+direct `export_node` calls without discovery. It then writes a unique generation
+while retaining the old manifest and objects. Once every upload and the source
+snapshot have succeeded, it atomically publishes the manifest with `If-Match` for
+that ETag, or `If-None-Match: *` if the node had no manifest. Metadata-only manifest refreshes
 use the same conditional publication protocol.
 
 Concurrent exporters write different generations. Only a writer whose expected
@@ -128,10 +129,13 @@ garbage collection or TTL. A later export only cleans its direct predecessor.
 Unknown unfinished S3 multipart uploads also require a bucket lifecycle rule or
 manual cleanup.
 
-Restore reads one manifest and continues using that generation. A concurrent
-export can delete it before restore finishes; missing objects fail the restore
-and roll back its unfinished node. Restore does not automatically switch
-generations. Rerun it to select the current manifest.
+Restore keeps the manifest selected when classifying each node through directory
+preparation and queued restoration. It does not reread the manifest between these
+steps, so a concurrent type change cannot silently skip the selected root or its
+children. A concurrent export can delete the selected generation before restore
+finishes; missing objects fail the restore and roll back its unfinished node.
+Restore does not automatically switch generations. Rerun it to select the current
+manifest.
 
 YT destinations use a transaction per node to avoid exposing partial tables, files
 or documents. When a table, file or document needs copying, an existing destination

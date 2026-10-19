@@ -84,6 +84,14 @@ class CopyResult:
     failed: int = 0
 
 
+@dataclass(frozen=True)
+class _RestoreNode:
+    """Carry the manifest selected during discovery to its restore worker."""
+
+    path: str
+    manifest: Manifest
+
+
 async def _pipeline(
     *,
     yt: YtWorkerFactory,
@@ -95,7 +103,9 @@ async def _pipeline(
     pool: PartPool | None = None,
 ) -> CopyResult:
     """Run discovery and copy workers, each with its own persistent YT client."""
-    channel: Channel[str | DiscoveredNode] = Channel(maxsize=options.queue_size)
+    channel: Channel[DiscoveredNode | _RestoreNode] = Channel(
+        maxsize=options.queue_size
+    )
 
     async def producer():
         """Discover nodes using a separate client and close the queue at EOF."""
@@ -114,7 +124,7 @@ async def _pipeline(
         """Reuse one YT client while transferring and counting queued nodes."""
         async with yt.worker() as backend:
             async for item in channel:
-                path = item.path if isinstance(item, DiscoveredNode) else item
+                path = item.path
                 progress.queued = channel.qsize()
                 progress.active += 1
                 try:
@@ -396,6 +406,9 @@ async def export_node(
                     source_progress.observe(node=discovered)
                     source_progress.skip()
                     return "skipped", "unchanged"
+        else:
+            # Bind publication before taking a snapshot, even without discovery.
+            old, etag = await _export_manifest(storage=storage, prefix=target)
 
         unchanged = False
         async with yt.snapshot(path=path) as snapshot:
@@ -412,8 +425,6 @@ async def export_node(
                 compression_level=options.compression_level,
                 part_size=options.part_size,
             )
-            if discovered is None:
-                old, etag = await _export_manifest(storage=storage, prefix=target)
             if old is not None and old.fingerprint == fingerprint:
                 if complete is None:
                     complete = await _complete(storage=storage, manifest=old)
@@ -570,11 +581,14 @@ async def restore_node(
     prefix: str,
     destination: str,
     progress: Progress | None = None,
+    manifest: Manifest | None = None,
 ):
     """Restore or skip one archive node, verifying data before commit."""
-    manifest = await _manifest(storage=storage, prefix=prefix)
+    if manifest is None:
+        manifest = await _manifest(storage=storage, prefix=prefix)
     if manifest is None:
         raise ValueError(f"Incomplete archive node (missing manifest): {prefix}")
+    validate_manifest_location(manifest=manifest, prefix=prefix)
     metadata = await storage.read_bytes(key=manifest.attributes.key)
     if metadata is None:
         raise ValueError(f"Missing attributes: {manifest.attributes.key}")
@@ -644,6 +658,15 @@ async def restore_tree(
     directories: set[str] = set()
     leaves: set[str] = set()
     discovered: set[str] = set()
+    # Ancestors may be selected before their own listing entry. Release each
+    # manifest after transfer or enqueue; queued leaf manifests stay bounded.
+    selected: dict[str, Manifest | None] = {}
+
+    async def select(*, prefix: str) -> Manifest | None:
+        """Keep classification and restore on the same archive generation."""
+        if prefix not in selected:
+            selected[prefix] = await _manifest(storage=storage, prefix=prefix)
+        return selected[prefix]
 
     def found(prefix: str) -> None:
         """Count source nodes once, including directories prepared before listing."""
@@ -651,13 +674,18 @@ async def restore_tree(
             discovered.add(prefix)
             progress.discovered += 1
 
-    async def transfer(*, item: str, yt: YtBackend):
-        """Restore one archived node using the current worker's client."""
+    async def transfer(*, item: _RestoreNode, yt: YtBackend):
+        """Restore the selected generation using the current worker's client."""
         target = restore_path(
-            source_prefix=source_prefix, node=item, destination=destination
+            source_prefix=source_prefix, node=item.path, destination=destination
         )
         return await restore_node(
-            yt=yt, storage=storage, prefix=item, destination=target, progress=progress
+            yt=yt,
+            storage=storage,
+            prefix=item.path,
+            destination=target,
+            progress=progress,
+            manifest=item.manifest,
         )
 
     async def directory(*, prefix: str, yt: YtBackend):
@@ -669,13 +697,15 @@ async def restore_tree(
         path = restore_path(
             source_prefix=source_prefix, node=prefix, destination=destination
         )
-        manifest = await _manifest(storage=storage, prefix=prefix)
+        manifest = await select(prefix=prefix)
         if manifest is not None:
             found(prefix)
             if manifest.kind != "map_node":
                 leaves.add(prefix)
                 raise _ArchiveLeaf(prefix)
-            status, reason = await transfer(item=prefix, yt=yt)
+            status, reason = await transfer(
+                item=_RestoreNode(path=prefix, manifest=manifest), yt=yt
+            )
             progress.record_result(status=status, reason=reason)
             if status == "skipped":
                 result.skipped += 1
@@ -704,6 +734,7 @@ async def restore_tree(
             # Virtual parents have no source metadata to overwrite existing attrs.
             await yt.ensure_directory(path=path)
         directories.add(prefix)
+        selected.pop(prefix)
 
     async def parents(*, prefix: str, yt: YtBackend):
         """Prepare each ancestor directory before restoring a descendant."""
@@ -716,12 +747,13 @@ async def restore_tree(
             current = object_key(prefix=current, name=component)
             await directory(prefix=current, yt=yt)
 
-    async def discover(*, channel: Channel[str], yt: YtBackend):
+    async def discover(*, channel: Channel[_RestoreNode], yt: YtBackend):
         """Scan S3 nodes, prepare directories and queue tables and files."""
-        root = await _manifest(storage=storage, prefix=source_prefix)
+        root = await select(prefix=source_prefix)
         if root is not None and root.kind != "map_node":
             found(source_prefix)
-            await channel.put(source_prefix)
+            await channel.put(_RestoreNode(path=source_prefix, manifest=root))
+            selected.pop(source_prefix)
             progress.queued = channel.qsize()
             return
         seen = False
@@ -733,16 +765,22 @@ async def restore_tree(
                 continue
             previous = prefix
             seen = True
+            if prefix in directories or (prefix in leaves and prefix not in selected):
+                continue
             try:
                 await parents(prefix=prefix, yt=yt)
                 found(prefix)
-                manifest = await _manifest(storage=storage, prefix=prefix)
-                if manifest is not None and manifest.kind == "map_node":
+                manifest = await select(prefix=prefix)
+                if manifest is None:
+                    raise ValueError(
+                        f"Incomplete archive node (missing manifest): {prefix}"
+                    )
+                if manifest.kind == "map_node":
                     await directory(prefix=prefix, yt=yt)
                 else:
-                    if manifest is not None:
-                        leaves.add(prefix)
-                    await channel.put(prefix)
+                    leaves.add(prefix)
+                    await channel.put(_RestoreNode(path=prefix, manifest=manifest))
+                    selected.pop(prefix)
                     progress.queued = channel.qsize()
             except _ArchiveLeaf:
                 log.debug("stale_archive_descendant_skipped prefix=%s", prefix)

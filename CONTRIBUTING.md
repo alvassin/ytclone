@@ -35,9 +35,12 @@ errors must warn without invalidating a published backup. Crashes can leave unus
 generations, and there is no automatic global garbage collector.
 
 When changing publication, test failed uploads with an existing backup, competing
-writers, lost publication acknowledgements, and cleanup failures. Restore must
-stay on its selected generation and roll back an unfinished node if those objects
-are deleted. Backend acceptance requires conditional PUT and atomic object
+writers (including direct `export_node` calls without discovery), lost publication
+acknowledgements, and cleanup failures. Restore must use the same selected manifest
+for classification and transfer, including ancestors found before their own listing
+entry. Test concurrent file/directory changes and deletion of the selected
+generation: restore must roll back an unfinished node if those objects are deleted.
+Backend acceptance requires conditional PUT and atomic object
 visibility with ETags; offline tests alone do not verify a deployed S3 service.
 
 ## Run checks
