@@ -3,6 +3,14 @@
 Start with the [README](README.md) for installation, credentials, and a first
 copy. Use `ytclone --help` or `ytclone-parallel --help` for the full option list.
 
+## Python installation
+
+Install with `pip install ytclone` in a Python virtual environment. Requires
+CPython 3.10+ on Linux x86_64 with glibc or macOS ARM64 (Apple Silicon). Other
+platforms are unsupported because the required
+[`ytsaurus-yson`](https://pypi.org/project/ytsaurus-yson/) dependency has no wheels
+for them.
+
 ## Connection settings
 
 | Option | Environment variable | Default |
@@ -114,6 +122,13 @@ For example, export both `//home/analytics/events` and `//home/analytics` to
 | `--buffer-size-mib` | `32` | S3 multipart buffer per active stream, from 5 to 512 MiB. |
 | `--compression-level` | `3` | Zstandard level, from -7 to 22; higher levels use more CPU and memory. |
 
+For example, allow four active nodes to share eight export streams in one process:
+
+```bash
+ytclone //home/analytics/events s3://my-bucket/export \
+  --concurrency 4 --max-streams 8 --log-file export.log
+```
+
 An archive part is one S3 object; multipart buffers are chunks within that object.
 `--part-size-mib` does not allocate a whole part in RAM. Objects smaller than the
 buffer use a single PUT; objects at or above that size use multipart upload.
@@ -152,10 +167,18 @@ be added together as total elapsed time.
 
 ## Parallel export
 
+For trees with many nodes, use multiple copy processes:
+
+```bash
+ytclone-parallel //home/analytics/events s3://my-bucket/export \
+  --processes 2 --concurrency 2 --log-file export.log
+```
+
 `--processes P --concurrency C --max-streams N` allows up to P × C active nodes
 and P × N export streams. With the default `--max-streams 0`, N equals C.
 Each process has its own stream pool; a table stays in one process and can use
-that process's N streams. This command supports YT → S3 only.
+that process's N streams. This command supports YT → S3 only; restore its archives
+with `ytclone`.
 
 - `--discovery-concurrency` (default: 4) controls concurrent directory listings.
 - Directories and smaller known nodes go first. While discovery runs, one slot is
