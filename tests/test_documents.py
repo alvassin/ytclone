@@ -12,6 +12,7 @@ from test_yt import Client, Store, add_node
 from yt import yson
 
 from ytclone.engine import CopyOptions, export_node, restore_node
+from ytclone.export_pool import PartPool
 from ytclone.format import (
     ENCODING,
     Manifest,
@@ -136,10 +137,14 @@ def test_document_roundtrip_preserves_types_attributes_and_unchanged_skips(value
     options = CopyOptions(part_size=1)
 
     async def scenario():
-        async with adapter.worker() as worker:
+        async with (
+            adapter.worker() as worker,
+            PartPool(yt=adapter, concurrency=options.stream_limit) as pool,
+        ):
 
             async def export():
                 return await export_node(
+                    pool=pool,
                     yt=worker,
                     storage=storage,
                     path="//tmp/source",
@@ -187,16 +192,21 @@ def test_bad_document_archive_rolls_back_existing_destination(failure):
     )
     before = copy.deepcopy(store.nodes[destination])
     storage = MemoryStorage(events=[])
+    options = CopyOptions()
 
     async def scenario():
-        async with adapter.worker() as worker:
+        async with (
+            adapter.worker() as worker,
+            PartPool(yt=adapter, concurrency=options.stream_limit) as pool,
+        ):
             await export_node(
+                pool=pool,
                 yt=worker,
                 storage=storage,
                 path="//tmp/source",
                 prefix="archive",
                 cluster="test",
-                options=CopyOptions(),
+                options=options,
             )
             manifest_key = "archive/tmp/source/@manifest.json"
             manifest = Manifest.from_bytes(storage.objects[manifest_key])
@@ -250,16 +260,21 @@ def test_bad_document_archive_rolls_back_existing_destination(failure):
 def test_document_modified_after_commit_is_not_marked_complete():
     store, _key, adapter = setup_document({b"x": 1})
     storage = MemoryStorage(events=[])
+    options = CopyOptions()
 
     async def scenario():
-        async with adapter.worker() as worker:
+        async with (
+            adapter.worker() as worker,
+            PartPool(yt=adapter, concurrency=options.stream_limit) as pool,
+        ):
             await export_node(
+                pool=pool,
                 yt=worker,
                 storage=storage,
                 path="//tmp/source",
                 prefix="archive",
                 cluster="test",
-                options=CopyOptions(),
+                options=options,
             )
 
             def change(client):
@@ -293,7 +308,8 @@ def test_document_snapshot_reads_pinned_value_despite_source_changes():
             compressed = b"".join(
                 [
                     chunk
-                    async for chunk in snapshot.read_part(
+                    async for chunk in worker.read_part(
+                        snapshot=snapshot,
                         part=next(plan_parts(node=snapshot.node, part_size=1)),
                         compression_level=3,
                         chunk_size=3,

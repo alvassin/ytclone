@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from ytclone.engine import CopyOptions
-from ytclone.format import DiscoveredNode
+from ytclone.format import DiscoveredNode, ObjectRef, Part, Range
 from ytclone.parallel import worker
 from ytclone.parallel.protocol import decode_message, encode_message
 from ytclone.progress import Progress
@@ -73,7 +73,9 @@ def feed(*, reader, job_id=None, message_type="job"):
     reader.feed_data(encode_message(message=message))
 
 
-def serve(*, reader, writer, yt, concurrency=1, progress=None, interval=100):
+def serve(
+    *, reader, writer, yt, concurrency=1, max_streams=0, progress=None, interval=100
+):
     """Configure a worker loop with no network adapters."""
     return worker.serve_jobs(
         reader=reader,
@@ -82,7 +84,7 @@ def serve(*, reader, writer, yt, concurrency=1, progress=None, interval=100):
         storage=object(),
         prefix="archive",
         cluster="https://yt.test",
-        options=CopyOptions(concurrency=concurrency),
+        options=CopyOptions(concurrency=concurrency, max_streams=max_streams),
         progress=Progress() if progress is None else progress,
         progress_interval=interval,
     )
@@ -132,12 +134,14 @@ def test_concurrency_is_bounded_and_clients_persist(monkeypatch):
         reader, writer, yt = asyncio.StreamReader(), MemoryWriter(), FakeYt()
         released, two_started = asyncio.Event(), asyncio.Event()
         backends = []
+        pools = []
         active = peak = 0
 
         async def transfer(**kwargs):
             """Record active slots and block them until the test releases both."""
             nonlocal active, peak
             backends.append(kwargs["yt"])
+            pools.append(kwargs["pool"])
             active += 1
             peak = max(peak, active)
             if active == 2:
@@ -159,11 +163,116 @@ def test_concurrency_is_bounded_and_clients_persist(monkeypatch):
         await asyncio.wait_for(task, timeout=1)
 
         assert len(backends) == 3
+        assert all(pool is pools[0] for pool in pools)
         assert len(set(backends)) == len(yt.opened) == len(yt.closed) == 2
         assert peak == 2
         results = [item for item in writer.messages if item["type"] == "result"]
         assert len(results) == 3
         assert all(item["status"] == "skipped" for item in results)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("node_count", [1, 3])
+def test_data_workers_are_shared_and_reused_across_nodes(monkeypatch, node_count):
+    """One table can fill N workers while concurrent tables share the same limit."""
+
+    async def scenario():
+        reader, writer, yt = asyncio.StreamReader(), MemoryWriter(), FakeYt()
+        released, filled = asyncio.Event(), asyncio.Event()
+        data_readers = set()
+        active = peak = 0
+
+        async def copy_range(*, reader, part):
+            nonlocal active, peak
+            data_readers.add(reader)
+            active += 1
+            peak = max(peak, active)
+            if active == 3:
+                filled.set()
+            try:
+                await released.wait()
+                return Part(
+                    object=ObjectRef(key=f"part-{part.index}", size=1, sha256="0" * 64),
+                    start=part.start,
+                    stop=part.stop,
+                )
+            finally:
+                active -= 1
+
+        async def transfer(**kwargs):
+            parts = await kwargs["pool"].copy(
+                parts=(Range(index=i, start=i, stop=i + 1) for i in range(6)),
+                transfer=copy_range,
+                parallel=True,
+            )
+            assert [part.start for part in parts] == list(range(6))
+            return "completed", "copied"
+
+        monkeypatch.setattr(worker, "export_node", transfer)
+        for job_id in range(node_count):
+            feed(reader=reader, job_id=job_id)
+        feed(reader=reader, message_type="stop")
+        task = asyncio.create_task(
+            serve(reader=reader, writer=writer, yt=yt, concurrency=2, max_streams=3)
+        )
+        try:
+            await asyncio.wait_for(filled.wait(), timeout=1)
+            assert peak == len(data_readers) == 3
+            released.set()
+            await asyncio.wait_for(task, timeout=1)
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        assert peak == len(data_readers) == 3
+        assert len(yt.opened) == len(yt.closed) == 5
+        results = [item for item in writer.messages if item["type"] == "result"]
+        assert len(results) == node_count
+        assert all(item["status"] == "completed" for item in results)
+
+    asyncio.run(scenario())
+
+
+def test_failed_data_client_stops_node_admission(monkeypatch):
+    """A broken shared pool must not turn every queued node into a new failure."""
+
+    class FailingReaders(FakeYt):
+        @asynccontextmanager
+        async def worker(self):
+            if self.opened:
+                raise OSError("reader initialization failed")
+            async with super().worker() as backend:
+                yield backend
+
+    async def scenario():
+        reader, writer, yt = asyncio.StreamReader(), MemoryWriter(), FailingReaders()
+        admitted = []
+
+        async def copy_range(*, reader, part):
+            pytest.fail("A failed reader must never start a data transfer")
+
+        async def transfer(**kwargs):
+            admitted.append(kwargs["path"])
+            await kwargs["pool"].copy(
+                parts=iter([Range(index=0, start=0, stop=1)]),
+                transfer=copy_range,
+                parallel=True,
+            )
+
+        monkeypatch.setattr(worker, "export_node", transfer)
+        for job_id in range(3):
+            feed(reader=reader, job_id=job_id)
+        feed(reader=reader, message_type="stop")
+
+        with pytest.raises(OSError, match="reader initialization failed"):
+            await asyncio.wait_for(
+                serve(reader=reader, writer=writer, yt=yt), timeout=1
+            )
+        assert admitted == ["//source/0"]
+        assert yt.opened == yt.closed
+        assert not any(item["type"] == "result" for item in writer.messages)
 
     asyncio.run(scenario())
 
@@ -199,6 +308,140 @@ def test_disconnect_and_cancellation_close_active_transfers(monkeypatch, parent_
             await asyncio.wait_for(task, timeout=1)
         assert cancelled.is_set()
         assert yt.opened == yt.closed
+        assert not any(item["type"] == "result" for item in writer.messages)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("parent_eof", [True, False])
+def test_shutdown_drains_shared_readers_before_node_snapshots(monkeypatch, parent_eof):
+    """Cancel the data pool before its owning node releases a shared snapshot."""
+
+    async def scenario():
+        reader, writer, yt = asyncio.StreamReader(), MemoryWriter(), FakeYt()
+        started = asyncio.Event()
+        events = []
+
+        async def read_part(*, reader, part):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                events.append("reader_closed")
+
+        async def transfer(**kwargs):
+            try:
+                await kwargs["pool"].copy(
+                    parts=iter([Range(index=0, start=0, stop=1)]),
+                    transfer=read_part,
+                    parallel=True,
+                )
+            finally:
+                assert events == ["reader_closed"]
+                events.append("snapshot_closed")
+
+        monkeypatch.setattr(worker, "export_node", transfer)
+        feed(reader=reader, job_id=1)
+        task = asyncio.create_task(
+            serve(reader=reader, writer=writer, yt=yt, concurrency=2, max_streams=3)
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        if parent_eof:
+            reader.feed_eof()
+        else:
+            task.cancel()
+
+        expected = worker.ParentDisconnected if parent_eof else asyncio.CancelledError
+        with pytest.raises(expected):
+            await asyncio.wait_for(task, timeout=1)
+        assert events == ["reader_closed", "snapshot_closed"]
+        assert set(yt.opened) == set(yt.closed)
+        assert not any(item["type"] == "result" for item in writer.messages)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("repeat_cancellation", [False, True])
+def test_shutdown_waits_for_slow_snapshot_and_client_cleanup(
+    monkeypatch, repeat_cancellation
+):
+    """Repeated shutdown requests must not cancel owners again during cleanup."""
+
+    async def scenario():
+        reader, writer = asyncio.StreamReader(), MemoryWriter()
+        started, snapshot_closing, client_closing = (
+            asyncio.Event(),
+            asyncio.Event(),
+            asyncio.Event(),
+        )
+        release_snapshot, release_client = asyncio.Event(), asyncio.Event()
+        events = []
+
+        class SlowMetadataYt(FakeYt):
+            @asynccontextmanager
+            async def worker(self):
+                metadata = not self.opened
+                async with super().worker() as backend:
+                    try:
+                        yield backend
+                    finally:
+                        if metadata:
+                            client_closing.set()
+                            await release_client.wait()
+                            events.append("client_closed")
+
+        async def copy_range(*, reader, part):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("reader_closed")
+
+        async def transfer(**kwargs):
+            try:
+                await kwargs["pool"].copy(
+                    parts=iter([Range(index=0, start=0, stop=1)]),
+                    transfer=copy_range,
+                    parallel=True,
+                )
+            finally:
+                assert events == ["reader_closed"]
+                snapshot_closing.set()
+                await release_snapshot.wait()
+                events.append("snapshot_closed")
+
+        monkeypatch.setattr(worker, "export_node", transfer)
+        yt = SlowMetadataYt()
+        feed(reader=reader, job_id=1)
+        task = asyncio.create_task(serve(reader=reader, writer=writer, yt=yt))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            task.cancel()
+            await asyncio.wait_for(snapshot_closing.wait(), timeout=1)
+            if repeat_cancellation:
+                task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release_snapshot.set()
+            await asyncio.wait_for(client_closing.wait(), timeout=1)
+            assert events == ["reader_closed", "snapshot_closed"]
+            if repeat_cancellation:
+                task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release_client.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+        finally:
+            release_snapshot.set()
+            release_client.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert events == ["reader_closed", "snapshot_closed", "client_closed"]
+        assert len(yt.opened) == len(yt.closed) == 2
         assert not any(item["type"] == "result" for item in writer.messages)
 
     asyncio.run(scenario())
@@ -328,6 +571,7 @@ def test_run_worker_builds_process_local_resources(monkeypatch):
             "bucket": "archive-bucket",
             "prefix": "snapshots",
             "concurrency": 3,
+            "max_streams": 7,
             "part_size": 256 * 1024**2,
             "chunk_size": 32 * 1024**2,
             "compression_level": 3,
@@ -343,6 +587,7 @@ def test_run_worker_builds_process_local_resources(monkeypatch):
     assert seen["s3_options"]["region"] == "region-test"
     assert set(seen["s3_options"]) == {"session", "url", "region"}
     assert seen["serve"]["options"].concurrency == 3
+    assert seen["serve"]["options"].max_streams == 7
     assert seen["serve"]["prefix"] == "snapshots"
     assert seen["serve"]["cluster"] == "https://yt.test"
     assert seen["yt_options"]["proxy_discovery"] is False
@@ -389,6 +634,7 @@ raise SystemExit(worker.main())
         "bucket": "bucket",
         "prefix": "archive",
         "concurrency": 1,
+        "max_streams": 0,
         "part_size": 256 * 1024**2,
         "chunk_size": 32 * 1024**2,
         "compression_level": 3,

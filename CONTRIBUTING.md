@@ -18,6 +18,13 @@ Run either command from the checkout with `uv run --locked`. See the
 [architecture guide](ARCHITECTURE.md) for module responsibilities, archive format,
 and export/restore sequences.
 
+Export has separate limits for node lifecycles (`--concurrency`) and a shared pool
+of range workers (`--max-streams`, defaulting to the node limit). When changing
+scheduling, verify that one table can fill the pool, multiple ready nodes take
+turns, files stay sequential, and failures or cancellation drain active ranges
+before their snapshot closes. Restore and the archive format remain unchanged;
+parallel export does not provide persistent progress within an unfinished node.
+
 ## Run checks
 
 Run the complete offline suite and lint checks:
@@ -29,7 +36,7 @@ uv run --locked ruff format --check src tests scripts packaging
 ```
 
 The offline suite uses in-memory fakes, local HTTP servers, and subprocesses. It
-needs no YTsaurus or S3 services or credentials. The six local integration cases
+needs no YTsaurus or S3 services or credentials. Local integration cases
 are skipped unless explicitly enabled.
 
 Known limitation: aiomisc can exit incorrectly after coroutine cleanup completes.
@@ -56,14 +63,15 @@ and proxy discovery, and use the dummy S3 credentials from `compose.yml`. No
 production credentials are needed.
 
 Each run creates unique `//tmp/ytclone-main-*`, `//tmp/ytclone-raw-retry-*`, and
-`//tmp/ytclone-cli-*` paths, plus `main-smoke-*`, `raw-retry-*`, and `cli-smoke-*`
+`//tmp/ytclone-cli-*` paths, plus `main-smoke-*`, `raw-retry-*`, `cli-smoke-*`, and `cli-streams-*`
 prefixes in the local `yt-backup` bucket. Tests cover export and restore, repeated
 copies, changed metadata, empty nodes, file parts, corruption rollback, and
 table-read retries within a snapshot. Document tests also cover scalar, empty and
 attributed YSON, a value exceeding the default node-list limit, concurrent source
-changes, changed destinations, and corrupt-archive rollback. The CLI roundtrip
-exports six nodes using two real worker processes, restores them, and repeats both commands to verify
-unchanged objects are skipped.
+changes, changed destinations, and corrupt-archive rollback. The CLI roundtrips
+cover six nodes using two real worker processes and a single table using
+`--concurrency 1 --max-streams 3`. Both restore the data and repeat the commands
+to verify unchanged objects are skipped.
 
 Fixtures are retained for inspection while the local containers and their storage
 exist. To stop the services while keeping containers and data:

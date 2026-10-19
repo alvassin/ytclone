@@ -85,17 +85,26 @@ For example, export both `//home/analytics/events` and `//home/analytics` to
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `--concurrency` | `4` | Concurrent node transfers; per process in parallel mode. |
+| `--concurrency` | `4` | Concurrent node lifecycles; per process in parallel mode. |
+| `--max-streams` | `0` | Shared export stream count per process; `0` uses `--concurrency`. Export only; restore rejects nonzero values. |
 | `--queue-size` | `16` | Pending paths in ordinary mode; control messages per process in parallel mode. |
 | `--part-size-mib` | `256` | Target **uncompressed** bytes per archive object; approximate for tables. |
-| `--buffer-size-mib` | `32` | S3 multipart buffer per transfer, from 5 to 512 MiB. |
+| `--buffer-size-mib` | `32` | S3 multipart buffer per active stream, from 5 to 512 MiB. |
 | `--compression-level` | `3` | Zstandard level, from -7 to 22; higher levels use more CPU and memory. |
 
 An archive part is one S3 object; multipart buffers are chunks within that object.
 `--part-size-mib` does not allocate a whole part in RAM. Objects smaller than the
 buffer use a single PUT; objects at or above that size use multipart upload.
 
-Lower concurrency or buffer size to reduce memory use. The startup RAM estimate
+Export uses a fixed pool of `--max-streams` workers shared by all active nodes.
+A single static table can use the whole pool. Ready nodes take turns supplying
+ranges as workers become free; files and documents use one range at a time.
+`--concurrency` bounds node lifecycles, including metadata checks and snapshots,
+separately from this stream limit. Restore keeps each node's parts sequential.
+
+Lower the stream count or buffer size to reduce export memory use; lower
+`--concurrency` to reduce the number of active snapshots or restore transfers.
+The startup RAM estimate
 is a planning budget, **not a limit**: large rows, metadata, and allocator overhead
 can exceed it. Parallel mode multiplies transfer memory by process count and also
 keeps discovered metadata in RAM; `--queue-size` does not bound that metadata.
@@ -109,7 +118,7 @@ file, ordinary mode writes detailed logs to the console.
 | Counter | Meaning |
 | --- | --- |
 | `copied / unchanged / skipped / errors` | Completed nodes, matching copies, reported skips, and node/discovery errors. |
-| `queued / active` | Pending nodes and busy transfer slots. |
+| `queued / active` | Pending nodes and active node lifecycles, not export streams. |
 | `uploaded / published` | Compressed bytes sent versus bytes belonging to completed archive nodes. |
 | `downloaded / restored` | Compressed bytes received versus bytes belonging to completed restores. |
 
@@ -121,8 +130,10 @@ be added together as total elapsed time.
 
 ## Parallel export
 
-`--processes N --concurrency C` allows up to N × C concurrent transfers. It
-supports YT → S3 only; one table still occupies one slot regardless of its size.
+`--processes P --concurrency C --max-streams N` allows up to P × C active nodes
+and P × N export streams. With the default `--max-streams 0`, N equals C.
+Each process has its own stream pool; a table stays in one process and can use
+that process's N streams. This command supports YT → S3 only.
 
 - `--discovery-concurrency` (default: 4) controls concurrent directory listings.
 - Directories and smaller known nodes go first. While discovery runs, one slot is
@@ -150,6 +161,11 @@ Temporary failures are retried automatically and logged:
 An uncertain commit or rollback stops automatic restore retries. A failure while
 recording completion can occur **after the data was committed**; inspect the log
 before assuming that the old destination is still present.
+
+On an export error, the node stops scheduling new ranges and waits for its active
+ranges to finish cleanup before closing the snapshot. Cancellation also drains
+active range workers before closing their snapshots. The manifest is published
+only after all parts and the snapshot have completed successfully.
 
 After fixing a failure, [rerun the command](README.md#repeated-runs). Completed,
 unchanged nodes are skipped; an unfinished table, file, or document starts from

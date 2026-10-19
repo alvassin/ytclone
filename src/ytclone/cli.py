@@ -41,7 +41,11 @@ class Arguments(argclass.Parser):
     )
     region: str = argclass.Argument(env_var="AWS_DEFAULT_REGION", default="us-east-1")
     concurrency: int = argclass.Argument(
-        default=4, help="Maximum concurrent data node transfers"
+        default=4, help="Maximum concurrent node lifecycles"
+    )
+    max_streams: int = argclass.Argument(
+        default=0,
+        help="Shared export data workers per process; 0 uses concurrency",
     )
     queue_size: int = argclass.Argument(default=16, help="Maximum queued node paths")
     part_size_mib: int = argclass.Argument(
@@ -96,7 +100,8 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
     )
 
     memory_budget = estimate_memory_mib(
-        concurrency=options.concurrency,
+        concurrency=options.stream_limit if export else options.concurrency,
+        snapshot_concurrency=options.concurrency if export else 0,
         chunk_size=options.chunk_size,
         compression_level=options.compression_level,
         export=export,
@@ -113,6 +118,8 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
         "Memory estimate is a planning budget; large rows, metadata and "
         "allocator overhead can exceed it."
     )
+    if export:
+        log.info("export_parallelism max_streams=%d", options.stream_limit)
 
     progress = Progress() if arguments.log_file else None
     if progress is not None:
@@ -222,9 +229,14 @@ def main() -> int:
             or arguments.progress_interval <= 0
         ):
             raise ValueError("Progress interval must be positive and finite")
-        direction(source=arguments.source, destination=arguments.destination)
+        export, _, _, _ = direction(
+            source=arguments.source, destination=arguments.destination
+        )
+        if not export and arguments.max_streams != 0:
+            raise ValueError("Maximum streams applies to export only")
         options = CopyOptions(
             concurrency=arguments.concurrency,
+            max_streams=arguments.max_streams,
             queue_size=arguments.queue_size,
             part_size=arguments.part_size_mib * MIB,
             chunk_size=arguments.buffer_size_mib * MIB,

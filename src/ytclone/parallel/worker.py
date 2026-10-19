@@ -15,6 +15,7 @@ from aiomisc.log import LogFormat
 from aiomisc_log import basic_config
 
 from ..engine import CopyOptions, export_node
+from ..export_pool import PartPool
 from ..format import DiscoveredNode
 from ..interfaces import ObjectStorage, YtBackend, YtWorkerFactory
 from ..logging import file_logging
@@ -50,6 +51,7 @@ async def serve_jobs(
     channel: Channel[tuple[int, DiscoveredNode]] = Channel(maxsize=options.concurrency)
     output_lock = asyncio.Lock()
     pending: set[int] = set()
+    stopping = False
 
     async def send(*, message: dict) -> None:
         """Keep concurrent progress and result messages on separate lines."""
@@ -88,6 +90,7 @@ async def serve_jobs(
     async def consume(*, backend: YtBackend) -> None:
         """Reuse one dedicated YT client for consecutive node assignments."""
         async for job_id, node in channel:
+            pool.check()
             try:
                 status, reason = await export_node(
                     yt=backend,
@@ -98,13 +101,18 @@ async def serve_jobs(
                     options=options,
                     progress=progress,
                     discovered=node,
+                    pool=pool,
                 )
             except Exception as error:
+                if not stopping:
+                    pool.check()
                 status, reason = "failed", type(error).__name__
                 log.exception("node_failed path=%s", node.path)
             else:
                 log.info("node_%s path=%s reason=%s", status, node.path, reason)
 
+            if stopping:
+                return
             progress.record_result(status=status, reason=reason)
             pending.remove(job_id)
             await report()
@@ -128,11 +136,31 @@ async def serve_jobs(
             await stack.enter_async_context(yt.worker())
             for _ in range(options.concurrency)
         ]
+        pool = await stack.enter_async_context(
+            PartPool(yt=yt, concurrency=options.stream_limit)
+        )
         await send(message={"type": "ready"})
         tasks = [asyncio.create_task(consume(backend=backend)) for backend in backends]
         tasks.append(asyncio.create_task(receive()))
         reporter = asyncio.create_task(report_periodically())
         completion = asyncio.gather(*tasks)
+
+        async def shutdown() -> None:
+            """Cancel owners once, drain data, and close clients without interruption."""
+            reporter.cancel()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            try:
+                # Cancelled pool.copy calls retain snapshots until readers drain.
+                await pool.close()
+            finally:
+                try:
+                    await asyncio.gather(
+                        completion, reporter, *tasks, return_exceptions=True
+                    )
+                finally:
+                    await stack.aclose()
 
         try:
             done, _ = await asyncio.wait(
@@ -142,12 +170,19 @@ async def serve_jobs(
                 await reporter
             await asyncio.shield(completion)
         finally:
+            stopping = True
             channel.close()
-            reporter.cancel()
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(completion, reporter, *tasks, return_exceptions=True)
+            shutdown_task = asyncio.create_task(shutdown())
+            try:
+                await asyncio.shield(shutdown_task)
+            except asyncio.CancelledError:
+                while not shutdown_task.done():
+                    try:
+                        await asyncio.shield(shutdown_task)
+                    except asyncio.CancelledError:
+                        pass
+                shutdown_task.result()
+                raise
 
 
 async def run_worker(
@@ -156,6 +191,7 @@ async def run_worker(
     """Create process-local YT and S3 clients and serve node assignments."""
     options = CopyOptions(
         concurrency=config["concurrency"],
+        max_streams=config["max_streams"],
         queue_size=config["concurrency"],
         part_size=config["part_size"],
         chunk_size=config["chunk_size"],

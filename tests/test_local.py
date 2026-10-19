@@ -18,6 +18,7 @@ from yt.wrapper.http_helpers import _get_session
 
 import ytclone.yt as yt_adapter
 from ytclone.engine import CopyOptions, export_node, export_tree, restore_tree
+from ytclone.export_pool import PartPool
 from ytclone.format import MIB, RESTORE_MARKER, ROW_FORMAT, Manifest, node_prefix
 from ytclone.interfaces import RetryableReadError
 from ytclone.progress import Progress
@@ -486,8 +487,12 @@ def test_local_raw_read_retries_preserve_snapshot(monkeypatch, retry_rows, failu
             storage = S3Storage(client=s3, chunk_size=options.chunk_size)
             archive = node_prefix(prefix=prefix, path=source)
             manifest_key = archive + "/@manifest.json"
-            async with yt.worker() as worker:
+            async with (
+                yt.worker() as worker,
+                PartPool(yt=yt, concurrency=options.stream_limit) as pool,
+            ):
                 transfer = export_node(
+                    pool=pool,
                     yt=worker,
                     storage=storage,
                     path=source,
@@ -658,7 +663,8 @@ def test_local_documents_roundtrip_snapshot_changes_and_corruption():
                 payload = b"".join(
                     [
                         chunk
-                        async for chunk in snapshot.read_part(
+                        async for chunk in worker.read_part(
+                            snapshot=snapshot,
                             part=next(plan_parts(node=snapshot.node, part_size=1)),
                             compression_level=3,
                             chunk_size=MIB,

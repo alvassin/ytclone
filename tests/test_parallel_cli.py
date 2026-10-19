@@ -32,6 +32,7 @@ def arguments(*extra):
         ("--small-table-mib", "-1"),
         ("--progress-interval", "nan"),
         ("--concurrency", "0"),
+        ("--max-streams", "-1"),
     ],
 )
 def test_invalid_settings(flag, value):
@@ -55,6 +56,8 @@ def test_run_passes_nonsecret_config_and_reports_failure(monkeypatch, capsys):
         "3",
         "--concurrency",
         "2",
+        "--max-streams",
+        "7",
         "--endpoint",
         "https://s3.invalid",
         "--region",
@@ -76,10 +79,13 @@ def test_run_passes_nonsecret_config_and_reports_failure(monkeypatch, capsys):
     assert captured["small_size"] == 8 * 1024**2
     config = captured["config"]
     assert config["concurrency"] == 2
+    assert config["max_streams"] == 7
     assert config["bucket"] == "bucket" and config["prefix"] == "prefix"
     assert config["endpoint"] == "https://s3.invalid" and config["region"] == "custom"
     assert not any("secret" in key.lower() or "token" in key.lower() for key in config)
-    assert "failed" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "2 node slots / 7 data workers" in output
+    assert "failed" in output
 
 
 @pytest.mark.parametrize(

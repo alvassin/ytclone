@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -12,6 +12,7 @@ import pytest
 
 from ytclone import engine
 from ytclone.engine import CopyOptions, export_node, export_tree, restore_tree
+from ytclone.export_pool import PartPool
 from ytclone.format import (
     DiscoveredNode,
     Manifest,
@@ -198,27 +199,28 @@ class MemoryYt:
         self.max_active = max(self.max_active, self.active)
         self.events.append(("snapshot_enter", path))
 
-        async def read_part(*, part, compression_level, chunk_size):
-            self.reads.append((path, part.index))
-            self.read_started.set()
-            try:
-                if self.release_read is not None:
-                    await self.release_read.wait()
-                failures = self.read_failures.get((path, part.index), [])
-                if failures:
-                    yield b"x"
-                    raise failures.pop(0)
-                yield b"x" * (part.stop - part.start)
-            finally:
-                self.closed_reads.append((path, part.index))
-
         try:
-            yield SimpleNamespace(node=self.nodes[path], read_part=read_part)
+            yield SimpleNamespace(node=self.nodes[path])
             if path in self.fail_snapshot_exit:
                 raise OSError("snapshot expired")
         finally:
             self.active -= 1
             self.events.append(("snapshot_exit", path))
+
+    async def read_part(self, *, snapshot, part, compression_level, chunk_size):
+        path = snapshot.node.path
+        self.reads.append((path, part.index))
+        self.read_started.set()
+        try:
+            if self.release_read is not None:
+                await self.release_read.wait()
+            failures = self.read_failures.get((path, part.index), [])
+            if failures:
+                yield b"x"
+                raise failures.pop(0)
+            yield b"x" * (part.stop - part.start)
+        finally:
+            self.closed_reads.append((path, part.index))
 
     async def ensure_directory(self, *, path):
         self.events.append(("ensure_directory", path))
@@ -278,6 +280,14 @@ class MemoryYtWorker:
         self.record(method="snapshot", path=path)
         async with self.owner.snapshot(path=path) as snapshot:
             yield snapshot
+
+    async def read_part(self, *, snapshot, **kwargs):
+        self.record(method="read_part", path=snapshot.node.path)
+        async with aclosing(
+            self.owner.read_part(snapshot=snapshot, **kwargs)
+        ) as chunks:
+            async for chunk in chunks:
+                yield chunk
 
     async def ensure_directory(self, *, path):
         """Create a missing directory through this backend."""
@@ -540,6 +550,7 @@ def test_part_copy_does_not_retry_unmarked_errors_or_cancellation(failure, monke
         async with yt.snapshot(path=SOURCE) as snapshot:
             with pytest.raises(type(error)) as caught:
                 await engine.copy_part(
+                    reader=yt,
                     snapshot=snapshot,
                     storage=storage,
                     key="part",
@@ -624,7 +635,7 @@ def test_discovery_overlaps_bounded_workers_and_cancellation_closes_snapshots():
         assert yt.active == 0
         assert progress.active == progress.queued == 0
         assert progress.completed_bytes == 0
-        assert len(yt.workers) == 3
+        assert len(yt.workers) == 5
         assert all(worker.closed for worker in yt.workers)
 
     asyncio.run(scenario())
@@ -805,7 +816,7 @@ def test_many_nodes_reuse_bounded_workers_and_separate_traversal_backend():
             yt=yt, storage=storage, copy_options=options(concurrency=3, queue_size=2)
         )
         assert (result.completed, result.failed) == (40, 0)
-        assert len(yt.workers) == 4
+        assert 5 <= len(yt.workers) <= 7
         assert all(worker.closed for worker in yt.workers)
         traversal = [
             worker
@@ -900,7 +911,8 @@ def test_producer_cleanup_failure_cancels_blocked_copy_worker():
     asyncio.run(scenario())
 
 
-def test_single_cancellation_waits_for_slow_worker_cleanup():
+@pytest.mark.parametrize("repeated", [False, True])
+def test_single_cancellation_waits_for_slow_worker_cleanup(repeated):
     """Do not cancel a worker's asynchronous cleanup a second time."""
 
     async def scenario():
@@ -948,6 +960,8 @@ def test_single_cancellation_waits_for_slow_worker_cleanup():
             await asyncio.wait_for(cleanup_started.wait(), timeout=2)
             await asyncio.wait_for(fast_closed.wait(), timeout=2)
             for _ in range(10):
+                if repeated:
+                    task.cancel()
                 await asyncio.sleep(0)
 
             assert not cleanup_interrupted.is_set()
@@ -959,6 +973,122 @@ def test_single_cancellation_waits_for_slow_worker_cleanup():
                 await asyncio.wait_for(task, timeout=2)
 
         assert cleanup_finished.is_set()
+        assert all(worker.closed for worker in yt.workers)
+        assert yt.active == 0
+
+    asyncio.run(scenario())
+
+
+def test_multiple_tables_finish_with_one_shared_data_worker():
+    """Snapshot owners must not occupy the only slot their ranges require."""
+
+    async def scenario():
+        nodes = [
+            make_node(path=f"{SOURCE}/{index}", kind="table") for index in range(5)
+        ]
+        yt, storage, _ = setup(nodes=nodes)
+        result = await asyncio.wait_for(
+            export(
+                yt=yt,
+                storage=storage,
+                copy_options=CopyOptions(concurrency=3, max_streams=1, part_size=4),
+            ),
+            timeout=2,
+        )
+        assert result.completed == 5 and result.failed == 0
+        data_workers = [
+            worker
+            for worker in yt.workers
+            if any(method == "read_part" for method, _ in worker.calls)
+        ]
+        assert len(data_workers) == 1
+        assert len(data_workers[0].calls) == 15
+        assert yt.max_active > 1 and yt.active == 0
+        assert all(manifest_key(path=node.path) in storage.objects for node in nodes)
+
+    asyncio.run(scenario())
+
+
+def test_parallel_table_orders_manifest_and_credits_completed_range_sizes():
+    """Finishing the final row range first must not report the entire table done."""
+
+    async def scenario():
+        node = make_node(kind="table", disk_size=240)
+        yt, storage, events = setup(nodes=[node])
+        progress = Progress()
+        started = asyncio.Queue()
+        releases = [asyncio.Event() for _ in range(3)]
+        uploaded = [asyncio.Event() for _ in range(3)]
+        original_upload = storage.upload
+
+        async def upload(*, key, chunks):
+            index = int(key.split("part-")[1].split(".")[0])
+            started.put_nowait(index)
+            await releases[index].wait()
+            ref = await original_upload(key=key, chunks=chunks)
+            uploaded[index].set()
+            return ref
+
+        storage.upload = upload
+        task = asyncio.create_task(
+            export(
+                yt=yt,
+                storage=storage,
+                progress=progress,
+                copy_options=CopyOptions(concurrency=1, max_streams=3, part_size=4),
+            )
+        )
+        try:
+            for index in range(3):
+                assert await asyncio.wait_for(started.get(), timeout=2) == index
+            for completed, index in enumerate((2, 0, 1), start=1):
+                releases[index].set()
+                await asyncio.wait_for(uploaded[index].wait(), timeout=2)
+                assert progress.source_copied_bytes == 80 * completed
+                if completed < 3:
+                    assert progress.source_partial_nodes == pytest.approx(completed / 3)
+                    assert manifest_key() not in storage.objects
+        finally:
+            for release in releases:
+                release.set()
+            outcome = await asyncio.wait_for(task, timeout=2)
+        assert outcome.completed == 1 and outcome.failed == 0
+        manifest = Manifest.from_bytes(storage.objects[manifest_key()])
+        assert [(part.start, part.stop) for part in manifest.parts] == [
+            (0, 4),
+            (4, 8),
+            (8, 12),
+        ]
+        assert events.index(("snapshot_exit", SOURCE)) < events.index(
+            ("put", manifest_key())
+        )
+        assert progress.source_partial_nodes == 0
+
+    asyncio.run(scenario())
+
+
+def test_data_worker_failure_stops_before_replacing_other_node_archives():
+    """A broken reader pool is fatal rather than a failure of every queued node."""
+
+    async def scenario():
+        nodes = [
+            make_node(path=f"{SOURCE}/{index}", kind="table") for index in range(4)
+        ]
+        yt, storage, events = setup(nodes=nodes)
+        assert (await export(yt=yt, storage=storage)).completed == 4
+        originals = dict(storage.objects)
+        yt.nodes = {node.path: replace(node, content_revision=2) for node in nodes}
+        # One owner and one traversal client are acquired before the lazy reader.
+        yt.fail_acquire_index = len(yt.workers) + 2
+        events.clear()
+        with pytest.raises(OSError, match="worker acquisition failed"):
+            await asyncio.wait_for(export(yt=yt, storage=storage), timeout=2)
+        assert [(kind, path) for kind, path in events if kind == "snapshot_enter"] == [
+            ("snapshot_enter", nodes[0].path)
+        ]
+        for node in nodes[1:]:
+            key = manifest_key(path=node.path)
+            assert storage.objects[key] == originals[key]
         assert all(worker.closed for worker in yt.workers)
         assert yt.active == 0
 
@@ -1720,8 +1850,12 @@ def test_direct_export_without_discovery_still_uses_snapshot():
         yt, storage, events = setup()
         await export(yt=yt, storage=storage)
         events.clear()
-        async with yt.worker() as backend:
+        async with (
+            yt.worker() as backend,
+            PartPool(yt=yt, concurrency=1) as pool,
+        ):
             result = await export_node(
+                pool=pool,
                 yt=backend,
                 storage=storage,
                 path=SOURCE,

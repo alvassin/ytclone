@@ -94,6 +94,7 @@ def worker_config() -> dict:
         "bucket": "portable-check",
         "prefix": "check",
         "concurrency": 2,
+        "max_streams": 0,
         "part_size": 1024**2,
         "chunk_size": 5 * 1024**2,
         "compression_level": 3,

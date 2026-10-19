@@ -74,16 +74,29 @@ Use a separate S3 prefix for each source cluster.
 
 ## Parallel export
 
-For trees with many tables or files, use multiple copy processes:
+Export large tables through several streams in one process:
+
+```bash
+ytclone //home/analytics/events s3://my-bucket/export \
+  --concurrency 4 --max-streams 8 --log-file export.log
+```
+
+Up to four nodes are active, sharing eight export streams. A single large table
+can use all eight streams; ready tables take turns when streams become available.
+Files and documents use one stream at a time. By default, the stream count equals
+`--concurrency`.
+
+For trees with many nodes, use multiple copy processes:
 
 ```bash
 ytclone-parallel //home/analytics/events s3://my-bucket/export \
   --processes 2 --concurrency 2 --log-file export.log
 ```
 
-This runs two processes with two transfers each, prioritizing directories and
-small nodes. One table still occupies one transfer slot. Parallel mode supports
-YT → S3; restore its archives with `ytclone` as above.
+This runs two processes with two active nodes and two export streams each,
+prioritizing directories and small nodes. Each process owns its stream pool;
+one table stays in one process. Parallel mode supports YT → S3; restore its
+archives with `ytclone` as above. Restore reads each node's parts sequentially.
 
 ## Before you copy
 

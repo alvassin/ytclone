@@ -41,6 +41,7 @@ from .interfaces import (
     RetryableReadError,
     RetryableRestoreError,
     SourceSnapshot,
+    WorkerLifecycleError,
     YtBackend,
     YtWorkerFactory,
 )
@@ -499,30 +500,87 @@ class _ReadStream:
             self.raw.close()
 
 
+async def _wait_cleanup(task):
+    """Finish resource cleanup even if multiple owners request cancellation."""
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            if cancelled:
+                raise asyncio.CancelledError
+            raise
+    if cancelled:
+        with contextlib.suppress(BaseException):
+            task.result()
+        raise asyncio.CancelledError
+    task.result()
+
+
 class Snapshot(SourceSnapshot):
     def __init__(self, *, session: _Session, node: Node, document: bytes | None = None):
-        """Bind a pinned node to its reading session."""
+        """Own the pinned transaction, but no reader clients or worker threads."""
         self.session = session
         self.node = node
-        self.pinned = "#" + node.node_id
-        self._stream = None
-        self._reading = False
         self.document = document
+        self.closed = False
+        self.readers: set[_PartReader] = set()
+        self._cleanup_task = None
+
+    async def _drain(self):
+        """Release all borrowed streams before ending the owner's transaction."""
+        results = await asyncio.gather(
+            *(reader.close() for reader in tuple(self.readers)),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def close(self):
+        """Stop new reads and share cancellation-safe cleanup with active readers."""
+        self.closed = True
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._drain())
+        await _wait_cleanup(self._cleanup_task)
+
+
+class _PartReader:
+    def __init__(self, *, session: _Session, snapshot: Snapshot):
+        """Borrow a snapshot for one range using a persistent data-worker session."""
+        self.session = session
+        self.snapshot = snapshot
+        self.node = snapshot.node
+        self.pinned = "#" + self.node.node_id
+        self._stream = None
+        self._transaction_context = None
+        self._pending = None
+        self._closed = False
+        self._cleanup_task = None
 
     def _open_part(self, *, part: Range, compression_level: int):
-        """Open and compress one table-row or file-byte range."""
-        if self._stream is not None:
-            raise RuntimeError("Read one part at a time within a snapshot")
-        self.session.check()
+        """Open a raw stream in the borrowed snapshot and wrap its compressor."""
+        self.snapshot.session.check()
         client = self.session.client
         if self.node.kind == "table":
             raw = _read_table(
                 client=client,
                 pinned=self.pinned,
                 part=part,
-                transaction_id=self.session.transaction.transaction_id,
+                transaction_id=self.snapshot.session.transaction.transaction_id,
             )
         elif self.node.kind == "file":
+            if self.session is not self.snapshot.session:
+                # File retries consult the client's transaction parameters while
+                # consuming the stream, so retain this context until raw.close().
+                self._transaction_context = client.Transaction(
+                    transaction_id=self.snapshot.session.transaction.transaction_id,
+                    acquire=False,
+                    ping=False,
+                )
+                self._transaction_context.__enter__()
             raw = client.read_file(
                 path=self.pinned,
                 offset=part.start,
@@ -530,11 +588,10 @@ class Snapshot(SourceSnapshot):
                 enable_read_parallel=False,
             )
         elif self.node.kind == DOCUMENT_KIND:
-            if self.document is None or part != Range(
-                index=0, start=0, stop=len(self.document)
-            ):
+            document = self.snapshot.document
+            if document is None or part != Range(index=0, start=0, stop=len(document)):
                 raise ValueError("Invalid document part")
-            raw = io.BytesIO(self.document)
+            raw = io.BytesIO(document)
         else:
             raise ValueError(f"Cannot read data of {self.node.kind}")
 
@@ -554,8 +611,15 @@ class Snapshot(SourceSnapshot):
 
     async def _read(self, function, /, **kwargs):
         """Translate only source-call failures into whole-part retry signals."""
+        if self._closed or self.snapshot.closed:
+            raise RuntimeError("Snapshot reader is closed")
+        if self.session.poisoned:
+            raise RuntimeError("YT reader cleanup failed")
         try:
-            return await self.session.call(function, operation="yt_read", **kwargs)
+            result = await self.session.call(function, operation="yt_read", **kwargs)
+            if self._closed or self.snapshot.closed:
+                raise RuntimeError("Snapshot reader is closed")
+            return result
         except Exception as error:
             if (
                 self.node.kind == "table"
@@ -566,21 +630,40 @@ class Snapshot(SourceSnapshot):
             raise
 
     def _close_part(self):
-        """Release the currently open data part."""
+        """Close data before restoring the reader client's transaction context."""
         stream, self._stream = self._stream, None
-        if stream is not None:
-            stream.close()
+        transaction, self._transaction_context = self._transaction_context, None
+        try:
+            if stream is not None:
+                stream.close()
+        finally:
+            if transaction is not None:
+                transaction.__exit__(None, None, None)
+
+    async def _drain(self):
+        """Drain prefetched SDK work and close the stream on its own thread."""
+        pending, self._pending = self._pending, None
+        if pending is not None:
+            pending.cancel()
+            with contextlib.suppress(BaseException):
+                await pending
+        try:
+            await self.session.call(self._close_part, operation=None)
+        except BaseException:
+            self.session.poisoned = True
+            raise
+
+    async def close(self):
+        """Share cleanup between the consumer, worker and snapshot owner."""
+        self._closed = True
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._drain())
+        await _wait_cleanup(self._cleanup_task)
 
     async def read_part(
         self, *, part: Range, compression_level: int, chunk_size: int
     ) -> AsyncIterator[bytes]:
         """Stream a compressed part with one chunk of prefetch."""
-        if chunk_size <= 0:
-            raise ValueError("chunk_size must be positive")
-        if self._reading:
-            raise RuntimeError("Read one part at a time within a snapshot")
-        self._reading = True
-        pending = None
         error = None
         try:
             stream = await self._read(
@@ -594,29 +677,27 @@ class Snapshot(SourceSnapshot):
                 pending = asyncio.create_task(
                     self._read(stream.compressed.read, size=chunk_size)
                 )
+                self._pending = pending
                 yield chunk
                 chunk = await pending
-                pending = None
+                if self._pending is pending:
+                    self._pending = None
+                if self._closed or self.snapshot.closed:
+                    raise RuntimeError("Snapshot reader is closed")
         except BaseException as caught:
             error = caught
             raise
         finally:
-            if pending is not None:
-                pending.cancel()
-                with contextlib.suppress(BaseException):
-                    await pending
             try:
-                await self.session.call(self._close_part, operation=None)
+                await self.close()
             except BaseException as cleanup_error:
-                self.session.poisoned = True
                 if error is None:
                     raise
                 log.exception("read_cleanup_failed path=%s", self.node.path)
                 if isinstance(error, RetryableReadError):
-                    # Preserve the source failure, but forbid retries after unsafe cleanup.
+                    # Preserve the source failure, but forbid this range's retry
+                    # when the source response could not be closed reliably.
                     raise error.__cause__ from cleanup_error
-            finally:
-                self._reading = False
 
 
 class Restore(RestoreSink):
@@ -835,7 +916,12 @@ class YtAdapter(YtWorkerFactory):
         session = _Session(adapter=self)
         try:
             await session.call(session.open, operation=None)
-            yield YtWorker(session=session)
+            worker = YtWorker(session=session)
+            try:
+                yield worker
+            finally:
+                if worker._reader is not None:
+                    await worker._reader.close()
         finally:
             await session.close()
 
@@ -844,6 +930,50 @@ class YtWorker(YtBackend):
     def __init__(self, *, session: _Session):
         """Bind sequential node operations to a persistent client session."""
         self.session = session
+        self._reader = None
+
+    async def read_part(
+        self,
+        *,
+        snapshot: SourceSnapshot,
+        part: Range,
+        compression_level: int,
+        chunk_size: int,
+    ) -> AsyncIterator[bytes]:
+        """Use this worker's client for a range of a snapshot owned elsewhere."""
+        if (
+            not isinstance(snapshot, Snapshot)
+            or snapshot.session.adapter is not self.session.adapter
+        ):
+            raise ValueError("Snapshot belongs to another YT adapter")
+        if snapshot.closed:
+            raise RuntimeError("Snapshot is closed")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if self._reader is not None:
+            raise RuntimeError("Read one part at a time within a worker")
+        reader = _PartReader(session=self.session, snapshot=snapshot)
+        self._reader = reader
+        snapshot.readers.add(reader)
+        try:
+            if self.session is not snapshot.session:
+                try:
+                    await self.session.call(self.session.ready, operation=None)
+                except Exception as error:
+                    raise WorkerLifecycleError("Cannot reset YT data worker") from error
+            async with contextlib.aclosing(
+                reader.read_part(
+                    part=part,
+                    compression_level=compression_level,
+                    chunk_size=chunk_size,
+                )
+            ) as chunks:
+                async for chunk in chunks:
+                    yield chunk
+        finally:
+            # read_part owns normal cleanup; a failed ready() has no open stream.
+            snapshot.readers.discard(reader)
+            self._reader = None
 
     @contextlib.asynccontextmanager
     async def _transaction(self) -> AsyncIterator[_Session]:
@@ -978,7 +1108,17 @@ class YtWorker(YtBackend):
                     _read_document, client=session.client, pinned="#" + node.node_id
                 )
                 node = replace(node, data_size=len(document))
-            yield Snapshot(session=session, node=node, document=document)
+            snapshot = Snapshot(session=session, node=node, document=document)
+            try:
+                yield snapshot
+            except BaseException:
+                try:
+                    await snapshot.close()
+                except BaseException:
+                    log.exception("snapshot_cleanup_failed path=%s", path)
+                raise
+            else:
+                await snapshot.close()
 
     async def matches(self, *, path: str, fingerprint: str) -> bool:
         """Check whether a completed restore still matches its fingerprint."""
