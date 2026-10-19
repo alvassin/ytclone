@@ -16,14 +16,25 @@ log = logging.getLogger(__name__)
 
 @dataclass(eq=False)
 class _Job:
+    """Track all ranges and their completion for one exported node."""
+
+    # Remaining ranges after next_part.
     parts: Iterator[Range]
+    # Next unassigned range while not exhausted.
     next_part: Range
+    # Copy one range to storage and return its archive metadata.
     transfer: Transfer
+    # Allow multiple active ranges for this node (not allowed for files and documents).
     parallel: bool
+    # Completion signal; check error for success.
     done: asyncio.Future[None]
+    # Assigned ranges that have not finished.
     active: int = 0
+    # No more ranges to assign; active ones may remain.
     exhausted: bool = False
+    # First failure or cancellation.
     error: BaseException | None = None
+    # Successful results in completion order; copy() sorts by range index.
     completed: list[tuple[int, Part]] = field(default_factory=list)
 
 
