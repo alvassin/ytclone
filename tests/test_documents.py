@@ -22,6 +22,7 @@ from ytclone.format import (
     Range,
     attributes_hash,
     data_key,
+    generation_prefix,
     make_fingerprint,
     plan_parts,
 )
@@ -75,9 +76,16 @@ def archive_record(size=1):
         attributes=binary({}),
         data_size=size,
     )
-    ref = ObjectRef(key="archive/@data/part-000000.yson.zst", size=10, sha256="a" * 64)
+    generation = "1" * 32
+    prefix = generation_prefix(prefix="archive", generation=generation)
+    ref = ObjectRef(
+        key=data_key(prefix=prefix, kind="document", index=0),
+        size=10,
+        sha256="a" * 64,
+    )
     return node, Manifest(
         kind="document",
+        generation=generation,
         source={
             "cluster": "test",
             "path": node.path,
@@ -85,13 +93,13 @@ def archive_record(size=1):
             "content_revision": 1,
         },
         fingerprint="b" * 64,
-        attributes=replace(ref, key="archive/@attributes.yson"),
+        attributes=replace(ref, key=prefix + "/@attributes.yson"),
         parts=(Part(object=ref, start=0, stop=size),),
         data_size=size,
     )
 
 
-def test_document_format_requires_one_complete_value_and_preserves_legacy_encoding():
+def test_document_format_requires_one_complete_value_and_declares_node_encoding():
     node, manifest = archive_record(100)
     assert list(plan_parts(node=node, part_size=1)) == [
         Range(index=0, start=0, stop=100)
@@ -113,7 +121,13 @@ def test_document_format_requires_one_complete_value_and_preserves_legacy_encodi
                     manifest.parts[0],
                     object=replace(
                         manifest.parts[0].object,
-                        key="archive/@data/part-000001.yson.zst",
+                        key=data_key(
+                            prefix=generation_prefix(
+                                prefix="archive", generation=manifest.generation
+                            ),
+                            kind="document",
+                            index=1,
+                        ),
                     ),
                     start=50,
                 ),
@@ -325,21 +339,21 @@ def test_document_snapshot_reads_pinned_value_despite_source_changes():
 @pytest.mark.parametrize(
     "kind,expected",
     [
-        ("table", "1b36127893bc99184412e9e3e7175876ae4a3995eb61a363e29cce08a9fea76b"),
-        ("file", "24a1247857886633f85cb069e84956396d68c307717dd278792bce6ac017bf35"),
+        ("table", "e05331e37c1e18c482c29ce9452934e5903989b33d5021d46e2132d44130eeae"),
+        ("file", "20138b68b70da7961e8d28f80900d30f49914e15c679a0405746116d852bf4cf"),
         (
             "map_node",
-            "947474aa509f558c5e1870104052f8f6fb00ee539273ae31f9d6a47ed0f6724f",
+            "ffa26630d892e19ebb6c5772267754990c5c62e59c4cf024a45d36f1cf995914",
         ),
     ],
 )
-def test_legacy_fingerprints_and_manifest_encodings_are_unchanged(kind, expected):
+def test_v2_fingerprints_and_manifest_encodings_for_regular_nodes(kind, expected):
     node, manifest = archive_record()
     node = replace(node, kind=kind, data_size=0)
     assert (
         make_fingerprint(node=node, cluster="test", compression_level=3, part_size=40)
         == expected
     )
-    legacy = replace(manifest, kind=kind, data_size=0, parts=())
-    assert json.loads(legacy.to_bytes())["encoding"] == ENCODING
-    assert Manifest.from_bytes(legacy.to_bytes()) == legacy
+    regular = replace(manifest, kind=kind, data_size=0, parts=())
+    assert json.loads(regular.to_bytes())["encoding"] == ENCODING
+    assert Manifest.from_bytes(regular.to_bytes()) == regular

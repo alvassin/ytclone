@@ -20,7 +20,7 @@ import ytclone.yt as yt_adapter
 from ytclone.engine import CopyOptions, export_node, export_tree, restore_tree
 from ytclone.export_pool import PartPool
 from ytclone.format import MIB, RESTORE_MARKER, ROW_FORMAT, Manifest, node_prefix
-from ytclone.interfaces import RetryableReadError
+from ytclone.interfaces import PublicationConflict, RetryableReadError
 from ytclone.progress import Progress
 from ytclone.s3 import S3Storage
 from ytclone.yt import YtAdapter
@@ -51,6 +51,75 @@ def rows(*, client, path):
         )
     ) as stream:
         return list(yson.load(stream=stream, yson_type="list_fragment", encoding=None))
+
+
+def test_local_s3_conditional_publication_preserves_winning_manifest():
+    """Require real S3 create-only and ETag guards, including competing writers."""
+    key = "conditional-smoke-" + uuid.uuid4().hex + "/@manifest.json"
+
+    async def scenario():
+        async with aiohttp.ClientSession() as session:
+            client = S3Client(
+                session=session,
+                url="http://localhost:8333/yt-backup",
+                access_key_id="local-bench",
+                secret_access_key="local-bench-secret",
+                region="us-east-1",
+            )
+            storage = S3Storage(client=client, chunk_size=5 * MIB)
+            try:
+                assert await storage.read_versioned(key=key) is None
+                await storage.put_conditional(key=key, data=b"first", etag=None)
+                first = await storage.read_versioned(key=key)
+                assert first is not None
+                assert first.data == b"first" and first.etag
+
+                with pytest.raises(PublicationConflict):
+                    await storage.put_conditional(
+                        key=key, data=b"second create", etag=None
+                    )
+                assert await storage.read_versioned(key=key) == first
+
+                await storage.put_conditional(
+                    key=key, data=b"replacement", etag=first.etag
+                )
+                replacement = await storage.read_versioned(key=key)
+                assert replacement is not None
+                assert replacement.data == b"replacement"
+                assert replacement.etag and replacement.etag != first.etag
+
+                with pytest.raises(PublicationConflict):
+                    await storage.put_conditional(
+                        key=key, data=b"stale writer", etag=first.etag
+                    )
+                assert await storage.read_versioned(key=key) == replacement
+
+                ready = asyncio.Event()
+
+                async def publish(data):
+                    await ready.wait()
+                    await storage.put_conditional(
+                        key=key, data=data, etag=replacement.etag
+                    )
+
+                candidates = (b"concurrent writer A", b"concurrent writer B")
+                tasks = [asyncio.create_task(publish(data)) for data in candidates]
+                ready.set()
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                assert sum(result is None for result in results) == 1, results
+                assert (
+                    sum(isinstance(result, PublicationConflict) for result in results)
+                    == 1
+                ), results
+                winner = candidates[results.index(None)]
+                current = await storage.read_versioned(key=key)
+                assert current is not None
+                assert current.data == winner
+                assert current.etag and current.etag != replacement.etag
+            finally:
+                await storage.delete(key=key)
+
+    asyncio.run(scenario())
 
 
 def test_local_allowed_subtree_without_ancestor_read_does_not_follow_links():

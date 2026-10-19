@@ -4,7 +4,8 @@ Copy static tables, files, YSON documents, and directories between YTsaurus and 
 preserving schemas and portable attributes. Repeat a command to skip completed, unchanged
 nodes and retry unfinished copies.
 
-Restoring from S3 requires an archive created by `ytclone`.
+Restoring from S3 requires a `yt-s3-v2` archive created by `ytclone`. Earlier archive
+formats are rejected; re-export the source to a new S3 prefix.
 
 ## Installation
 
@@ -102,16 +103,22 @@ archives with `ytclone` as above. Restore reads each node's parts sequentially.
 
 - **Supported node types:** static tables, files, YSON documents, and directories.
   Dynamic tables are skipped and reported; links are unsupported.
-- **One current S3 copy.** There is no archive version history. Replacing a node
-  makes its archive unavailable until completion; a failed replacement can lose
-  the previous complete copy.
+- **One current S3 generation.** An update uploads new objects before atomically
+  publishing its manifest, then immediately deletes the previous generation.
+  A failed upload leaves the previous copy available. Crashes or cleanup errors
+  can leave unused objects; there is no automatic garbage collection.
 - **Permissions are not copied.** ACLs, ownership, and account settings are
   excluded. Replacing an existing YT table, file, or document recreates the node,
   so its previous settings are not preserved either.
 - **Consistency is per node.** A directory tree is not a single point-in-time
   snapshot.
-- **Avoid overlapping writers.** Do not run commands that write to the same
-  destination nodes concurrently, or restore an archive while it is being replaced.
+- **Concurrent exports detect conflicts.** Writers use separate generations and
+  conditional manifest publication; a competing update can fail the node instead
+  of overwriting another writer. The S3 backend must honor conditional PUTs and
+  provide atomic object visibility with ETags. Concurrent writes to the same YT
+  restore destination are unsupported.
+- **Restore pins one generation.** If an export replaces and deletes it, restore
+  fails and rolls back the unfinished node. Rerun restore to use the new generation.
 
 ## Documentation
 

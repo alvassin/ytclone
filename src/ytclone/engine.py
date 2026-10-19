@@ -2,10 +2,10 @@
 
 import asyncio
 import logging
-import re
 import time
 from contextlib import aclosing
 from dataclasses import dataclass, replace
+from uuid import uuid4
 
 import aiomisc
 from aiochannel import Channel
@@ -22,6 +22,7 @@ from .format import (
     Part,
     Range,
     data_key,
+    generation_prefix,
     make_fingerprint,
     matches_discovery,
     node_prefix,
@@ -230,20 +231,18 @@ class _SourceProgress:
         self.progress.source_skipped_bytes += self.skipped
 
 
-async def _export_manifest(*, storage: ObjectStorage, prefix: str) -> Manifest | None:
-    """Read an existing export manifest, allowing invalid archives to be repaired."""
-    data = await storage.read_bytes(
+async def _export_manifest(
+    *, storage: ObjectStorage, prefix: str
+) -> tuple[Manifest | None, str | None]:
+    """Read the manifest and its publication guard from the same object version."""
+    stored = await storage.read_versioned(
         key=object_key(prefix=prefix, name="@manifest.json")
     )
-    if data is None:
-        return None
-    try:
-        manifest = Manifest.from_bytes(data)
-        validate_manifest_location(manifest=manifest, prefix=prefix)
-    except ValueError:
-        log.warning("manifest_invalid prefix=%s action=replace", prefix)
-        return None
-    return manifest
+    if stored is None:
+        return None, None
+    manifest = Manifest.from_bytes(stored.data)
+    validate_manifest_location(manifest=manifest, prefix=prefix)
+    return manifest, stored.etag
 
 
 async def _complete(*, storage: ObjectStorage, manifest: Manifest) -> bool:
@@ -374,6 +373,7 @@ async def export_node(
     progress = progress if progress is not None else Progress()
     with _SourceProgress(progress=progress) as source_progress:
         old = None
+        etag = None
         complete = None
         if discovered is not None:
             if discovered.kind not in KINDS:
@@ -383,7 +383,7 @@ async def export_node(
                 source_progress.skip()
                 return "skipped", "dynamic"
 
-            old = await _export_manifest(storage=storage, prefix=target)
+            old, etag = await _export_manifest(storage=storage, prefix=target)
             if old is not None and matches_discovery(
                 manifest=old,
                 node=discovered,
@@ -413,7 +413,7 @@ async def export_node(
                 part_size=options.part_size,
             )
             if discovered is None:
-                old = await _export_manifest(storage=storage, prefix=target)
+                old, etag = await _export_manifest(storage=storage, prefix=target)
             if old is not None and old.fingerprint == fingerprint:
                 if complete is None:
                     complete = await _complete(storage=storage, manifest=old)
@@ -421,17 +421,17 @@ async def export_node(
 
             if not unchanged:
                 pool.check()
-                # Readers must not see the previous manifest while its objects change.
-                await storage.delete(key=manifest_key)
+                generation = uuid4().hex
+                staged = generation_prefix(prefix=target, generation=generation)
                 attributes = await storage.put_bytes(
-                    key=object_key(prefix=target, name="@attributes.yson"),
+                    key=object_key(prefix=staged, name="@attributes.yson"),
                     data=node.attributes,
                 )
                 parts = await _export_parts(
                     pool=pool,
                     snapshot=snapshot,
                     storage=storage,
-                    target=target,
+                    target=staged,
                     options=options,
                     source_progress=source_progress,
                 )
@@ -441,21 +441,16 @@ async def export_node(
         if unchanged:
             if node.attribute_revision is not None and old.source != source:
                 refreshed = replace(old, source=source)
-                await storage.put_bytes(key=manifest_key, data=refreshed.to_bytes())
+                await storage.put_conditional(
+                    key=manifest_key, data=refreshed.to_bytes(), etag=etag
+                )
                 log.info("manifest_refreshed path=%s", path)
             source_progress.skip()
             return "skipped", "unchanged"
 
         # Snapshot exit may fail; publication must happen strictly afterwards.
-        keep = {part.object.key for part in parts}
-        data_prefix = object_key(prefix=target, name="@data/")
-        async for key in storage.list_keys(prefix=data_prefix):
-            if key not in keep and re.fullmatch(
-                r"part-\d+\.(?:yson|bin)\.zst", key[len(data_prefix) :]
-            ):
-                await storage.delete(key=key)
-
         manifest = Manifest(
+            generation=generation,
             kind=node.kind,
             source=source,
             fingerprint=fingerprint,
@@ -464,11 +459,24 @@ async def export_node(
             row_count=node.row_count,
             data_size=node.data_size,
         )
-        await storage.put_bytes(key=manifest_key, data=manifest.to_bytes())
+        # Failed/uncertain publication keeps both generations. Our request may
+        # already have committed and been superseded before we see its response.
+        await storage.put_conditional(
+            key=manifest_key, data=manifest.to_bytes(), etag=etag
+        )
         progress.completed_bytes += sum(part.object.size for part in parts)
         source_progress.complete()
-        log.info("node_timing path=%s seconds=%.3f", path, time.monotonic() - started)
-        return "completed", "copied"
+
+    # Only our confirmed predecessor is obsolete. Other generations may still be
+    # uploading, or may already have replaced ours. Cleanup cannot undo publication.
+    if old is not None:
+        for ref in (old.attributes, *(part.object for part in old.parts)):
+            try:
+                await storage.delete(key=ref.key)
+            except Exception:
+                log.warning("generation_cleanup_failed key=%s", ref.key, exc_info=True)
+    log.info("node_timing path=%s seconds=%.3f", path, time.monotonic() - started)
+    return "completed", "copied"
 
 
 async def export_tree(
@@ -604,6 +612,8 @@ def _node_from_key(*, key: str, source_prefix: str) -> str | None:
         raise ValueError("Listing key escapes selected source prefix")
     components = key[len(base) :].split("/")
     for index, name in enumerate(components):
+        if name == "@generations" and index + 1 < len(components):
+            return (base + "/".join(components[:index])).rstrip("/")
         if name == "@data" and index + 1 < len(components):
             return (base + "/".join(components[:index])).rstrip("/")
         if (
@@ -674,6 +684,14 @@ async def restore_tree(
                 result.completed += 1
                 log.info("node_completed path=%s reason=%s", path, reason)
         else:
+            async with aclosing(
+                storage.list_keys(
+                    prefix=object_key(prefix=prefix, name="@generations/")
+                )
+            ) as keys:
+                async for _ in keys:
+                    found(prefix)
+                    raise ValueError(f"Incomplete archive directory: {prefix}")
             # A virtual parent is legitimate when only a descendant was exported.
             if (
                 await storage.read_bytes(

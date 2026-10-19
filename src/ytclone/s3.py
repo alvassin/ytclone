@@ -14,7 +14,12 @@ import aiohttp
 from aiohttp_s3_client import S3Client
 
 from .format import MIB, ObjectRef
-from .interfaces import ObjectStorage, RetryableDownloadError
+from .interfaces import (
+    ObjectStorage,
+    PublicationConflict,
+    RetryableDownloadError,
+    StoredBytes,
+)
 from .progress import Progress
 from .s3_retry import is_retryable_error, retry
 
@@ -78,6 +83,58 @@ class S3Storage(ObjectStorage):
         if self.progress is None:
             return nullcontext()
         return self.progress.measure(operation=operation)
+
+    @retry
+    async def read_versioned(self, *, key: str) -> StoredBytes | None:
+        """Read a manifest and its opaque concurrency token in one GET."""
+        with self._measure():
+            async with self.client.get(object_name=key) as response:
+                if response.status == 404:
+                    return None
+                response.raise_for_status()
+                data = await response.read()
+                etag = response.headers.get("ETag")
+                if not etag:
+                    raise ValueError(f"S3 did not return an object ETag: {key}")
+                return StoredBytes(data=data, etag=etag)
+
+    @retry
+    async def _put_conditional(
+        self, *, key: str, data: bytes, etag: str | None
+    ) -> None:
+        """Retry publication with the original condition on every attempt."""
+        headers = {"If-None-Match": "*"} if etag is None else {"If-Match": etag}
+        with self._measure():
+            async with self.client.put(
+                object_name=key,
+                data=data,
+                content_sha256=hashlib.sha256(data).hexdigest(),
+                headers=headers,
+            ) as response:
+                response.raise_for_status()
+                await response.read()
+
+    async def put_conditional(self, *, key: str, data: bytes, etag: str | None) -> None:
+        """Publish atomically and recognize a committed PUT with a lost reply."""
+        try:
+            await self._put_conditional(key=key, data=data, etag=etag)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            conflict = isinstance(
+                error, aiohttp.ClientResponseError
+            ) and error.status in (409, 412)
+            if not conflict and not is_retryable_error(error):
+                raise
+            # A retry can fail its condition because our first PUT committed.
+            # Compare the complete manifest, never just its hash or generation.
+            # A failure to read it leaves the outcome unknown to the caller.
+            if await self.read_bytes(key=key) == data:
+                log.info("manifest_publication_recovered key=%s", key)
+                return
+            if conflict:
+                raise PublicationConflict(
+                    f"S3 manifest changed during publication: {key}"
+                ) from error
+            raise
 
     @retry
     async def read_bytes(self, *, key: str) -> bytes | None:

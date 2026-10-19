@@ -12,15 +12,22 @@ and directories carry metadata.
 ```text
 s3://my-bucket/export/
 └── home/analytics/events/
-    ├── @attributes.yson
     ├── @manifest.json
+    ├── @generations/<directory-generation>/
+    │   └── @attributes.yson
     └── 2026-01-01/
-        ├── @attributes.yson
         ├── @manifest.json
-        └── @data/
-            ├── part-000000.yson.zst
-            └── part-000001.yson.zst
+        └── @generations/<table-generation>/
+            ├── @attributes.yson
+            └── @data/
+                ├── part-000000.yson.zst
+                └── part-000001.yson.zst
 ```
+
+Each generation ID is a random UUID represented by 32 lowercase hexadecimal
+digits. The node manifest declares that generation and references only its exact
+attributes and ordered part keys. Generation objects are immutable; only the
+node's `@manifest.json` is replaced when publishing an update.
 
 Tables use binary YSON row fragments compressed with Zstandard. Files use compressed
 byte ranges (`.bin.zst`). Documents use exactly one binary YSON node compressed
@@ -39,12 +46,11 @@ settings are excluded. The user attribute `yt_s3_state` is reserved for completi
 metadata. Directory attributes are updated without removing unrelated children;
 replacing a directory with a table, file or document, or vice versa, is rejected.
 
-The archive format identifier remains `yt-s3-v1`, and the restore completion
-attribute remains `yt_s3_state`. Both names are retained for compatibility with
-existing archives and restored nodes created by `yt-s3`. Only document manifests
-extend `encoding` with `documents: binary_yson_node`; existing kinds keep their
-encoding and fingerprints unchanged. New readers accept old archives; old readers
-reject document manifests and cannot fully restore a tree containing documents.
+The archive format identifier is `yt-s3-v2`; older formats are rejected by both
+export and restore. Re-export the source to a new archive prefix rather than
+updating an old archive in place. The restore completion attribute remains
+`yt_s3_state`, and fingerprints include the new format identifier. Only document
+manifests extend `encoding` with `documents: binary_yson_node`.
 
 Documents are read through `/@value` under the same snapshot lock as their metadata.
 Node attributes are read separately through `/@`, so attributes on the YSON value
@@ -67,9 +73,9 @@ the full fingerprint: source cluster, node ID, content revision, a hash of the
 saved attributes (including schema), and archive encoding settings. A mismatch
 requires copying. The manifest's revisions come from the snapshot actually copied.
 
-Older manifests without `attribute_revision` use this full check. If unchanged,
-only the manifest is updated after successful snapshot completion; data is not
-uploaded again. Subsequent runs can use the listing check.
+When source revision metadata needs refreshing but the full fingerprint is
+unchanged, only the manifest is conditionally updated after successful snapshot
+completion; data is not uploaded again. Subsequent runs can use the listing check.
 
 A fast skip reflects the state observed during discovery; changes after that
 observation are picked up on a later run. Revision-based detection assumes writers
@@ -92,20 +98,40 @@ checksums verify data as it is transferred.
 
 ## Completion and replacement
 
-The manifest records the source fingerprint and references the attributes object
-and ordered data parts, with sizes and checksums. It is written last: without it,
-an S3 node is incomplete. A directory manifest confirms its own metadata, not
-completion of its descendants.
+The manifest records the generation, source fingerprint, attributes object, and
+ordered data parts, with sizes and checksums. Without a manifest, an S3 node is
+incomplete. A directory manifest confirms its own metadata, not completion of its
+descendants.
 
-S3 keeps **one current copy, without version history**. Replacing a node removes
-its manifest before changing data and publishes a new manifest when finished.
-The node is unavailable during replacement, and a failed replacement may lose the
-previous complete copy. Reading a node while it is being replaced, or writing it
-from multiple processes at once, is not supported.
+S3 keeps **one current generation, without version history**. Export reads the
+existing manifest and its ETag, then writes a unique generation while retaining
+the old manifest and objects. Once every upload and the source snapshot have
+succeeded, it atomically publishes the manifest with `If-Match` for that ETag, or
+`If-None-Match: *` if the node had no manifest. Metadata-only manifest refreshes
+use the same conditional publication protocol.
 
-A successful replacement removes obsolete parts for that node. An interruption
-can leave data without a manifest or unfinished S3 multipart uploads; these need
-a retry or cleanup.
+Concurrent exporters write different generations. Only a writer whose expected
+manifest still matches can publish; a conflict fails that node without overwriting
+the winner. The writer does not automatically rebase an older snapshot onto a
+newer manifest. A lost publication acknowledgement is checked against the stored
+manifest, and an unresolved outcome retains the uploaded objects. These guarantees
+require the S3 backend to honor conditional PUTs and provide atomic object
+visibility with ETags; they are not implied merely by an S3-compatible API.
+
+After confirmed publication, export immediately deletes only the attributes and
+parts referenced by the exact manifest it replaced. It never deletes all
+generations except the current one: those might belong to another active writer.
+A cleanup failure is a warning and does not invalidate the published backup.
+Crashes, failed or conflicted uploads, uncertain publication outcomes, and
+interrupted cleanup can leave unused generations. There is no automatic global
+garbage collection or TTL. A later export only cleans its direct predecessor.
+Unknown unfinished S3 multipart uploads also require a bucket lifecycle rule or
+manual cleanup.
+
+Restore reads one manifest and continues using that generation. A concurrent
+export can delete it before restore finishes; missing objects fail the restore
+and roll back its unfinished node. Restore does not automatically switch
+generations. Rerun it to select the current manifest.
 
 YT destinations use a transaction per node to avoid exposing partial tables, files
 or documents. When a table, file or document needs copying, an existing destination
@@ -116,7 +142,7 @@ and inheritance rules apply. Unchanged nodes are skipped without replacement.
 Existing directories are updated in place, keeping their identity, non-portable
 settings and unrelated children while replacing their portable attributes.
 
-Consistency is per table or file; a directory tree is not a single
+Consistency is per node; a directory tree is not a single
 point-in-time snapshot. Moving or replacing directories during a copy can change
 which children are discovered; rerun after such changes to reconcile the tree.
 
@@ -225,7 +251,7 @@ sequenceDiagram
     participant S as S3Storage<br/>S3Client
 
     D-->>W: Enqueue path, ID, type and revisions from LIST
-    W->>S: Read manifest once
+    W->>S: Read manifest and ETag once
     alt Revisions and copy settings match
         W->>S: Check referenced object sizes
     end
@@ -237,15 +263,16 @@ sequenceDiagram
         alt Full fingerprint matches and objects exist
             W->>Y: Successfully finish snapshot transaction
             opt Snapshot revision is missing or outdated in manifest
-                W->>S: Refresh only the manifest
+                W->>S: Refresh manifest conditionally on its ETag
             end
             Note over W: Report skipped
         else Copy required
-            W->>S: Delete old manifest, upload attributes
+            W->>S: Upload attributes to a new unique generation
+            Note over W,S: Keep the previous manifest and generation available
             W->>P: Register lazy ranges and shared snapshot
             loop Concurrent ranges, up to the shared stream limit
                 P->>P: Read snapshot range, compress with zstd
-                P->>S: Upload part, record size and SHA-256
+                P->>S: Upload generation part, record size and SHA-256
                 opt Temporary table-read failure
                     P->>S: Abort unfinished multipart upload
                     P->>P: Reopen the same range in the same snapshot
@@ -254,9 +281,14 @@ sequenceDiagram
             end
             P-->>W: All ranges complete, results in range order
             W->>Y: Successfully finish snapshot transaction
-            W->>S: Remove obsolete parts of this node
-            W->>S: Write manifest last, with snapshot revisions
-            Note over W,S: The archive node is complete
+            W->>S: Publish manifest with If-Match, or create-only
+            alt Publication confirmed
+                Note over W,S: The new archive generation is complete
+                W->>S: Delete exact references from the replaced manifest
+                Note over W,S: Cleanup failure warns; the published backup remains valid
+            else Conflict or unresolved publication
+                Note over W,S: Fail node; retain uploaded objects
+            end
         end
     end
 ```

@@ -14,6 +14,28 @@ copy. Use `ytclone --help` or `ytclone-parallel --help` for the full option list
 For local Docker YTsaurus, use `--yt-proxy http://localhost:8000` with
 `--no-proxy-discovery`. See [local integration tests](CONTRIBUTING.md#test-with-local-ytsaurus-and-s3).
 
+The S3 backend must honor `If-Match` and `If-None-Match: *` on object PUTs and
+provide atomic object visibility with ETags. S3 API compatibility alone does not
+establish these guarantees; verify them for the service you use.
+
+## Archive compatibility and updates
+
+Only the `yt-s3-v2` archive format is supported. Existing older archives are
+rejected on export and restore; re-export the source to a new S3 prefix. There is
+no in-place format migration.
+
+An updated node gets a new generation containing its attributes and data parts.
+The previous manifest remains visible until all uploads and the YT snapshot
+complete successfully. The new manifest is published conditionally, then the
+exact objects referenced by its predecessor are deleted immediately. No TTL or
+archive history is retained.
+
+A restore reads one manifest and uses that generation throughout. If a concurrent
+export deletes its generation, the unfinished restore fails and rolls back; it
+does not automatically switch to another generation. Rerun restore to use the
+current manifest. These guarantees apply per node, not to a snapshot of the
+entire directory tree.
+
 ## Standalone downloads
 
 Download an archive and its matching `.tar.gz.sha256` file from
@@ -145,8 +167,10 @@ that process's N streams. This command supports YT → S3 only.
 With `--log-file export.log`, workers write `export-worker-N.log`. The coordinator
 aggregates node and byte counts, but not worker ETA, source-size estimates, or
 request timings. An abrupt worker death can lose its last unreported byte counts.
-Do not start another copy targeting the same nodes; coordination is limited to
-one invocation.
+Independent exports may target the same archive nodes. Their conditional manifest
+writes detect competing updates and fail the conflicting node; they never blindly
+overwrite another publication. Coordinator scheduling remains local to one
+invocation.
 
 ## Errors and recovery
 
@@ -155,6 +179,9 @@ Temporary failures are retried automatically and logged:
 - **Table reads:** retry the failed archive part within the same snapshot, up to
   three attempts. A lost snapshot fails the node.
 - **S3 requests:** up to 30 attempts, with a 45-minute budget per retried request.
+  Conditional publication conflicts stop that node rather than rebasing its
+  snapshot onto a newer manifest. A lost publication acknowledgement is checked
+  against the stored manifest before treating the publication as successful.
 - **Restore:** after a confirmed rollback, retry the entire node in a new
   transaction, up to 30 attempts. Permission and checksum errors are not retried.
 
@@ -166,6 +193,13 @@ On an export error, the node stops scheduling new ranges and waits for its activ
 ranges to finish cleanup before closing the snapshot. Cancellation also drains
 active range workers before closing their snapshots. The manifest is published
 only after all parts and the snapshot have completed successfully.
+
+Failed or interrupted uploads leave the previous manifest and its generation
+available. A cleanup failure after confirmed publication is logged as a warning:
+the new backup is complete, but old objects may remain. Crashed or conflicted
+uploads, uncertain publication outcomes, and interrupted cleanup can leave unused
+generations. There is no automatic global garbage collection; a later successful
+export deletes only the generation it directly replaces, not all older objects.
 
 After fixing a failure, [rerun the command](README.md#repeated-runs). Completed,
 unchanged nodes are skipped; an unfinished table, file, or document starts from
