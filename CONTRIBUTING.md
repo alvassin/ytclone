@@ -69,9 +69,14 @@ copies, changed metadata, empty nodes, file parts, corruption rollback, and
 table-read retries within a snapshot. Document tests also cover scalar, empty and
 attributed YSON, a value exceeding the default node-list limit, concurrent source
 changes, changed destinations, and corrupt-archive rollback. The CLI roundtrips
-cover six nodes using two real worker processes and a single table using
-`--concurrency 1 --max-streams 3`. Both restore the data and repeat the commands
-to verify unchanged objects are skipped.
+cover six nodes using two real worker processes and a 24 MiB table using
+`--concurrency 1 --max-streams 3` with both CLI commands. They run with and without
+`--yt-zstd-passthrough`, restore without the flag, and repeat the commands to
+verify unchanged objects are skipped. The large table exercises multiple archive
+parts and S3 multipart uploads. Tests also read the stored objects, verify their
+checksums, and decode every Zstandard frame: passthrough must retain multiple
+proxy frames per part, while local compression produces one frame. This catches
+a flag that is accepted but not forwarded to the table readers.
 
 Fixtures are retained for inspection while the local containers and their storage
 exist. To stop the services while keeping containers and data:
