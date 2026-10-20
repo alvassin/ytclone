@@ -9,12 +9,13 @@ from xml.etree import ElementTree as ET
 
 import aiomisc
 import pytest
-from aiohttp import ClientResponseError, ClientSession, web
+from aiohttp import ClientError, ClientResponseError, ClientSession, web
 from aiohttp_s3_client import S3Client
 
 from ytclone import s3 as storage_module
 from ytclone import s3_retry
 from ytclone.format import MIB, ObjectRef
+from ytclone.interfaces import PublicationConflict, StoredBytes
 from ytclone.s3 import IntegrityError, S3Storage, _multipart_chunks
 
 
@@ -40,6 +41,10 @@ class Server:
         self.list_queries = []
         self.put_failures = []
         self.put_requests = []
+        self.put_conditions = []
+        self.lost_put_responses = 0
+        self.lost_put_after_headers = False
+        self.competing_write = None
         self.complete_error = False
         self.abort_status = 204
         self.missing_etag = False
@@ -75,7 +80,12 @@ class Server:
                 await response.write(self.objects[key])
                 await response.write_eof()
                 return response
-            return web.Response(body=self.objects[key])
+            headers = (
+                {}
+                if self.missing_etag
+                else {"ETag": '"' + hashlib.md5(self.objects[key]).hexdigest() + '"'}
+            )
+            return web.Response(body=self.objects[key], headers=headers)
         if request.method == "POST" and "uploads" in query:
             return web.Response(
                 body=b'<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
@@ -84,17 +94,39 @@ class Server:
         if request.method == "PUT":
             data = await request.read()
             self.put_requests.append((key, query, data))
+            self.put_conditions.append(
+                (request.headers.get("If-Match"), request.headers.get("If-None-Match"))
+            )
             assert (
                 request.headers["x-amz-content-sha256"]
                 == hashlib.sha256(data).hexdigest()
             )
             if self.put_failures:
                 return web.Response(status=self.put_failures.pop(0))
+            if request.headers.get("If-None-Match") == "*" and key in self.objects:
+                return web.Response(status=412)
+            expected = request.headers.get("If-Match")
+            if expected is not None and (
+                key not in self.objects
+                or expected != '"' + hashlib.md5(self.objects[key]).hexdigest() + '"'
+            ):
+                return web.Response(status=412)
             if "partNumber" in query:
                 self.parts[int(query["partNumber"])] = data
                 self.part_uploaded.set()
             else:
                 self.objects[key] = data
+            if self.lost_put_responses:
+                self.lost_put_responses -= 1
+                if self.competing_write is not None:
+                    self.objects[key] = self.competing_write
+                if self.lost_put_after_headers:
+                    response = web.StreamResponse(headers={"Content-Length": "1"})
+                    await response.prepare(request)
+                    request.transport.close()
+                    return response
+                request.transport.close()
+                return web.Response()
             headers = (
                 {}
                 if self.missing_etag
@@ -169,7 +201,194 @@ def test_small_objects_and_encoded_keys_round_trip():
     assert not server.objects
 
 
-@pytest.mark.parametrize("method", ["read", "exists", "delete", "download", "list"])
+def test_versioned_read_and_conditional_create_update():
+    """Read the exact token and preserve it when replacing a manifest."""
+    server = Server()
+    progress = Telemetry()
+    key = "folder/текст/@manifest.json"
+    first, second = b"first manifest", b"second manifest"
+
+    async def scenario():
+        async with server.storage(progress=progress) as storage:
+            assert await storage.read_versioned(key=key) is None
+            await storage.put_conditional(key=key, data=first, etag=None)
+            stored = await storage.read_versioned(key=key)
+            assert stored == StoredBytes(
+                data=first, etag='"' + hashlib.md5(first).hexdigest() + '"'
+            )
+            await storage.put_conditional(key=key, data=second, etag=stored.etag)
+            assert await storage.read_bytes(key=key) == second
+            assert server.put_conditions == [(None, "*"), (stored.etag, None)]
+            assert len(progress.events) == len(server.requests)
+            assert progress.transferred_bytes == 0
+
+    run(scenario())
+
+
+def test_versioned_read_requires_etag_but_read_bytes_does_not():
+    """A backend without a concurrency token must fail before publication."""
+    server = Server()
+    server.objects["manifest"] = b"current"
+    server.missing_etag = True
+
+    async def scenario():
+        async with server.storage() as storage:
+            with pytest.raises(ValueError, match="object ETag"):
+                await storage.read_versioned(key="manifest")
+            assert await storage.read_bytes(key="manifest") == b"current"
+
+    run(scenario())
+    assert [method for method, _, _ in server.requests] == ["GET", "GET"]
+
+
+@pytest.mark.parametrize("etag", [None, '"outdated-etag"'])
+def test_conditional_publication_never_overwrites_competitor(etag):
+    """Both create and replacement conditions protect a competing manifest."""
+    server = Server()
+    server.objects["manifest"] = b"competitor"
+
+    async def scenario():
+        async with server.storage() as storage:
+            with pytest.raises(PublicationConflict, match="manifest changed"):
+                await storage.put_conditional(key="manifest", data=b"ours", etag=etag)
+
+    run(scenario())
+    assert server.objects["manifest"] == b"competitor"
+    assert [method for method, _, _ in server.requests] == ["PUT", "GET"]
+    assert server.put_conditions == [(etag, "*" if etag is None else None)]
+
+
+@pytest.mark.parametrize("status", [409, 412])
+@pytest.mark.parametrize("matching", [False, True])
+def test_conditional_conflict_checks_exact_current_body(status, matching):
+    """Only our complete manifest can resolve an ambiguous conflict as success."""
+    server = Server()
+    server.objects["manifest"] = b"ours" if matching else b"ours-plus-a-change"
+    server.put_failures = [status]
+
+    async def scenario():
+        async with server.storage() as storage:
+            if matching:
+                await storage.put_conditional(key="manifest", data=b"ours", etag=None)
+            else:
+                with pytest.raises(PublicationConflict):
+                    await storage.put_conditional(
+                        key="manifest", data=b"ours", etag=None
+                    )
+
+    run(scenario())
+    assert [method for method, _, _ in server.requests] == ["PUT", "GET"]
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+@pytest.mark.parametrize("competitor", [False, True])
+def test_lost_publication_response_retries_original_condition(
+    replacement, competitor, monkeypatch
+):
+    """A committed PUT can be recognized without overwriting a later writer."""
+    server = Server()
+    if replacement:
+        server.objects["manifest"] = b"previous"
+    server.lost_put_responses = 1
+    if competitor:
+        server.competing_write = b"later manifest"
+    monkeypatch.setattr(s3_retry, "retry_delay", lambda *, attempt: 0)
+    etag = '"' + hashlib.md5(b"previous").hexdigest() + '"' if replacement else None
+
+    async def scenario():
+        async with server.storage() as storage:
+            if competitor:
+                with pytest.raises(PublicationConflict):
+                    await storage.put_conditional(
+                        key="manifest", data=b"ours", etag=etag
+                    )
+            else:
+                await storage.put_conditional(key="manifest", data=b"ours", etag=etag)
+
+    run(scenario())
+    assert server.objects["manifest"] == (b"later manifest" if competitor else b"ours")
+    assert [method for method, _, _ in server.requests] == ["PUT", "PUT", "GET"]
+    assert server.put_conditions == [(etag, None if replacement else "*")] * 2
+
+
+@pytest.mark.parametrize("competitor", [False, True])
+def test_final_transport_failure_checks_publication_without_rewriting(
+    competitor, monkeypatch
+):
+    """After exhausting retries, a GET can prove success or retain uncertainty."""
+    server = Server()
+    server.lost_put_responses = 1
+    server.lost_put_after_headers = True
+    if competitor:
+        server.competing_write = b"later manifest"
+    monkeypatch.setattr(
+        s3_retry,
+        "_policy",
+        aiomisc.asyncbackoff(
+            attempt_timeout=None,
+            deadline=5,
+            pause=0,
+            max_tries=1,
+            exceptions=(ClientError, asyncio.TimeoutError),
+        ),
+    )
+
+    async def scenario():
+        async with server.storage() as storage:
+            if competitor:
+                with pytest.raises(ClientError):
+                    await storage.put_conditional(
+                        key="manifest", data=b"ours", etag=None
+                    )
+            else:
+                await storage.put_conditional(key="manifest", data=b"ours", etag=None)
+
+    run(scenario())
+    assert server.objects["manifest"] == (b"later manifest" if competitor else b"ours")
+    assert [method for method, _, _ in server.requests] == ["PUT", "GET"]
+    assert server.put_conditions == [(None, "*")]
+
+
+def test_conditional_publication_retries_transient_errors_with_same_condition(
+    monkeypatch,
+):
+    """Retries preserve both the intended bytes and the original opaque ETag."""
+    server = Server()
+    server.objects["manifest"] = b"previous"
+    server.put_failures = [500, 503, 429, 408]
+    monkeypatch.setattr(s3_retry, "retry_delay", lambda *, attempt: 0)
+    etag = '"' + hashlib.md5(b"previous").hexdigest() + '"'
+
+    async def scenario():
+        async with server.storage() as storage:
+            await storage.put_conditional(key="manifest", data=b"ours", etag=etag)
+
+    run(scenario())
+    assert server.objects["manifest"] == b"ours"
+    assert server.put_conditions == [(etag, None)] * 5
+    assert [body for _, _, body in server.put_requests] == [b"ours"] * 5
+
+
+def test_conditional_publication_does_not_fall_back_when_unsupported():
+    """A server rejecting conditional headers cannot receive an unconditional PUT."""
+    server = Server()
+    server.put_failures = [400]
+
+    async def scenario():
+        async with server.storage() as storage:
+            with pytest.raises(ClientResponseError) as error:
+                await storage.put_conditional(key="manifest", data=b"ours", etag=None)
+            assert error.value.status == 400
+
+    run(scenario())
+    assert server.objects == {}
+    assert server.put_conditions == [(None, "*")]
+    assert [method for method, _, _ in server.requests] == ["PUT"]
+
+
+@pytest.mark.parametrize(
+    "method", ["read", "read-versioned", "exists", "delete", "download", "list"]
+)
 def test_access_errors_are_not_interpreted_as_missing(method):
     server = Server()
     server.failure_status = 403
@@ -179,6 +398,8 @@ def test_access_errors_are_not_interpreted_as_missing(method):
             with pytest.raises(ClientResponseError, match="403"):
                 if method == "read":
                     await storage.read_bytes(key="data")
+                elif method == "read-versioned":
+                    await storage.read_versioned(key="data")
                 elif method == "exists":
                     await storage.exists(ref=reference())
                 elif method == "delete":
@@ -707,7 +928,9 @@ def test_progress_counts_all_data_parts_once_in_each_direction():
     run(scenario())
 
 
-@pytest.mark.parametrize("method", ["read", "exists", "delete", "list", "put", "abort"])
+@pytest.mark.parametrize(
+    "method", ["read", "read-versioned", "exists", "delete", "list", "put", "abort"]
+)
 def test_s3_operations_recover_after_multiple_transient_errors(method, monkeypatch):
     """Retry actual S3 requests beyond the old limit without counting delays as I/O."""
     server = Server()
@@ -731,6 +954,10 @@ def test_s3_operations_recover_after_multiple_transient_errors(method, monkeypat
         async with server.storage(progress=telemetry) as storage:
             if method == "read":
                 assert await storage.read_bytes(key="data") == b"payload"
+            elif method == "read-versioned":
+                stored = await storage.read_versioned(key="data")
+                assert stored.data == b"payload"
+                assert stored.etag == '"' + hashlib.md5(b"payload").hexdigest() + '"'
             elif method == "exists":
                 assert await storage.exists(ref=reference())
             elif method == "delete":

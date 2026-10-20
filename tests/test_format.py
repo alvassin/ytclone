@@ -12,9 +12,11 @@ from ytclone.format import (
     Node,
     ObjectRef,
     Part,
+    UnsupportedArchiveFormat,
     attributes_hash,
     canonical_attributes,
     data_key,
+    generation_prefix,
     make_fingerprint,
     matches_discovery,
     node_prefix,
@@ -24,6 +26,8 @@ from ytclone.format import (
     validate_manifest_location,
     verify_object,
 )
+
+GENERATION = "0123456789abcdef0123456789abcdef"
 
 
 def node(*, kind="table", size=7, attributes=None):
@@ -48,11 +52,12 @@ def fingerprint(value, *, cluster="test", compression_level=3, part_size=40):
     )
 
 
-def manifest():
-    prefix = "archive/source/table"
+def manifest(*, generation=GENERATION):
+    prefix = generation_prefix(prefix="archive/source/table", generation=generation)
     attrs = b"{}"
     return Manifest(
         kind="table",
+        generation=generation,
         source={
             "cluster": "test",
             "path": "//source/table",
@@ -171,6 +176,95 @@ def test_manifest_round_trip_and_object_verification():
         verify_object(data=b"[]", ref=value.attributes)
     with pytest.raises(ValueError):
         verify_object(data=b"{}\n", ref=value.attributes)
+
+
+def test_manifest_rejects_previous_archive_format_with_reexport_guidance():
+    raw = json.loads(manifest().to_bytes())
+    raw["format"] = "yt-s3-v1"
+    del raw["generation"]
+    with pytest.raises(
+        UnsupportedArchiveFormat, match="yt-s3-v1.*expected yt-s3-v2.*Re-export"
+    ):
+        Manifest.from_bytes(json.dumps(raw).encode())
+
+
+def test_manifest_requires_generation():
+    raw = json.loads(manifest().to_bytes())
+    del raw["generation"]
+    with pytest.raises(ValueError, match="Invalid archive manifest"):
+        Manifest.from_bytes(json.dumps(raw).encode())
+
+
+@pytest.mark.parametrize(
+    "generation",
+    [
+        None,
+        True,
+        1,
+        [],
+        {},
+        "",
+        "a" * 31,
+        "a" * 33,
+        "A" * 32,
+        "g" * 32,
+        "../escape",
+        "%2e%2e",
+        "01234567-89ab-cdef-0123-456789abcdef",
+    ],
+)
+def test_invalid_generation_cannot_be_decoded_or_used_in_a_prefix(generation):
+    raw = json.loads(manifest().to_bytes())
+    raw["generation"] = generation
+    with pytest.raises(ValueError, match="Invalid archive generation"):
+        Manifest.from_bytes(json.dumps(raw).encode())
+    with pytest.raises(ValueError, match="Invalid archive generation"):
+        generation_prefix(prefix="archive/source/table", generation=generation)
+
+
+@pytest.mark.parametrize(
+    "prefix", ["", "archive/source/table", "archive/source/table/"]
+)
+def test_generation_prefix_is_canonical(prefix):
+    expected = (
+        (prefix.rstrip("/") + "/" if prefix else "") + "@generations/" + GENERATION
+    )
+    assert generation_prefix(prefix=prefix, generation=GENERATION) == expected
+
+
+@pytest.mark.parametrize("target", ["attributes", "part"])
+@pytest.mark.parametrize(
+    "foreign_prefix",
+    [
+        "archive/source/table",
+        "archive/source/table/@generations/" + "b" * 32,
+        "archive/source/other/@generations/" + GENERATION,
+        "archive/source/table/@generations/" + GENERATION + "/..",
+        "archive/source/table/@generations/" + GENERATION + "/%2e%2e",
+    ],
+)
+def test_manifest_rejects_old_paths_cross_generation_and_traversal(
+    target, foreign_prefix
+):
+    value = manifest()
+    if target == "attributes":
+        value = replace(
+            value,
+            attributes=replace(
+                value.attributes, key=foreign_prefix + "/@attributes.yson"
+            ),
+        )
+    else:
+        part = value.parts[0]
+        part = replace(
+            part,
+            object=replace(
+                part.object, key=data_key(prefix=foreign_prefix, kind="table", index=0)
+            ),
+        )
+        value = replace(value, parts=(part, *value.parts[1:]))
+    with pytest.raises(ValueError, match="escapes selected generation"):
+        validate_manifest_location(manifest=value, prefix="archive/source/table")
 
 
 @pytest.mark.parametrize(
@@ -300,6 +394,7 @@ def discovery_case(*, kind="table"):
     snapshot = replace(node(kind=kind, size=0), attribute_revision=17)
     archived = Manifest(
         kind=kind,
+        generation=GENERATION,
         source={
             "cluster": "test",
             "path": snapshot.path,
@@ -309,7 +404,8 @@ def discovery_case(*, kind="table"):
         },
         fingerprint=fingerprint(snapshot),
         attributes=ObjectRef(
-            key="archive/source/table/@attributes.yson",
+            key=generation_prefix(prefix="archive/source/table", generation=GENERATION)
+            + "/@attributes.yson",
             size=len(snapshot.attributes),
             sha256=attributes_hash(snapshot.attributes),
         ),
@@ -335,16 +431,25 @@ def discovery_matches(*, archived, discovered, **options):
     )
 
 
-def test_fingerprint_remains_compatible_with_archives_before_revision_hints():
-    """Adding source revisions does not invalidate the established fingerprint."""
+def test_fingerprint_ignores_optional_attribute_revision():
+    """The attribute bytes, not the optional revision hint, define identity."""
     snapshot = node(attributes={b"description": b"example"})
-    expected = "73cb6c30eae05f7691cfd2943e1234aa9febcedebfa09a86915ba67f001c9e15"
-    assert fingerprint(snapshot) == expected
-    assert fingerprint(replace(snapshot, attribute_revision=999)) == expected
+    assert fingerprint(snapshot) == fingerprint(
+        replace(snapshot, attribute_revision=999)
+    )
 
 
-def test_manifest_accepts_legacy_source_without_attribute_revision():
-    """Old source records remain readable and require the full comparison."""
+def test_generation_does_not_change_discovery_fingerprint():
+    """A successful retry in a different generation still represents the same source."""
+    archived, discovered = discovery_case()
+    assert discovery_matches(archived=archived, discovered=discovered)
+    assert discovery_matches(
+        archived=replace(archived, generation="b" * 32), discovered=discovered
+    )
+
+
+def test_manifest_without_attribute_revision_requires_full_comparison():
+    """A missing optional revision hint requires reading source attributes."""
     archived, discovered = discovery_case()
     source = dict(archived.source)
     del source["attribute_revision"]

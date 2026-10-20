@@ -20,6 +20,7 @@ from ytclone.format import (
     Part,
     canonical_attributes,
     data_key,
+    generation_prefix,
 )
 from ytclone.interfaces import RetryableDownloadError, RetryableRestoreError
 from ytclone.progress import Progress
@@ -143,11 +144,13 @@ def make_case(*, kind, error=None):
     )
     storage = FlakyStorage(error=error)
     metadata = canonical_attributes(attributes=attrs)
-    attributes_key = PREFIX + "/@attributes.yson"
+    generation = "1" * 32
+    data_prefix = generation_prefix(prefix=PREFIX, generation=generation)
+    attributes_key = data_prefix + "/@attributes.yson"
     storage.objects[attributes_key] = metadata
     parts = []
     for index, (data, (start, stop)) in enumerate(zip(chunks, bounds)):
-        key = data_key(prefix=PREFIX, kind=kind, index=index)
+        key = data_key(prefix=data_prefix, kind=kind, index=index)
         compressed = zstandard.ZstdCompressor().compress(data)
         storage.objects[key] = compressed
         parts.append(
@@ -156,6 +159,7 @@ def make_case(*, kind, error=None):
     storage.failure_key = parts[1].object.key
     manifest = Manifest(
         kind=kind,
+        generation=generation,
         source={
             "cluster": "test",
             "path": "//source",
@@ -228,7 +232,7 @@ def test_retry_replays_all_parts_in_a_fresh_transaction(kind, failure):
     assert case.storage.downloaded == expected_keys * 2
     assert Counter(case.storage.reads) == {
         PREFIX + "/@manifest.json": 1,
-        PREFIX + "/@attributes.yson": 1,
+        case.manifest.attributes.key: 1,
     }
     assert case.progress.completed_bytes == sum(
         part.object.size for part in case.manifest.parts
