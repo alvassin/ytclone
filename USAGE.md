@@ -91,6 +91,7 @@ For example, export both `//home/analytics/events` and `//home/analytics` to
 | `--part-size-mib` | `256` | Target **uncompressed** bytes per archive object; approximate for tables. |
 | `--buffer-size-mib` | `32` | S3 multipart buffer per active stream, from 5 to 512 MiB. |
 | `--compression-level` | `3` | Zstandard level, from -7 to 22; higher levels use more CPU and memory. |
+| `--yt-zstd-passthrough` | off | Experimental export: request Zstandard from the YT HTTP proxy for tables, avoiding local decompression/recompression. See [limitations](README.md#experimental-yt-compression). |
 
 An archive part is one S3 object; multipart buffers are chunks within that object.
 `--part-size-mib` does not allocate a whole part in RAM. Objects smaller than the

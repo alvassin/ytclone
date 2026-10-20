@@ -202,6 +202,7 @@ async def run_worker(
         proxy=config["yt_proxy"],
         proxy_discovery=config["proxy_discovery"],
         progress=progress,
+        yt_zstd_passthrough=config.get("yt_zstd_passthrough", False),
     )
 
     async with aiohttp.ClientSession(

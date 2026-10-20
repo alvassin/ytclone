@@ -88,6 +88,7 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
     config = {
         "yt_proxy": arguments.yt_proxy,
         "proxy_discovery": not arguments.no_proxy_discovery,
+        "yt_zstd_passthrough": arguments.yt_zstd_passthrough,
         "endpoint": arguments.endpoint,
         "region": arguments.region,
         "bucket": bucket,
@@ -103,6 +104,11 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
         "log_file": arguments.log_file,
         "progress_interval": arguments.progress_interval,
     }
+    log.info(
+        "table_compression mode=%s level=%d",
+        "yt-zstd-passthrough" if arguments.yt_zstd_passthrough else "local-zstd",
+        options.compression_level,
+    )
     budget = arguments.processes * estimate_memory_mib(
         concurrency=options.stream_limit,
         snapshot_concurrency=options.concurrency,

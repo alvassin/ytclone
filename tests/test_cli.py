@@ -39,6 +39,7 @@ def test_defaults_match_engine_and_aiomisc():
     assert parsed.part_size_mib * MIB == defaults.part_size
     assert parsed.buffer_size_mib * MIB == defaults.chunk_size
     assert parsed.compression_level == defaults.compression_level
+    assert parsed.yt_zstd_passthrough is False
     assert parsed.log_format == LogFormat.default()
     assert not parsed.no_proxy_discovery
 
@@ -86,10 +87,12 @@ def test_invalid_addresses_are_rejected(source, destination):
         cli.direction(source=source, destination=destination)
 
 
-@pytest.mark.parametrize("restore", [False, True])
+@pytest.mark.parametrize(
+    "restore,yt_zstd_passthrough", [(False, False), (False, True), (True, False)]
+)
 @pytest.mark.parametrize("failures", [0, 1])
 def test_run_wires_keyword_only_adapters_and_closes_session(
-    monkeypatch, caplog, restore, failures
+    monkeypatch, caplog, restore, yt_zstd_passthrough, failures
 ):
     """Log the memory budget before constructing transfer resources."""
     calls = {}
@@ -100,7 +103,13 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
         compression_level=7,
     )
     parsed = arguments(
-        restore=restore, extra=("--no-proxy-discovery", "--endpoint", "http://s3.test/")
+        restore=restore,
+        extra=(
+            "--no-proxy-discovery",
+            "--endpoint",
+            "http://s3.test/",
+            *(("--yt-zstd-passthrough",) if yt_zstd_passthrough else ()),
+        ),
     )
 
     class Session:
@@ -126,12 +135,12 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
         )
         return 512
 
-    def yt_adapter(*, proxy, proxy_discovery, progress):
+    def yt_adapter(*, proxy, proxy_discovery, progress, yt_zstd_passthrough):
         """Capture logs at the first resource-construction boundary."""
         calls["startup_logs"] = [
             record for record in caplog.records if record.name == cli.__name__
         ]
-        calls["yt"] = (proxy, proxy_discovery)
+        calls["yt"] = (proxy, proxy_discovery, yt_zstd_passthrough)
         return "yt-adapter"
 
     def s3_client(*, session, url, region):
@@ -191,9 +200,11 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
     expected_logs = [expected_start, expected_note]
     if not restore:
         expected_logs.append("export_parallelism max_streams=6")
+        mode = "yt-zstd-passthrough" if yt_zstd_passthrough else "local-zstd"
+        expected_logs.append(f"table_compression mode={mode} level=7")
     assert [record.getMessage() for record in startup] == expected_logs
     assert all(record.levelno == logging.INFO for record in startup)
-    assert calls["yt"] == ("https://yt.example.test", False)
+    assert calls["yt"] == ("https://yt.example.test", False, yt_zstd_passthrough)
     assert calls["s3"] == ("http://s3.test/bucket", "us-east-1")
     assert calls["storage"] == ("s3-client", 8 * MIB)
     assert calls["transfer"][:5] == (
@@ -237,7 +248,8 @@ def test_main_rejects_invalid_options_before_starting_resources(monkeypatch, ext
     assert exc.value.code == 2
 
 
-def test_main_rejects_export_stream_setting_for_restore(monkeypatch, capsys):
+@pytest.mark.parametrize("extra", [("--max-streams", "4"), ("--yt-zstd-passthrough",)])
+def test_main_rejects_export_settings_for_restore(monkeypatch, capsys, extra):
     """Reject an export-only setting instead of silently changing restore limits."""
     monkeypatch.setattr(
         cli.aiomisc,
@@ -253,8 +265,7 @@ def test_main_rejects_export_stream_setting_for_restore(monkeypatch, capsys):
             "//copy",
             "--yt-proxy",
             "test",
-            "--max-streams",
-            "4",
+            *extra,
         ],
     )
     with pytest.raises(SystemExit) as error:

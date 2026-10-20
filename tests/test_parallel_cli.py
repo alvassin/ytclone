@@ -1,6 +1,8 @@
 """Public parallel CLI validation and adapter configuration."""
 
 import asyncio
+import logging
+import sys
 
 import pytest
 
@@ -41,15 +43,45 @@ def test_invalid_settings(flag, value):
         cli.validate(arguments(flag, value))
 
 
-def test_reject_restore():
+@pytest.mark.parametrize("extra", [(), ("--yt-zstd-passthrough",)])
+def test_reject_restore(extra):
     """Do not apply export ordering to restore directory dependencies."""
     args = cli.Arguments()
-    args.parse_args(["s3://bucket/prefix", "//home/test", "--yt-proxy", "yt.invalid"])
+    args.parse_args(
+        ["s3://bucket/prefix", "//home/test", "--yt-proxy", "yt.invalid", *extra]
+    )
     with pytest.raises(ValueError, match="YT to S3"):
         cli.validate(args)
 
 
-def test_run_passes_nonsecret_config_and_reports_failure(monkeypatch, capsys):
+def test_main_rejects_restore_passthrough_before_starting_resources(monkeypatch):
+    """An export transport option cannot start clients or workers on restore."""
+    monkeypatch.setattr(
+        cli.aiomisc,
+        "run",
+        lambda *args, **kwargs: pytest.fail("Invalid restore must not start"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ytclone-parallel",
+            "s3://bucket/prefix",
+            "//home/test",
+            "--yt-proxy",
+            "yt.invalid",
+            "--yt-zstd-passthrough",
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("yt_zstd_passthrough", [False, True])
+def test_run_passes_nonsecret_config_and_reports_failure(
+    monkeypatch, capsys, caplog, yt_zstd_passthrough
+):
     """Preserve endpoint and worker options without performing live transfers."""
     args = arguments(
         "--processes",
@@ -64,9 +96,17 @@ def test_run_passes_nonsecret_config_and_reports_failure(monkeypatch, capsys):
         "custom",
         "--small-table-mib",
         "8",
+        *(("--yt-zstd-passthrough",) if yt_zstd_passthrough else ()),
     )
+    assert args.yt_zstd_passthrough is yt_zstd_passthrough
     captured = {}
-    monkeypatch.setattr(cli, "YtAdapter", lambda **kwargs: object())
+
+    def adapter(**kwargs):
+        """Discovery keeps the default transport regardless of data worker mode."""
+        captured["discovery_options"] = kwargs
+        return object()
+
+    monkeypatch.setattr(cli, "YtAdapter", adapter)
 
     async def supervise(**kwargs):
         """Observe passed settings and simulate a failed node."""
@@ -74,12 +114,17 @@ def test_run_passes_nonsecret_config_and_reports_failure(monkeypatch, capsys):
         kwargs["progress"].failed = 1
 
     monkeypatch.setattr(cli, "supervise", supervise)
+    caplog.set_level(logging.INFO, logger=cli.__name__)
     assert asyncio.run(cli.run(arguments=args, options=cli.validate(args))) == 1
     assert captured["processes"] == 3
     assert captured["small_size"] == 8 * 1024**2
     config = captured["config"]
     assert config["concurrency"] == 2
     assert config["max_streams"] == 7
+    assert config["yt_zstd_passthrough"] is yt_zstd_passthrough
+    assert "yt_zstd_passthrough" not in captured["discovery_options"]
+    mode = "yt-zstd-passthrough" if yt_zstd_passthrough else "local-zstd"
+    assert f"table_compression mode={mode} level=3" in caplog.text
     assert config["bucket"] == "bucket" and config["prefix"] == "prefix"
     assert config["endpoint"] == "https://s3.invalid" and config["region"] == "custom"
     assert not any("secret" in key.lower() or "token" in key.lower() for key in config)

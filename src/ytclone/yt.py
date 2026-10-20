@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 import yt.wrapper as yt
 import zstandard
@@ -19,7 +20,7 @@ from yt import yson
 from yt.common import YT_NULL_TRANSACTION_ID
 from yt.wrapper.driver import make_request
 from yt.wrapper.errors import YtChunkUnavailable, YtError
-from yt.wrapper.http_helpers import get_retriable_errors
+from yt.wrapper.http_helpers import _get_session, get_retriable_errors
 from yt.wrapper.ypath import escape_ypath_literal
 
 from .codec import AsyncReader
@@ -45,6 +46,7 @@ from .interfaces import (
     YtBackend,
     YtWorkerFactory,
 )
+from .yt_zstd import ZstdBlockReader, yt_zstd_codec
 
 if TYPE_CHECKING:
     from .progress import Progress
@@ -333,33 +335,93 @@ def _chunks_digest(*, client, pinned: str) -> str:
     return digest.hexdigest()
 
 
-def _read_table(*, client, pinned: str, part: Range, transaction_id: str):
+@contextlib.contextmanager
+def _zstd_transport(*, client, encoding: str):
+    """Scope encoded table bytes to this client's HTTP request, before SDK reads."""
+    if client.config.get("backend") not in (None, "http"):
+        raise ValueError("YT Zstandard passthrough requires the HTTP backend")
+    session = _get_session(client)
+    original_send = session.send
+    responses = []
+
+    def send(request, **kwargs):
+        # Discovery can also run while opening a table. Keep its compression
+        # unchanged, and retain SDK authentication, routing, and trailer checks.
+        table = urlsplit(request.url).path.endswith("/read_table")
+        if table:
+            request.headers["Accept-Encoding"] = encoding
+            request.headers.pop("X-YT-Accept-Framing", None)
+        response = original_send(request, **kwargs)
+        if table:
+            responses.append(response)
+            # Let the SDK interpret HTTP/auth errors with its usual semantics.
+            if (
+                200 <= response.status_code < 300
+                and int(response.headers.get("X-YT-Response-Code", 0)) == 0
+            ):
+                if response.headers.get("Content-Encoding") != encoding:
+                    raise ValueError(
+                        "YT did not return the requested Zstd transport codec"
+                    )
+                if "X-YT-Framing" in response.headers:
+                    raise ValueError("YT framing is not supported for Zstd passthrough")
+        return response
+
+    # Each client belongs to one executor thread. Restoring send is safe before
+    # consumption: the returned ResponseStream already owns the HTTP response.
+    session.send = send
+    try:
+        yield
+    except BaseException:
+        # ResponseStream eagerly reads its first chunk in __init__, so opening
+        # can fail before a raw stream exists for the usual reader cleanup.
+        for response in responses:
+            response.close()
+        raise
+    finally:
+        session.send = original_send
+
+
+def _read_table(
+    *,
+    client,
+    pinned: str,
+    part: Range,
+    transaction_id: str,
+    encoding: str | None = None,
+):
     """Open raw YSON bytes in the caller's snapshot without SDK row parsing."""
     if not transaction_id or transaction_id == YT_NULL_TRANSACTION_ID:
         raise ValueError("A live snapshot transaction is required for table reads")
 
-    return make_request(
-        command_name="read_table",
-        params={
-            "transaction_id": transaction_id,
-            "path": yt.TablePath(
-                name=pinned, start_index=part.start, end_index=part.stop
-            ),
-            "output_format": yt.YsonFormat(attributes=ROW_FORMAT),
-            "unordered": False,
-            "control_attributes": {
-                "enable_row_index": False,
-                "enable_table_index": False,
-                "enable_range_index": False,
-            },
-            "omit_inaccessible_columns": False,
-            "omit_inaccessible_rows": False,
-        },
-        return_content=False,
-        use_heavy_proxy=True,
-        allow_retries=False,
-        client=client,
+    transport = (
+        _zstd_transport(client=client, encoding=encoding)
+        if encoding is not None
+        else contextlib.nullcontext()
     )
+    with transport:
+        return make_request(
+            command_name="read_table",
+            params={
+                "transaction_id": transaction_id,
+                "path": yt.TablePath(
+                    name=pinned, start_index=part.start, end_index=part.stop
+                ),
+                "output_format": yt.YsonFormat(attributes=ROW_FORMAT),
+                "unordered": False,
+                "control_attributes": {
+                    "enable_row_index": False,
+                    "enable_table_index": False,
+                    "enable_range_index": False,
+                },
+                "omit_inaccessible_columns": False,
+                "omit_inaccessible_rows": False,
+            },
+            return_content=False,
+            use_heavy_proxy=True,
+            allow_retries=False,
+            client=client,
+        )
 
 
 def _is_retryable_read(*, error: Exception) -> bool:
@@ -564,12 +626,16 @@ class _PartReader:
         """Open a raw stream in the borrowed snapshot and wrap its compressor."""
         self.snapshot.session.check()
         client = self.session.client
+        encoding = None
         if self.node.kind == "table":
+            if self.session.adapter.yt_zstd_passthrough:
+                encoding = yt_zstd_codec(compression_level)
             raw = _read_table(
                 client=client,
                 pinned=self.pinned,
                 part=part,
                 transaction_id=self.snapshot.session.transaction.transaction_id,
+                encoding=encoding,
             )
         elif self.node.kind == "file":
             if self.session is not self.snapshot.session:
@@ -596,9 +662,12 @@ class _PartReader:
             raise ValueError(f"Cannot read data of {self.node.kind}")
 
         try:
-            compressed = zstandard.ZstdCompressor(
-                level=compression_level
-            ).stream_reader(source=raw, read_size=MIB, closefd=False)
+            if encoding is not None:
+                compressed = ZstdBlockReader(raw, codec=encoding)
+            else:
+                compressed = zstandard.ZstdCompressor(
+                    level=compression_level
+                ).stream_reader(source=raw, read_size=MIB, closefd=False)
             self._stream = _ReadStream(raw=raw, compressed=compressed)
             return self._stream
         except BaseException:
@@ -901,12 +970,14 @@ class YtAdapter(YtWorkerFactory):
         *,
         proxy: str,
         proxy_discovery: bool = True,
+        yt_zstd_passthrough: bool = False,
         client_factory=None,
         progress: "Progress | None" = None,
     ):
         """Configure persistent workers for one cluster."""
         self.proxy = proxy
         self.proxy_discovery = proxy_discovery
+        self.yt_zstd_passthrough = yt_zstd_passthrough
         self.client_factory = client_factory or yt.YtClient
         self.progress = progress
 

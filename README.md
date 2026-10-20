@@ -98,6 +98,22 @@ prioritizing directories and small nodes. Each process owns its stream pool;
 one table stays in one process. Parallel mode supports YT → S3; restore its
 archives with `ytclone` as above. Restore reads each node's parts sequentially.
 
+### Experimental YT compression
+
+Add `--yt-zstd-passthrough` to either export command to compress table reads on the
+YT proxy and upload the resulting Zstandard frames without local recompression.
+The proxy's `z-zstd_<level>` block container is removed automatically, preserving
+the existing `.zst` archive format and restore compatibility. Files and documents
+continue to use local compression; `--compression-level` selects the level for both.
+
+The proxy's 32 KiB blocks may compress less efficiently than the usual local
+stream. Unsupported proxy compression fails explicitly without silently falling
+back. This mode is disabled by default; throughput has not been benchmarked yet.
+Use a fresh destination prefix for comparisons: unchanged nodes are still skipped.
+The experimental reader accepts transport blocks up to 4 MiB encoded and
+128 MiB decoded/window size. It checks frame structure and response completion;
+compressed contents are validated when restoring.
+
 ## Before you copy
 
 - **Supported node types:** static tables, files, YSON documents, and directories.

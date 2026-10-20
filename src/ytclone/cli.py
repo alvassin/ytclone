@@ -58,6 +58,10 @@ class Arguments(argclass.Parser):
     compression_level: int = argclass.Argument(
         default=3, help="Zstandard level, -7..22"
     )
+    yt_zstd_passthrough: bool = argclass.Argument(
+        default=False,
+        help="Experimental export: use YT proxy Zstandard compression for tables",
+    )
     log_file: str | None = argclass.Argument(
         default=None,
         type=str,
@@ -120,6 +124,11 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
     )
     if export:
         log.info("export_parallelism max_streams=%d", options.stream_limit)
+        log.info(
+            "table_compression mode=%s level=%d",
+            "yt-zstd-passthrough" if arguments.yt_zstd_passthrough else "local-zstd",
+            options.compression_level,
+        )
 
     progress = Progress() if arguments.log_file else None
     if progress is not None:
@@ -146,6 +155,7 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
             proxy=arguments.yt_proxy,
             proxy_discovery=not arguments.no_proxy_discovery,
             progress=progress,
+            yt_zstd_passthrough=arguments.yt_zstd_passthrough,
         )
         estimate_task = (
             asyncio.create_task(estimate_total(yt=yt, path=yt_path, progress=progress))
@@ -234,6 +244,8 @@ def main() -> int:
         )
         if not export and arguments.max_streams != 0:
             raise ValueError("Maximum streams applies to export only")
+        if not export and arguments.yt_zstd_passthrough:
+            raise ValueError("YT Zstandard passthrough applies to export only")
         options = CopyOptions(
             concurrency=arguments.concurrency,
             max_streams=arguments.max_streams,
