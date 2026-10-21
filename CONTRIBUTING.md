@@ -22,8 +22,26 @@ Export has separate limits for node lifecycles (`--concurrency`) and a shared po
 of range workers (`--max-streams`, defaulting to the node limit). When changing
 scheduling, verify that one table can fill the pool, multiple ready nodes take
 turns, files stay sequential, and failures or cancellation drain active ranges
-before their snapshot closes. Restore and the archive format remain unchanged;
-parallel export does not provide persistent progress within an unfinished node.
+before their snapshot closes. Restore transfers parts sequentially; parallel
+export does not provide persistent progress within an unfinished node.
+
+The archive format is `yt-s3-v2` only. Export writes immutable attributes and
+parts under a unique generation, retains the previous manifest until the snapshot
+and uploads succeed, then publishes with an ETag condition (or create-only for a
+new node). All manifest updates, including metadata-only refreshes, must use this
+condition. After confirmed publication, delete only the exact references from the
+replaced manifest; never sweep all generations except the current one. Cleanup
+errors must warn without invalidating a published backup. Crashes can leave unused
+generations, and there is no automatic global garbage collector.
+
+When changing publication, test failed uploads with an existing backup, competing
+writers (including direct `export_node` calls without discovery), lost publication
+acknowledgements, and cleanup failures. Restore must use the same selected manifest
+for classification and transfer, including ancestors found before their own listing
+entry. Test concurrent file/directory changes and deletion of the selected
+generation: restore must roll back an unfinished node if those objects are deleted.
+Backend acceptance requires conditional PUT and atomic object
+visibility with ETags; offline tests alone do not verify a deployed S3 service.
 
 ## Run checks
 
@@ -77,6 +95,10 @@ parts and S3 multipart uploads. Tests also read the stored objects, verify their
 checksums, and decode every Zstandard frame: passthrough must retain multiple
 proxy frames per part, while local compression produces one frame. This catches
 a flag that is accepted but not forwarded to the table readers.
+
+The local S3 acceptance test also checks create-only publication, valid and stale
+ETag replacements, and competing writers with one winner against SeaweedFS. It
+deletes its unique `conditional-smoke-*` test object on completion.
 
 Fixtures are retained for inspection while the local containers and their storage
 exist. To stop the services while keeping containers and data:

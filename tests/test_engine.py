@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -22,7 +23,7 @@ from ytclone.format import (
     canonical_attributes,
     node_prefix,
 )
-from ytclone.interfaces import RetryableReadError
+from ytclone.interfaces import PublicationConflict, RetryableReadError, StoredBytes
 from ytclone.progress import Progress
 
 PREFIX = "archive"
@@ -86,6 +87,19 @@ class MemoryStorage:
         self.reads.append(key)
         return self.objects.get(key)
 
+    async def read_versioned(self, *, key):
+        data = await self.read_bytes(key=key)
+        if data is None:
+            return None
+        return StoredBytes(data=data, etag=hashlib.sha256(data).hexdigest())
+
+    async def put_conditional(self, *, key, data, etag):
+        current = self.objects.get(key)
+        actual = hashlib.sha256(current).hexdigest() if current is not None else None
+        if actual != etag:
+            raise PublicationConflict("Manifest changed")
+        await self.put_bytes(key=key, data=data)
+
     async def put_bytes(self, *, key, data):
         self.events.append(("put", key))
         self.objects[key] = data
@@ -95,7 +109,8 @@ class MemoryStorage:
         self.events.append(("upload", key))
         data = bytearray()
         async for chunk in chunks:
-            if key in self.upload_failures:
+            flat_key = re.sub(r"/@generations/[a-f0-9]{32}/", "/", key)
+            if flat_key in self.upload_failures:
                 raise OSError("upload interrupted")
             data.extend(chunk)
 
@@ -373,7 +388,7 @@ def test_export_publishes_after_snapshot_and_skips_only_complete_nodes():
     asyncio.run(scenario())
 
 
-def test_changed_node_invalidates_manifest_and_cleans_only_its_obsolete_parts():
+def test_changed_node_publishes_before_cleaning_only_its_predecessor():
     async def scenario():
         yt, storage, events = setup()
         await export(yt=yt, storage=storage)
@@ -388,11 +403,12 @@ def test_changed_node_invalidates_manifest_and_cleans_only_its_obsolete_parts():
         assert result.completed == 1 and result.failed == 0
         manifest = Manifest.from_bytes(storage.objects[key])
         assert len(manifest.parts) == 1
-        assert events.index(("delete", key)) < events.index(
-            ("put", manifest.attributes.key)
-        )
+        assert manifest.generation != old.generation
+        assert ("delete", key) not in events
+        assert events.index(("put", key)) < events.index(("delete", old.attributes.key))
         assert events.index(("snapshot_exit", SOURCE)) < events.index(("put", key))
-        assert all(part.object.key not in storage.objects for part in old.parts[1:])
+        assert all(part.object.key not in storage.objects for part in old.parts)
+        assert old.attributes.key not in storage.objects
         assert storage.objects[sibling_key] == b"keep"
 
     asyncio.run(scenario())
@@ -510,8 +526,9 @@ def test_part_retry_exhaustion_fails_without_manifest(monkeypatch):
         assert events.count(("snapshot_enter", SOURCE)) == 1
         assert events.count(("snapshot_exit", SOURCE)) == 1
         assert yt.active == 0
-        assert storage.objects["archive/source/@data/part-000000.bin.zst"] == b"xxxx"
-        assert "archive/source/@data/part-000001.bin.zst" not in storage.objects
+        assert [
+            value for key, value in storage.objects.items() if "/@data/" in key
+        ] == [b"xxxx"]
         assert manifest_key() not in storage.objects
         assert progress.failed == 1
         assert progress.source_observed_bytes == 240
@@ -1288,7 +1305,7 @@ def test_source_progress_tracks_uploaded_ranges_before_node_publication(kind):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("failure", ["upload", "snapshot_exit", "manifest", "cleanup"])
+@pytest.mark.parametrize("failure", ["upload", "snapshot_exit", "manifest"])
 def test_failed_export_rolls_back_source_progress(failure):
     """Source bytes from an incomplete node never count as completed work."""
 
@@ -1315,20 +1332,12 @@ def test_failed_export_rolls_back_source_progress(failure):
                 raise OSError("publication failed")
             return await original_put(key=key, data=data)
 
-        async def fail_cleanup(*, prefix):
-            """Reject obsolete-part discovery after the source transaction exits."""
-            assert progress.source_copied_bytes == 240
-            raise OSError("cleanup listing failed")
-            yield prefix
-
         if failure == "upload":
             storage.upload = fail_upload
         elif failure == "snapshot_exit":
             yt.fail_snapshot_exit.add(SOURCE)
         elif failure == "manifest":
             storage.put_bytes = fail_manifest
-        else:
-            storage.list_keys = fail_cleanup
 
         result = await export(yt=yt, storage=storage, progress=progress)
         assert result.failed == progress.failed == 1
@@ -1650,7 +1659,13 @@ def test_incomplete_fast_match_reuses_manifest_and_existence_results(missing):
         assert storage.reads == [manifest_key()]
         assert storage.checked.count(lost.key) == 1
         assert len(storage.checked) == len(set(storage.checked))
-        assert lost.key in storage.objects
+        repaired = Manifest.from_bytes(storage.objects[manifest_key()])
+        assert repaired.generation != manifest.generation
+        assert lost.key not in storage.objects
+        assert all(
+            ref.key in storage.objects
+            for ref in (repaired.attributes, *(part.object for part in repaired.parts))
+        )
         assert progress.source_observed_bytes == progress.source_copied_bytes == 240
         assert progress.source_skipped_bytes == 0
 

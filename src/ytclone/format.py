@@ -10,8 +10,7 @@ from urllib.parse import quote, unquote, urlsplit
 from yt import yson
 
 MIB = 1024 * 1024
-# Keep persisted identifiers stable for existing archives and restored nodes.
-FORMAT = "yt-s3-v1"
+FORMAT = "yt-s3-v2"
 RESTORE_MARKER = "yt_s3_state"
 ROW_FORMAT = {
     "format": "binary",
@@ -31,7 +30,7 @@ KINDS = {"table", "file", "map_node", DOCUMENT_KIND}
 
 
 def node_encoding(kind: str) -> dict:
-    """Extend only document records, preserving legacy bytes and fingerprints."""
+    """Describe the encoding used for each supported node kind."""
     if kind == DOCUMENT_KIND:
         return {**ENCODING, "documents": "binary_yson_node"}
     return ENCODING
@@ -110,9 +109,20 @@ def _ref(value: dict) -> ObjectRef:
     return ref
 
 
+class UnsupportedArchiveFormat(ValueError):
+    """The archive requires a different reader or a fresh export."""
+
+
+def _validate_generation(generation: str) -> None:
+    """Require a canonical UUID hex string safe to use in an object key."""
+    if not isinstance(generation, str) or not re.fullmatch(r"[a-f0-9]{32}", generation):
+        raise ValueError("Invalid archive generation: expected 32 lowercase hex digits")
+
+
 @dataclass(frozen=True)
 class Manifest:
     kind: str
+    generation: str
     source: dict
     fingerprint: str
     attributes: ObjectRef
@@ -133,16 +143,21 @@ class Manifest:
         """Decode and validate an archive manifest."""
         try:
             raw = json.loads(data)
-            if raw.pop("format") != FORMAT or raw.pop("encoding") != node_encoding(
-                raw["kind"]
-            ):
-                raise ValueError("Unsupported archive format or encoding")
+            archive_format = raw.pop("format")
+            if archive_format != FORMAT:
+                raise UnsupportedArchiveFormat(
+                    f"Unsupported archive format {archive_format!r}; expected {FORMAT}. "
+                    "Re-export the source to a new archive prefix."
+                )
+            if raw.pop("encoding") != node_encoding(raw["kind"]):
+                raise ValueError("Unsupported archive encoding")
             raw["attributes"] = _ref(raw["attributes"])
             raw["parts"] = tuple(
                 Part(object=_ref(p["object"]), start=p["start"], stop=p["stop"])
                 for p in raw["parts"]
             )
             result = cls(**raw)
+            _validate_generation(result.generation)
             if result.kind not in KINDS:
                 raise ValueError("Unsupported node type")
             if not re.fullmatch(r"[a-f0-9]{64}", result.fingerprint):
@@ -342,6 +357,12 @@ def object_key(*, prefix: str, name: str) -> str:
     return prefix.rstrip("/") + "/" + name if prefix else name
 
 
+def generation_prefix(*, prefix: str, generation: str) -> str:
+    """Build the isolated object prefix for one immutable node generation."""
+    _validate_generation(generation)
+    return object_key(prefix=prefix, name=f"@generations/{generation}")
+
+
 def data_key(*, prefix: str, kind: str, index: int) -> str:
     """Build the object key for an ordered data part."""
     extension = "yson" if kind in ("table", DOCUMENT_KIND) else "bin"
@@ -349,13 +370,14 @@ def data_key(*, prefix: str, kind: str, index: int) -> str:
 
 
 def validate_manifest_location(*, manifest: Manifest, prefix: str) -> None:
-    """Ensure all object references stay within their node."""
+    """Require the exact ordered object keys in the declared node generation."""
+    prefix = generation_prefix(prefix=prefix, generation=manifest.generation)
     if manifest.attributes.key != object_key(prefix=prefix, name="@attributes.yson"):
-        raise ValueError("Attributes reference escapes selected node")
+        raise ValueError("Attributes reference escapes selected generation")
     for index, part in enumerate(manifest.parts):
         if part.object.key != data_key(prefix=prefix, kind=manifest.kind, index=index):
             raise ValueError(
-                "Data reference escapes selected node or has invalid ordering"
+                "Data reference escapes selected generation or has invalid ordering"
             )
 
 

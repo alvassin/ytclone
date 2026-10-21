@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from typing import Protocol
 
 from .format import DiscoveredNode, Node, ObjectRef, Range, SourceEstimate
@@ -21,6 +22,18 @@ class RetryableRestoreError(Exception):
 
 class WorkerLifecycleError(RuntimeError):
     """A data worker cannot reset its client safely for another range."""
+
+
+class PublicationConflict(ValueError):
+    """Another writer replaced the manifest before conditional publication."""
+
+
+@dataclass(frozen=True)
+class StoredBytes:
+    """An object's bytes and opaque ETag from the same read."""
+
+    data: bytes
+    etag: str
 
 
 class SourceSnapshot(Protocol):
@@ -92,6 +105,19 @@ class YtWorkerFactory(Protocol):
 
 
 class ObjectStorage(Protocol):
+    async def read_versioned(self, *, key: str) -> StoredBytes | None:
+        """Read bytes and their ETag together, returning None for a missing key."""
+        ...
+
+    async def put_conditional(self, *, key: str, data: bytes, etag: str | None) -> None:
+        """Publish only over the given ETag, or create only when etag is None.
+
+        Raise PublicationConflict when another writer won. Publication errors
+        do not prove the attempted manifest was never current; callers must
+        retain its referenced data.
+        """
+        ...
+
     async def read_bytes(self, *, key: str) -> bytes | None:
         """Read an object, returning None when it is missing."""
         ...
