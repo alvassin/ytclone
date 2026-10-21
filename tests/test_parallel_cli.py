@@ -96,6 +96,10 @@ def test_run_passes_nonsecret_config_and_reports_failure(
         "custom",
         "--small-table-mib",
         "8",
+        "--table-format",
+        "skiff",
+        "--compression-level",
+        "1",
         *(("--yt-zstd-passthrough",) if yt_zstd_passthrough else ()),
     )
     assert args.yt_zstd_passthrough is yt_zstd_passthrough
@@ -121,10 +125,14 @@ def test_run_passes_nonsecret_config_and_reports_failure(
     config = captured["config"]
     assert config["concurrency"] == 2
     assert config["max_streams"] == 7
-    assert config["yt_zstd_passthrough"] is yt_zstd_passthrough
+    assert config["table_format"] == "skiff"
+    assert config["compression_level"] == 1
+    assert config["compression"] == "zstd"
+    assert "yt_zstd_passthrough" not in config
     assert "yt_zstd_passthrough" not in captured["discovery_options"]
-    mode = "yt-zstd-passthrough" if yt_zstd_passthrough else "local-zstd"
-    assert f"table_compression mode={mode} level=3" in caplog.text
+    assert (
+        "table_compression format=skiff mode=yt-zstd-passthrough level=1" in caplog.text
+    )
     assert config["bucket"] == "bucket" and config["prefix"] == "prefix"
     assert config["endpoint"] == "https://s3.invalid" and config["region"] == "custom"
     assert not any("secret" in key.lower() or "token" in key.lower() for key in config)

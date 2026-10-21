@@ -119,11 +119,16 @@ async def export_table(source, storage):
         )
 
 
+@pytest.mark.parametrize("legacy_flag", [None, False, True])
 def test_passthrough_parts_restore_without_local_table_compression(
-    table_source, monkeypatch
+    table_source, monkeypatch, legacy_flag
 ):
     """Published parts are unchanged proxy frames accepted by normal restore."""
     source = table_source
+    compatibility = {} if legacy_flag is None else {"yt_zstd_passthrough": legacy_flag}
+    source.adapter = YtAdapter(
+        proxy="test", client_factory=source.store.factory, **compatibility
+    )
     storage = MemoryStorage(events=[])
     target_store = Store()
     Client(target_store).create(type="map_node", path="//tmp")
@@ -135,7 +140,11 @@ def test_passthrough_parts_restore_without_local_table_compression(
     monkeypatch.setattr(yt_module.zstandard, "ZstdCompressor", forbidden_compressor)
 
     async def scenario():
-        assert await export_table(source, storage) == ("completed", "copied")
+        with monkeypatch.context() as export_patch:
+            export_patch.setattr(
+                yt_module.zstandard, "ZstdDecompressor", forbidden_compressor
+            )
+            assert await export_table(source, storage) == ("completed", "copied")
         manifest = Manifest.from_bytes(storage.objects[f"{ARCHIVE}/@manifest.json"])
         assert len(manifest.parts) == len(source.rows)
         parts = [storage.objects[part.object.key] for part in manifest.parts]

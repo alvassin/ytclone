@@ -30,7 +30,7 @@ pytestmark = pytest.mark.skipif(
 
 YT_PROXY = "http://localhost:8000"
 S3_ENDPOINT = "http://localhost:8333"
-NODE_COUNT = 6
+NODE_COUNT = 7
 CLI_TIMEOUT = 180
 
 
@@ -194,8 +194,10 @@ def assert_summary(*, output, copied, unchanged):
     assert fields["errors"] == "0", summaries[0]
 
 
-def assert_table_archive_frames(*, archive, source, passthrough):
-    """Inspect stored frames so a parsed but ignored CLI flag cannot pass."""
+def assert_table_archive(
+    *, archive, source, table_format, client, min_parts=1, multiple_frames=True
+):
+    """Check stored format, complete proxy frames and exact Skiff wire bytes."""
     bucket, prefix = parse_s3_url(archive)
     manifest_key = node_prefix(prefix=prefix, path=source) + "/@manifest.json"
 
@@ -214,7 +216,10 @@ def assert_table_archive_frames(*, archive, source, passthrough):
             manifest_data = await storage.read_bytes(key=manifest_key)
             assert manifest_data is not None, manifest_key
             manifest = Manifest.from_bytes(manifest_data)
-            assert manifest.kind == "table" and manifest.parts
+            assert manifest.kind == "table"
+            assert manifest.table_format["name"] == table_format
+            assert len(manifest.parts) >= min_parts
+            decoded = []
             for part in manifest.parts:
                 remaining = b"".join(
                     [chunk async for chunk in storage.download(ref=part.object)]
@@ -222,17 +227,41 @@ def assert_table_archive_frames(*, archive, source, passthrough):
                 frame_count = 0
                 while remaining:
                     decoder = zstandard.ZstdDecompressor().decompressobj()
-                    decoder.decompress(remaining)
+                    decoded.append(decoder.decompress(remaining))
                     assert decoder.eof, f"Truncated Zstd frame: {part.object.key}"
                     assert len(decoder.unused_data) < len(remaining)
                     remaining = decoder.unused_data
                     frame_count += 1
-                if passthrough:
+                if multiple_frames:
                     assert frame_count > 1, (part.object.key, frame_count)
                 else:
-                    assert frame_count == 1, (part.object.key, frame_count)
+                    assert frame_count >= 1, (part.object.key, frame_count)
+            return manifest, b"".join(decoded)
 
-    asyncio.run(inspect())
+    manifest, decoded = asyncio.run(inspect())
+    if table_format == "skiff":
+        # Read independently with the recorded wire schema. Comparing only the
+        # restored rows could miss a flag ignored on both export and restore.
+        # Generic raw Skiff has no Python row decoder for the SDK retry wrapper.
+        read_retries = client.config["read_retries"]["enable"]
+        client.config["read_retries"]["enable"] = False
+        try:
+            with contextlib.closing(
+                client.read_table(
+                    table=source,
+                    format=sdk.format.Format(
+                        "skiff",
+                        attributes=manifest.table_format["attributes"],
+                        raw=True,
+                    ),
+                    raw=True,
+                    enable_read_parallel=False,
+                )
+            ) as stream:
+                assert decoded == stream.read()
+        finally:
+            client.config["read_retries"]["enable"] = read_retries
+    return manifest
 
 
 def assert_yson_equal(actual, expected):
@@ -243,11 +272,9 @@ def assert_yson_equal(actual, expected):
 
 
 @pytest.mark.parametrize("module", ["ytclone", "ytclone.parallel"])
-@pytest.mark.parametrize(
-    "passthrough", [False, True], ids=["local-zstd", "yt-zstd-passthrough"]
-)
+@pytest.mark.parametrize("table_format", ["yson", "skiff"])
 def test_local_single_table_export_with_three_streams_and_cli_restore(
-    tmp_path, module, passthrough
+    tmp_path, module, table_format
 ):
     """Round-trip ordered table ranges through the CLI with one node and three readers."""
     run_id = uuid.uuid4().hex[:12]
@@ -292,7 +319,16 @@ def test_local_single_table_export_with_three_streams_and_cli_restore(
                 max_streams=3,
                 part_size_mib=8,
                 extra=(
-                    *(("--yt-zstd-passthrough",) if passthrough else ()),
+                    *(
+                        ("--table-format", table_format)
+                        if table_format == "skiff"
+                        else ()
+                    ),
+                    *(
+                        ("--yt-zstd-passthrough",)
+                        if repeated and table_format == "yson"
+                        else ()
+                    ),
                     *(("--processes", "2") if module == "ytclone.parallel" else ()),
                 ),
             )
@@ -303,8 +339,10 @@ def test_local_single_table_export_with_three_streams_and_cli_restore(
                 assert "export_parallelism max_streams=3" in logs
             else:
                 assert "1 node slots / 3 data workers" in output
-            mode = "yt-zstd-passthrough" if passthrough else "local-zstd"
-            assert f"table_compression mode={mode}" in logs
+            assert (
+                f"table_compression format={table_format} mode=yt-zstd-passthrough"
+                in logs
+            )
             if not repeated:
                 # Parallel export writes data-part events in worker log files.
                 part_logs = "\n".join(
@@ -321,8 +359,12 @@ def test_local_single_table_export_with_three_streams_and_cli_restore(
                 assert sorted(indices) == list(range(len(indices)))
                 # Incompressible ranges exceed the 5 MiB upload buffer.
                 assert re.search(r"part_uploaded key=\S+ part=2\b", part_logs)
-                assert_table_archive_frames(
-                    archive=archive, source=source, passthrough=passthrough
+                assert_table_archive(
+                    archive=archive,
+                    source=source,
+                    table_format=table_format,
+                    client=client,
+                    min_parts=3,
                 )
 
             output, _ = run_cli(
@@ -347,7 +389,7 @@ def test_local_single_table_export_with_three_streams_and_cli_restore(
             restored = list(
                 yson.load(stream=stream, yson_type="list_fragment", encoding=None)
             )
-        assert restored == expected
+        assert_yson_equal(restored, expected)
         assert_yson_equal(
             client.get(path=destination + "/@schema"),
             client.get(path=source + "/@schema"),
@@ -357,10 +399,9 @@ def test_local_single_table_export_with_three_streams_and_cli_restore(
         client._cleanup()
 
 
-@pytest.mark.parametrize(
-    "passthrough", [False, True], ids=["local-zstd", "yt-zstd-passthrough"]
-)
-def test_local_installed_parallel_export_and_cli_restore(tmp_path, passthrough):
+@pytest.mark.parametrize("module", ["ytclone", "ytclone.parallel"])
+@pytest.mark.parametrize("table_format", ["yson", "skiff"])
+def test_local_installed_export_and_cli_restore(tmp_path, module, table_format):
     run_id = uuid.uuid4().hex[:12]
     root = "//tmp/ytclone-cli-" + run_id
     source, destination = root + "/source", root + "/restored"
@@ -378,6 +419,22 @@ def test_local_installed_parallel_export_and_cli_restore(tmp_path, passthrough):
             {"name": "payload", "type": "string"},
             {"name": "u", "type": "uint64"},
             {"name": "details", "type": "any"},
+            {
+                "name": "structured",
+                "type_v3": {
+                    "type_name": "optional",
+                    "item": {
+                        "type_name": "struct",
+                        "members": [
+                            {"name": "label", "type": "string"},
+                            {
+                                "name": "counts",
+                                "type": {"type_name": "list", "item": "int64"},
+                            },
+                        ],
+                    },
+                },
+            },
         ],
         attributes={"strict": True, "unique_keys": True},
     )
@@ -387,8 +444,15 @@ def test_local_installed_parallel_export_and_cli_restore(tmp_path, passthrough):
             b"payload": bytes(range(256)) * 1024,
             b"u": yson.YsonUint64(2**64 - 1),
             b"details": {b"nested": [None, b"\x00\xff", yson.YsonUint64(2**63)]},
+            b"structured": [b"\x00\xff", [1, -2]],
         },
-        {b"id": 2, b"payload": None, b"u": None, b"details": None},
+        {
+            b"id": 2,
+            b"payload": None,
+            b"u": None,
+            b"details": None,
+            b"structured": None,
+        },
     ]
     payload = bytes(range(256)) * 8192
     client.create(
@@ -414,6 +478,34 @@ def test_local_installed_parallel_export_and_cli_restore(tmp_path, passthrough):
         format=sdk.YsonFormat(attributes=ROW_FORMAT),
         raw=True,
     )
+    nonstrict_rows = [
+        {
+            b"id": 1,
+            b"unknown_bytes": b"\x00\xff",
+            b"unknown_uint": yson.YsonUint64(2**64 - 1),
+            b"unknown_map": {b"items": [None, b"", b"\xff"]},
+        },
+        {b"id": 2, b"unknown_bytes": None, b"only_second_row": b"keep me"},
+    ]
+    client.create(
+        type="table",
+        path=source + "/nonstrict_table",
+        attributes={
+            "schema": yson.to_yson_type(
+                [{"name": "id", "type": "int64", "sort_order": "ascending"}],
+                attributes={"strict": False, "unique_keys": True},
+            ),
+            "note": "table metadata",
+        },
+    )
+    client.write_table(
+        table=source + "/nonstrict_table",
+        input_stream=yson.dumps(
+            object=nonstrict_rows, yson_type="list_fragment", yson_format="binary"
+        ),
+        format=sdk.YsonFormat(attributes=ROW_FORMAT),
+        raw=True,
+    )
     client.create(
         type="file",
         path=source + "/file",
@@ -430,17 +522,19 @@ def test_local_installed_parallel_export_and_cli_restore(tmp_path, passthrough):
 
     for repeated in (False, True):
         output, logs = run_cli(
-            module="ytclone.parallel",
+            module=module,
             source=source,
             destination=archive,
             directory=tmp_path,
             name="export-repeat" if repeated else "export",
             extra=(
-                "--processes",
-                "2",
-                "--discovery-concurrency",
-                "2",
-                *(("--yt-zstd-passthrough",) if passthrough else ()),
+                "--table-format",
+                table_format,
+                *(
+                    ("--processes", "2", "--discovery-concurrency", "2")
+                    if module == "ytclone.parallel"
+                    else ()
+                ),
             ),
         )
         assert_summary(
@@ -448,14 +542,34 @@ def test_local_installed_parallel_export_and_cli_restore(tmp_path, passthrough):
             copied=0 if repeated else NODE_COUNT,
             unchanged=NODE_COUNT if repeated else 0,
         )
-        workers = re.findall(r"worker_started worker=(\d+) pid=(\d+)", logs)
-        assert {worker for worker, _ in workers} == {"1", "2"}, logs
-        assert len({pid for _, pid in workers}) == 2, logs
-        mode = "yt-zstd-passthrough" if passthrough else "local-zstd"
-        assert f"table_compression mode={mode}" in logs
+        if module == "ytclone.parallel":
+            workers = re.findall(r"worker_started worker=(\d+) pid=(\d+)", logs)
+            assert {worker for worker, _ in workers} == {"1", "2"}, logs
+            assert len({pid for _, pid in workers}) == 2, logs
+        assert (
+            f"table_compression format={table_format} mode=yt-zstd-passthrough" in logs
+        )
         if not repeated:
-            assert_table_archive_frames(
-                archive=archive, source=source + "/table", passthrough=passthrough
+            assert_table_archive(
+                archive=archive,
+                source=source + "/table",
+                table_format=table_format,
+                client=client,
+            )
+            empty_manifest = assert_table_archive(
+                archive=archive,
+                source=source + "/empty_table",
+                table_format=table_format,
+                client=client,
+                min_parts=0,
+            )
+            assert empty_manifest.row_count == 0 and not empty_manifest.parts
+            assert_table_archive(
+                archive=archive,
+                source=source + "/nonstrict_table",
+                table_format=table_format,
+                client=client,
+                multiple_frames=False,
             )
 
         output, _ = run_cli(
@@ -484,7 +598,11 @@ def test_local_installed_parallel_export_and_cli_restore(tmp_path, passthrough):
     ) == yson.dumps(document, yson_format="binary", sort_keys=True)
     assert client.get(path=destination + "/document/@note") == "document metadata"
 
-    for name in ("table", "empty_table"):
+    for name, expected in (
+        ("table", expected_rows),
+        ("empty_table", []),
+        ("nonstrict_table", nonstrict_rows),
+    ):
         with contextlib.closing(
             client.read_table(
                 table=destination + "/" + name,
@@ -495,8 +613,7 @@ def test_local_installed_parallel_export_and_cli_restore(tmp_path, passthrough):
             restored = list(
                 yson.load(stream=stream, yson_type="list_fragment", encoding=None)
             )
-        assert restored == (expected_rows if name == "table" else [])
-        assert_yson_equal(restored, expected_rows if name == "table" else [])
+        assert_yson_equal(restored, expected)
         assert_yson_equal(
             client.get(path=destination + "/" + name + "/@schema"),
             client.get(path=source + "/" + name + "/@schema"),
@@ -510,3 +627,96 @@ def test_local_installed_parallel_export_and_cli_restore(tmp_path, passthrough):
     assert client.get(path=destination + "/empty/@type") == "map_node"
     assert list(client.list(path=destination + "/empty")) == []
     assert client.get(path=destination + "/empty/@note") == "empty folder"
+
+
+@pytest.mark.parametrize("module", ["ytclone", "ytclone.parallel"])
+def test_local_cli_format_and_level_changes_replace_unchanged_table(tmp_path, module):
+    """Changing either representation setting must publish a new generation."""
+    run_id = uuid.uuid4().hex[:12]
+    root = "//tmp/ytclone-cli-settings-" + run_id
+    source, destination = root + "/source", root + "/restored"
+    archive = "s3://yt-backup/cli-settings-" + run_id
+    client = sdk.YtClient(
+        proxy=YT_PROXY,
+        config={
+            "enable_token": False,
+            "proxy": {"enable_proxy_discovery": False, "retries": {"count": 1}},
+        },
+    )
+    expected = [{b"id": 1, b"payload": b"\x00\xff"}, {b"id": 2, b"payload": None}]
+    try:
+        client.create(
+            type="table",
+            path=source,
+            recursive=True,
+            attributes={
+                "schema": [
+                    {"name": "id", "type": "int64"},
+                    {"name": "payload", "type": "string"},
+                ],
+            },
+        )
+        client.write_table(table=source, input_stream=expected)
+        manifests = []
+        for table_format, level in (("yson", 3), ("skiff", 3), ("skiff", 1)):
+            name = f"settings-{table_format}-{level}"
+            for repeated in (False, True):
+                output, _ = run_cli(
+                    module=module,
+                    source=source,
+                    destination=archive,
+                    directory=tmp_path,
+                    name=name + ("-repeat" if repeated else ""),
+                    extra=(
+                        "--table-format",
+                        table_format,
+                        "--compression",
+                        "zstd",
+                        "--compression-level",
+                        str(level),
+                        *(("--processes", "2") if module == "ytclone.parallel" else ()),
+                    ),
+                )
+                assert_summary(
+                    output=output, copied=int(not repeated), unchanged=int(repeated)
+                )
+                manifest = assert_table_archive(
+                    archive=archive,
+                    source=source,
+                    table_format=table_format,
+                    client=client,
+                    multiple_frames=False,
+                )
+                if repeated:
+                    assert manifest == manifests[-1]
+                else:
+                    assert manifest.generation not in {
+                        item.generation for item in manifests
+                    }
+                    assert manifest.fingerprint not in {
+                        item.fingerprint for item in manifests
+                    }
+                    manifests.append(manifest)
+
+            # No export format or compression options are supplied to restore.
+            output, _ = run_cli(
+                module="ytclone",
+                source=archive + "/" + source.removeprefix("//"),
+                destination=destination,
+                directory=tmp_path,
+                name=name + "-restore",
+            )
+            assert_summary(output=output, copied=1, unchanged=0)
+            with contextlib.closing(
+                client.read_table(
+                    table=destination,
+                    format=sdk.YsonFormat(attributes=ROW_FORMAT),
+                    raw=True,
+                )
+            ) as stream:
+                restored = list(
+                    yson.load(stream, yson_type="list_fragment", encoding=None)
+                )
+            assert_yson_equal(restored, expected)
+    finally:
+        client._cleanup()

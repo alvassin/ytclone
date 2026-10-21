@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import copy
 import io
+import struct
 import threading
 from types import SimpleNamespace
 
@@ -21,6 +22,53 @@ from ytclone.format import (
 )
 from ytclone.progress import Progress
 from ytclone.yt import YtAdapter
+from ytclone.yt_zstd import _codec_id
+
+# This compressor models the remote proxy, independently of patches that forbid
+# instantiating a local codec inside the adapter under test.
+_REMOTE_COMPRESSOR = zstandard.ZstdCompressor
+
+
+class EncodedResponse:
+    """Lazily model YT's blockcodec body while retaining source failures/cleanup."""
+
+    def __init__(self, raw, *, codec="z-zstd_3"):
+        self.raw = raw
+        self.codec = codec
+        self.pending = bytearray()
+        self.finished = False
+        level = (
+            int(codec.removeprefix("z-zstd_"))
+            if "fast" not in codec
+            else -int(codec.rsplit("_", 1)[1])
+        )
+        self.compressor = _REMOTE_COMPRESSOR(level=level)
+
+    def read(self, size):
+        while len(self.pending) < size and not self.finished:
+            payload = self.raw.read(32768)
+            frame = self.compressor.compress(payload)
+            self.pending.extend(
+                struct.pack("<HQQ", _codec_id(self.codec), 8 + len(frame), len(payload))
+                + frame
+            )
+            self.finished = not payload
+        data = bytes(self.pending[:size])
+        del self.pending[:size]
+        return data
+
+    def close(self):
+        self.raw.close()
+
+
+@contextlib.contextmanager
+def fake_zstd_transport(*, client, encoding):
+    """Carry the requested transport codec through the fake HTTP boundary."""
+    client.transport_codec = encoding
+    try:
+        yield
+    finally:
+        del client.transport_codec
 
 
 def run(coro):
@@ -363,9 +411,12 @@ def adapter(store, monkeypatch):
         assert return_content is False
         assert use_heavy_proxy is True
         assert allow_retries is False
-        return client.read_response(params=params)
+        return EncodedResponse(
+            client.read_response(params=params), codec=client.transport_codec
+        )
 
     monkeypatch.setattr(yt_module, "make_request", make_request)
+    monkeypatch.setattr(yt_module, "_zstd_transport", fake_zstd_transport)
     return YtAdapter(proxy="test", client_factory=store.factory)
 
 
@@ -2670,13 +2721,15 @@ def test_raw_read_classifies_only_transient_errors(
     assert store.commits == 0
 
 
-def test_second_read_attempt_uses_fresh_response_and_compressor(
-    adapter, store, monkeypatch
+@pytest.mark.parametrize("table_format", ["yson", "skiff"])
+def test_second_read_attempt_uses_fresh_proxy_response_and_frame_reader(
+    adapter, store, monkeypatch, table_format
 ):
     """Restart the entire range in the same snapshot after a transient read."""
     from ytclone.interfaces import RetryableReadError
 
     add_node(store=store)
+    adapter.table_format = table_format
     error = read_error(name="timeout")
     payload = b"raw bytes do not need to be parsed here" * 100
     requests = []
@@ -2692,7 +2745,7 @@ def test_second_read_attempt_uses_fresh_response_and_compressor(
         requests.append(kwargs["params"])
         raw = BrokenReader() if len(requests) == 1 else io.BytesIO(payload)
         streams.append(raw)
-        return raw
+        return EncodedResponse(raw, codec=kwargs["client"].transport_codec)
 
     monkeypatch.setattr(yt_module, "make_request", make_request)
 
@@ -2727,6 +2780,10 @@ def test_second_read_attempt_uses_fresh_response_and_compressor(
         "snapshot-transaction"
     }
     assert requests[0]["path"].attributes == requests[1]["path"].attributes
+    assert str(requests[0]["output_format"].to_yson_type()) == table_format
+    assert requests[0]["output_format"].to_yson_type().attributes == (
+        requests[1]["output_format"].to_yson_type().attributes
+    )
     assert store.clients[0].calls.count("transaction") == 1
     assert store.clients[0].calls.count("lock:snapshot") == 1
 

@@ -7,6 +7,8 @@ import pytest
 from yt import yson
 
 from ytclone.format import (
+    ENCODING,
+    FORMAT,
     DiscoveredNode,
     Manifest,
     Node,
@@ -26,6 +28,7 @@ from ytclone.format import (
     validate_manifest_location,
     verify_object,
 )
+from ytclone.table_format import make_table_format
 
 GENERATION = "0123456789abcdef0123456789abcdef"
 
@@ -146,6 +149,70 @@ def test_schema_attributes_are_part_of_the_fingerprint():
     assert fingerprint(node(attributes={b"schema": schema})) != baseline
 
 
+def legacy_fingerprint(value, *, compression_level=3, part_size=40):
+    """Compute the pre-table-format fingerprint for compatibility regression checks."""
+    return attributes_hash(
+        json.dumps(
+            {
+                "format": FORMAT,
+                "encoding": ENCODING,
+                "cluster": "test",
+                "kind": value.kind,
+                "node_id": value.node_id,
+                "content_revision": value.content_revision
+                if value.kind != "map_node"
+                else None,
+                "attributes": attributes_hash(value.attributes),
+                "compression_level": compression_level,
+                "part_size": part_size,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    )
+
+
+def test_table_fingerprint_prevents_reusing_local_compression_archives():
+    value = node()
+    assert fingerprint(value) != legacy_fingerprint(value)
+
+
+@pytest.mark.parametrize("kind", ["file", "map_node"])
+def test_non_table_fingerprints_remain_unchanged_by_table_format_option(kind):
+    value = node(kind=kind)
+    assert fingerprint(value) == legacy_fingerprint(value)
+    assert make_fingerprint(
+        node=value,
+        cluster="test",
+        compression_level=3,
+        part_size=40,
+        table_format="skiff",
+    ) == legacy_fingerprint(value)
+
+
+def test_table_fingerprint_includes_actual_wire_schema_and_requested_format():
+    value = node(attributes={b"schema": [{b"name": b"x", b"type": b"int64"}]})
+    selected = make_table_format("skiff", value.attributes)
+    encoded = replace(value, table_format=selected)
+    args = {
+        "cluster": "test",
+        "compression_level": 3,
+        "part_size": 40,
+        "table_format": "skiff",
+    }
+    baseline = make_fingerprint(node=encoded, **args)
+    assert baseline == make_fingerprint(node=value, **args)
+    assert baseline != fingerprint(value)
+    # Both layouts preserve every column, but use different on-wire encodings.
+    alternate = make_table_format("skiff", canonical_attributes({}))
+    assert (
+        make_fingerprint(node=replace(value, table_format=alternate), **args)
+        != baseline
+    )
+    with pytest.raises(ValueError, match="Snapshot format"):
+        fingerprint(encoded)
+
+
 @pytest.mark.parametrize(
     "kind,size,part_size", [("table", 7, 40), ("table", 7, 1), ("file", 7, 4)]
 )
@@ -176,6 +243,70 @@ def test_manifest_round_trip_and_object_verification():
         verify_object(data=b"[]", ref=value.attributes)
     with pytest.raises(ValueError):
         verify_object(data=b"{}\n", ref=value.attributes)
+
+
+def test_legacy_v2_manifest_omits_optional_format_and_remains_readable():
+    value = manifest()
+    raw = json.loads(value.to_bytes())
+    assert "table_format" not in raw
+    assert raw["encoding"] == ENCODING
+    assert Manifest.from_bytes(json.dumps(raw).encode()) == value
+
+
+@pytest.mark.parametrize("name", ["yson", "skiff"])
+def test_manifest_preserves_explicit_table_format_and_requires_matching_part_keys(name):
+    value = manifest()
+    spec = make_table_format(name, canonical_attributes({}))
+    parts = tuple(
+        replace(
+            part,
+            object=replace(
+                part.object, key=part.object.key.replace(".yson.zst", f".{name}.zst")
+            ),
+        )
+        for part in value.parts
+    )
+    value = replace(value, table_format=spec, parts=parts)
+    decoded = Manifest.from_bytes(value.to_bytes())
+    assert decoded == value
+    validate_manifest_location(manifest=decoded, prefix="archive/source/table")
+    raw = json.loads(value.to_bytes())
+    assert raw["encoding"]["tables"] == (
+        "skiff" if name == "skiff" else "binary_yson_list_fragment"
+    )
+    if name == "skiff":
+        with pytest.raises(ValueError, match="escapes selected generation"):
+            validate_manifest_location(
+                manifest=replace(value, parts=manifest().parts),
+                prefix="archive/source/table",
+            )
+
+
+@pytest.mark.parametrize("name", ["yson", "skiff"])
+def test_manifest_rejects_format_encoding_mismatch(name):
+    raw = json.loads(manifest().to_bytes())
+    raw["table_format"] = make_table_format(name, canonical_attributes({}))
+    raw["encoding"]["tables"] = (
+        "binary_yson_list_fragment" if name == "skiff" else "skiff"
+    )
+    with pytest.raises(ValueError, match="Unsupported archive encoding"):
+        Manifest.from_bytes(json.dumps(raw).encode())
+
+
+def test_skiff_manifest_requires_wire_schema():
+    raw = json.loads(manifest().to_bytes())
+    raw["encoding"]["tables"] = "skiff"
+    with pytest.raises(ValueError, match="Unsupported archive encoding"):
+        Manifest.from_bytes(json.dumps(raw).encode())
+
+
+@pytest.mark.parametrize("kind", ["file", "map_node", "document"])
+def test_manifest_rejects_table_format_on_non_table_nodes(kind):
+    raw = json.loads(manifest().to_bytes())
+    raw["kind"] = kind
+    raw["table_format"] = make_table_format("yson", b"")
+    with pytest.raises(ValueError, match="only valid for tables"):
+        Manifest.from_bytes(json.dumps(raw).encode())
 
 
 def test_manifest_rejects_previous_archive_format_with_reexport_guidance():
@@ -446,6 +577,38 @@ def test_generation_does_not_change_discovery_fingerprint():
     assert discovery_matches(
         archived=replace(archived, generation="b" * 32), discovered=discovered
     )
+
+
+def test_discovery_fast_path_checks_requested_and_actual_table_formats():
+    archived, discovered = discovery_case()
+    source = replace(node(size=0), attribute_revision=17)
+    spec = make_table_format("skiff", source.attributes)
+    archived = replace(
+        archived,
+        table_format=spec,
+        fingerprint=make_fingerprint(
+            node=replace(source, table_format=spec),
+            cluster="test",
+            compression_level=3,
+            part_size=40,
+            table_format="skiff",
+        ),
+    )
+    assert discovery_matches(
+        archived=archived, discovered=discovered, table_format="skiff"
+    )
+    assert not discovery_matches(archived=archived, discovered=discovered)
+    assert not discovery_matches(
+        archived=replace(archived, table_format=None),
+        discovered=discovered,
+        table_format="skiff",
+    )
+
+
+def test_discovery_reexports_legacy_local_zstd_table():
+    archived, discovered = discovery_case()
+    archived = replace(archived, fingerprint=legacy_fingerprint(node(size=0)))
+    assert not discovery_matches(archived=archived, discovered=discovered)
 
 
 def test_manifest_without_attribute_revision_requires_full_comparison():

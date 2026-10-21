@@ -234,6 +234,31 @@ def test_block_reader_reaches_http_eof_after_terminator(http_sdk):
         raw.close()
 
 
+def test_sdk_explicitly_disables_content_decoding_before_prefetch(
+    http_sdk, monkeypatch
+):
+    """Retain encoded bytes even if urllib3 gains support for YT's codec name."""
+    http, client = http_sdk
+    body, _ = _transport(b"proxy-compressed payload")
+    http.enqueue(body, headers={"Content-Encoding": CODEC})
+    original = HTTPResponse.stream
+    observed = []
+
+    def stream(self, amt=2**16, decode_content=None):
+        if self.headers.get("Content-Encoding") == CODEC:
+            observed.append(decode_content)
+            assert decode_content is False
+        return original(self, amt=amt, decode_content=decode_content)
+
+    monkeypatch.setattr(HTTPResponse, "stream", stream)
+    raw = _open(client)
+    try:
+        assert raw.read() == body
+    finally:
+        raw.close()
+    assert observed
+
+
 def test_block_reader_preserves_late_http_error_after_valid_terminator(http_sdk):
     http, client = http_sdk
     body, frames = _transport(b'{"a"=1;};')

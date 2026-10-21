@@ -46,6 +46,7 @@ from .interfaces import (
     YtBackend,
     YtWorkerFactory,
 )
+from .table_format import make_table_format, validate_table_format
 from .yt_zstd import ZstdBlockReader, yt_zstd_codec
 
 if TYPE_CHECKING:
@@ -365,6 +366,14 @@ def _zstd_transport(*, client, encoding: str):
                     )
                 if "X-YT-Framing" in response.headers:
                     raise ValueError("YT framing is not supported for Zstd passthrough")
+                original_stream = response.raw.stream
+
+                def stream(amt=2**16, decode_content=None):
+                    # Requests normally requests decoding. Keep the encoded
+                    # body intact even if a future HTTP stack supports z-*.
+                    return original_stream(amt=amt, decode_content=False)
+
+                response.raw.stream = stream
         return response
 
     # Each client belongs to one executor thread. Restoring send is safe before
@@ -389,8 +398,9 @@ def _read_table(
     part: Range,
     transaction_id: str,
     encoding: str | None = None,
+    table_format: dict | None = None,
 ):
-    """Open raw YSON bytes in the caller's snapshot without SDK row parsing."""
+    """Open the selected raw format in the snapshot without SDK row parsing."""
     if not transaction_id or transaction_id == YT_NULL_TRANSACTION_ID:
         raise ValueError("A live snapshot transaction is required for table reads")
 
@@ -407,7 +417,7 @@ def _read_table(
                 "path": yt.TablePath(
                     name=pinned, start_index=part.start, end_index=part.stop
                 ),
-                "output_format": yt.YsonFormat(attributes=ROW_FORMAT),
+                "output_format": _sdk_table_format(table_format),
                 "unordered": False,
                 "control_attributes": {
                     "enable_row_index": False,
@@ -422,6 +432,14 @@ def _read_table(
             allow_retries=False,
             client=client,
         )
+
+
+def _sdk_table_format(spec: dict | None):
+    """Restore the persisted wire format without native Skiff parsing bindings."""
+    if spec is None:
+        return yt.YsonFormat(attributes=ROW_FORMAT)
+    spec = validate_table_format(spec)
+    return yt.format.Format(spec["name"], attributes=spec["attributes"], raw=True)
 
 
 def _is_retryable_read(*, error: Exception) -> bool:
@@ -623,19 +641,19 @@ class _PartReader:
         self._cleanup_task = None
 
     def _open_part(self, *, part: Range, compression_level: int):
-        """Open a raw stream in the borrowed snapshot and wrap its compressor."""
+        """Preserve YT's table Zstd frames; compress other node types locally."""
         self.snapshot.session.check()
         client = self.session.client
         encoding = None
         if self.node.kind == "table":
-            if self.session.adapter.yt_zstd_passthrough:
-                encoding = yt_zstd_codec(compression_level)
+            encoding = yt_zstd_codec(compression_level)
             raw = _read_table(
                 client=client,
                 pinned=self.pinned,
                 part=part,
                 transaction_id=self.snapshot.session.transaction.transaction_id,
                 encoding=encoding,
+                table_format=self.node.table_format,
             )
         elif self.node.kind == "file":
             if self.session is not self.snapshot.session:
@@ -852,7 +870,7 @@ class Restore(RestoreSink):
                 self.session.client.write_table(
                     table=yt.TablePath(self.pinned, append=self.part_count > 0),
                     input_stream=chunks(),
-                    format=yt.YsonFormat(attributes=ROW_FORMAT),
+                    format=_sdk_table_format(self.node.table_format),
                     raw=True,
                     force_create=False,
                 )
@@ -971,13 +989,18 @@ class YtAdapter(YtWorkerFactory):
         proxy: str,
         proxy_discovery: bool = True,
         yt_zstd_passthrough: bool = False,
+        table_format: str = "yson",
         client_factory=None,
         progress: "Progress | None" = None,
     ):
         """Configure persistent workers for one cluster."""
         self.proxy = proxy
         self.proxy_discovery = proxy_discovery
-        self.yt_zstd_passthrough = yt_zstd_passthrough
+        # Retain the old keyword for callers; tables always use YT compression.
+        self.yt_zstd_passthrough = True
+        if table_format not in ("yson", "skiff"):
+            raise ValueError("Table format must be yson or skiff")
+        self.table_format = table_format
         self.client_factory = client_factory or yt.YtClient
         self.progress = progress
 
@@ -1173,6 +1196,13 @@ class YtWorker(YtBackend):
                 )
 
             node = await session.call(pin)
+            if node.kind == "table" and not node.dynamic:
+                node = replace(
+                    node,
+                    table_format=make_table_format(
+                        self.session.adapter.table_format, node.attributes
+                    ),
+                )
             document = None
             if node.kind == DOCUMENT_KIND:
                 document = await session.call(
