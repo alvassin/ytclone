@@ -91,6 +91,9 @@ class ObjectRef:
     key: str
     size: int
     sha256: str
+    # Bytes before encryption (compressed for data parts, raw YSON for attributes).
+    plaintext_size: int | None = None
+    plaintext_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -112,7 +115,29 @@ def _ref(value: dict) -> ObjectRef:
         raise ValueError("Invalid object reference")
     if not isinstance(ref.sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", ref.sha256):
         raise ValueError("Invalid object checksum")
+    if ref.plaintext_size is not None or ref.plaintext_sha256 is not None:
+        if not _integer(ref.plaintext_size) or not isinstance(
+            ref.plaintext_sha256, str
+        ):
+            raise ValueError("Invalid plaintext integrity metadata")
+        if not re.fullmatch(r"[a-f0-9]{64}", ref.plaintext_sha256):
+            raise ValueError("Invalid plaintext checksum")
     return ref
+
+
+def validate_encryption(value: dict) -> dict:
+    """Accept only the fixed, versioned OpenSSL encryption profile."""
+    if not isinstance(value, dict) or set(value) != {"format", "iterations", "key_id"}:
+        raise ValueError("Invalid archive encryption settings")
+    if (
+        value["format"] != "openssl-aes-256-cbc-pbkdf2-sha256-v1"
+        or type(value["iterations"]) is not int
+        or value["iterations"] != 100000
+        or not isinstance(value["key_id"], str)
+        or not re.fullmatch(r"[a-f0-9]{64}", value["key_id"])
+    ):
+        raise ValueError("Unsupported archive encryption settings")
+    return dict(value)
 
 
 class UnsupportedArchiveFormat(ValueError):
@@ -136,10 +161,20 @@ class Manifest:
     row_count: int = 0
     data_size: int = 0
     table_format: dict | None = None
+    encryption: dict | None = None
 
     def to_bytes(self) -> bytes:
         """Serialize the versioned manifest as JSON."""
         record = asdict(self)
+        if self.encryption is None:
+            del record["encryption"]
+        else:
+            record["encryption"] = validate_encryption(self.encryption)
+        # Keep unencrypted v2 records byte-compatible with existing readers.
+        for ref in (record["attributes"], *(p["object"] for p in record["parts"])):
+            if ref["plaintext_size"] is None and ref["plaintext_sha256"] is None:
+                del ref["plaintext_size"]
+                del ref["plaintext_sha256"]
         if self.table_format is None:
             del record["table_format"]
         else:
@@ -176,6 +211,15 @@ class Manifest:
                 for p in raw["parts"]
             )
             result = cls(**raw)
+            if result.encryption is not None:
+                validate_encryption(result.encryption)
+            for ref in (result.attributes, *(p.object for p in result.parts)):
+                if (ref.plaintext_sha256 is not None) != (
+                    result.encryption is not None
+                ):
+                    raise ValueError(
+                        "Object integrity metadata differs from encryption mode"
+                    )
             _validate_generation(result.generation)
             if result.kind not in KINDS:
                 raise ValueError("Unsupported node type")
@@ -263,6 +307,7 @@ def _fingerprint(
     compression_level: int,
     part_size: int,
     table_format: dict | None = None,
+    encryption: dict | None = None,
 ) -> str:
     """Hash source identity, the saved attribute digest and encoding settings."""
     settings = {
@@ -276,6 +321,8 @@ def _fingerprint(
         "compression_level": compression_level,
         "part_size": part_size,
     }
+    if encryption is not None:
+        settings["encryption"] = validate_encryption(encryption)
     if kind == "table":
         settings["table_format"] = (
             make_table_format("yson", b"")
@@ -299,6 +346,7 @@ def make_fingerprint(
     compression_level: int,
     part_size: int,
     table_format: str = "yson",
+    encryption: dict | None = None,
 ) -> str:
     """Identify source state and archive encoding settings."""
     selected = None
@@ -319,6 +367,7 @@ def make_fingerprint(
         compression_level=compression_level,
         part_size=part_size,
         table_format=selected,
+        encryption=encryption,
     )
 
 
@@ -330,9 +379,12 @@ def matches_discovery(
     compression_level: int,
     part_size: int,
     table_format: str = "yson",
+    encryption: dict | None = None,
 ) -> bool:
     """Compare discovery revisions and copy settings without reading attributes."""
     source = manifest.source
+    if manifest.encryption != encryption:
+        return False
     if (
         not isinstance(source, dict)
         or not isinstance(node.kind, str)
@@ -374,11 +426,16 @@ def matches_discovery(
         kind=node.kind,
         node_id=node.node_id,
         content_revision=node.content_revision,
-        attributes_digest=manifest.attributes.sha256,
+        attributes_digest=(
+            manifest.attributes.plaintext_sha256
+            if encryption is not None
+            else manifest.attributes.sha256
+        ),
         cluster=cluster,
         compression_level=compression_level,
         part_size=part_size,
         table_format=manifest.table_format if node.kind == "table" else None,
+        encryption=encryption,
     )
 
 

@@ -3,9 +3,11 @@
 import asyncio
 import logging
 import math
+import os
 import sys
 import time
 from contextlib import nullcontext, suppress
+from pathlib import Path
 
 import aiohttp
 import aiomisc
@@ -13,6 +15,7 @@ import argclass
 from aiohttp_s3_client import S3Client
 from aiomisc.log import LogFormat
 
+from .encryption import ArchiveEncryption
 from .engine import CopyOptions, export_tree, restore_tree
 from .format import MIB, parse_s3_url, path_components
 from .logging import file_logging
@@ -72,6 +75,15 @@ class Arguments(argclass.Parser):
         default=False,
         help="Deprecated export alias: table Zstandard passthrough is always enabled",
     )
+    encrypt: bool = argclass.Argument(
+        default=False,
+        help="Encrypt exported contents or unlock an encrypted archive on restore",
+    )
+    encryption_password_file: str | None = argclass.Argument(
+        default=None,
+        type=str,
+        help="Read the encryption password from this file; otherwise use YTCLONE_ENCRYPTION_PASSWORD",
+    )
     log_file: str | None = argclass.Argument(
         default=None,
         type=str,
@@ -89,6 +101,37 @@ class Arguments(argclass.Parser):
         choices=LogFormat.choices(),
         env_var="AIOMISC_LOG_FORMAT",
     )
+
+
+def load_encryption(
+    *, enabled: bool, password_file: str | None
+) -> ArchiveEncryption | None:
+    """Read an explicitly requested secret without exposing it in parser state."""
+    if not enabled:
+        if password_file is not None:
+            raise ValueError("--encryption-password-file requires --encrypt")
+        return None
+    if password_file is not None:
+        try:
+            password = Path(password_file).read_bytes()
+        except OSError:
+            raise ValueError("Cannot read encryption password file") from None
+        if password.endswith(b"\r\n"):
+            password = password[:-2]
+        elif password.endswith(b"\n"):
+            password = password[:-1]
+    else:
+        value = os.environ.get("YTCLONE_ENCRYPTION_PASSWORD")
+        if value is None:
+            raise ValueError(
+                "--encrypt requires --encryption-password-file or "
+                "YTCLONE_ENCRYPTION_PASSWORD"
+            )
+        try:
+            password = value.encode("utf-8")
+        except UnicodeError:
+            raise ValueError("Encryption password must be valid UTF-8") from None
+    return ArchiveEncryption(password=password)
 
 
 def direction(*, source: str, destination: str) -> tuple[bool, str, str, str]:
@@ -269,6 +312,10 @@ def main() -> int:
             compression_level=arguments.compression_level,
             table_format=arguments.table_format,
             compression=arguments.compression,
+            encryption=load_encryption(
+                enabled=arguments.encrypt,
+                password_file=arguments.encryption_password_file,
+            ),
         )
     except ValueError as exc:
         arguments.create_parser().error(str(exc))

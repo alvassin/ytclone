@@ -21,6 +21,7 @@ dependencies = [
     "aiohttp-s3-client>=1.0.14,<2",
     "aiomisc>=17.10.3,<19",
     "argclass>=1.11.1,<2",
+    "cryptography>=50,<51",
     "ytsaurus-client>=0.13.54,<0.14",
     "ytsaurus-yson>=0.4.10,<0.5",
     "zstandard>=0.25.0,<1",

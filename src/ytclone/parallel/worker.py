@@ -14,6 +14,7 @@ from aiohttp_s3_client import S3Client
 from aiomisc.log import LogFormat
 from aiomisc_log import basic_config
 
+from ..cli import load_encryption
 from ..engine import CopyOptions, export_node
 from ..export_pool import PartPool
 from ..format import DiscoveredNode
@@ -189,6 +190,14 @@ async def run_worker(
     *, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, config: dict
 ) -> None:
     """Create process-local YT and S3 clients and serve node assignments."""
+    encryption = await asyncio.to_thread(
+        load_encryption,
+        enabled=config.get("encrypt", False),
+        password_file=config.get("encryption_password_file"),
+    )
+    key_id = encryption.policy["key_id"] if encryption is not None else None
+    if key_id != config.get("encryption_key_id"):
+        raise ValueError("Encryption password differs from coordinator configuration")
     options = CopyOptions(
         concurrency=config["concurrency"],
         max_streams=config["max_streams"],
@@ -198,6 +207,7 @@ async def run_worker(
         compression_level=config["compression_level"],
         table_format=config.get("table_format", "yson"),
         compression=config.get("compression", "zstd"),
+        encryption=encryption,
     )
     progress = Progress()
     yt = YtAdapter(

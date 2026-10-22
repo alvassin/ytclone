@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import hashlib
 import io
 import os
 import random
@@ -20,6 +21,7 @@ import zstandard
 from aiohttp_s3_client import S3Client
 from yt import yson
 
+from ytclone.encryption import ArchiveEncryption
 from ytclone.format import MIB, ROW_FORMAT, Manifest, node_prefix, parse_s3_url
 from ytclone.s3 import S3Storage
 
@@ -32,6 +34,19 @@ YT_PROXY = "http://localhost:8000"
 S3_ENDPOINT = "http://localhost:8333"
 NODE_COUNT = 7
 CLI_TIMEOUT = 180
+
+
+def encryption_settings(directory, enabled):
+    """Use a synthetic file-backed password shared by subprocess workers."""
+    if not enabled:
+        return (), None
+    password = b"synthetic-password-for-disposable-cli-integration-tests"
+    path = directory / "encryption-password"
+    path.write_bytes(password + b"\n")
+    path.chmod(0o600)
+    return ("--encrypt", "--encryption-password-file", str(path)), ArchiveEncryption(
+        password=password
+    )
 
 
 def stop_container(*, docker, container, environment):
@@ -195,7 +210,14 @@ def assert_summary(*, output, copied, unchanged):
 
 
 def assert_table_archive(
-    *, archive, source, table_format, client, min_parts=1, multiple_frames=True
+    *,
+    archive,
+    source,
+    table_format,
+    client,
+    min_parts=1,
+    multiple_frames=True,
+    encryption=None,
 ):
     """Check stored format, complete proxy frames and exact Skiff wire bytes."""
     bucket, prefix = parse_s3_url(archive)
@@ -215,7 +237,10 @@ def assert_table_archive(
             storage = S3Storage(client=client, chunk_size=5 * MIB)
             manifest_data = await storage.read_bytes(key=manifest_key)
             assert manifest_data is not None, manifest_key
+            if encryption is not None:
+                manifest_data = await encryption.open_manifest(manifest_data)
             manifest = Manifest.from_bytes(manifest_data)
+            assert (manifest.encryption is not None) == (encryption is not None)
             assert manifest.kind == "table"
             assert manifest.table_format["name"] == table_format
             assert len(manifest.parts) >= min_parts
@@ -224,6 +249,14 @@ def assert_table_archive(
                 remaining = b"".join(
                     [chunk async for chunk in storage.download(ref=part.object)]
                 )
+                if encryption is not None:
+                    assert remaining.startswith(b"Salted__")
+                    remaining = await encryption.decrypt_bytes(remaining)
+                    assert len(remaining) == part.object.plaintext_size
+                    assert (
+                        hashlib.sha256(remaining).hexdigest()
+                        == part.object.plaintext_sha256
+                    )
                 frame_count = 0
                 while remaining:
                     decoder = zstandard.ZstdDecompressor().decompressobj()
@@ -273,14 +306,16 @@ def assert_yson_equal(actual, expected):
 
 @pytest.mark.parametrize("module", ["ytclone", "ytclone.parallel"])
 @pytest.mark.parametrize("table_format", ["yson", "skiff"])
+@pytest.mark.parametrize("encrypted", [False, True])
 def test_local_single_table_export_with_three_streams_and_cli_restore(
-    tmp_path, module, table_format
+    tmp_path, module, table_format, encrypted
 ):
     """Round-trip ordered table ranges through the CLI with one node and three readers."""
     run_id = uuid.uuid4().hex[:12]
     root = "//tmp/ytclone-cli-streams-" + run_id
     source, destination = root + "/source", root + "/restored"
     archive = "s3://yt-backup/cli-streams-" + run_id
+    encryption_args, encryption = encryption_settings(tmp_path, encrypted)
     client = sdk.YtClient(
         proxy=YT_PROXY,
         config={
@@ -319,6 +354,7 @@ def test_local_single_table_export_with_three_streams_and_cli_restore(
                 max_streams=3,
                 part_size_mib=8,
                 extra=(
+                    *encryption_args,
                     *(
                         ("--table-format", table_format)
                         if table_format == "skiff"
@@ -365,6 +401,7 @@ def test_local_single_table_export_with_three_streams_and_cli_restore(
                     table_format=table_format,
                     client=client,
                     min_parts=3,
+                    encryption=encryption,
                 )
 
             output, _ = run_cli(
@@ -374,6 +411,7 @@ def test_local_single_table_export_with_three_streams_and_cli_restore(
                 directory=tmp_path,
                 name="streams-restore-repeat" if repeated else "streams-restore",
                 concurrency=1,
+                extra=encryption_args,
             )
             assert_summary(
                 output=output, copied=0 if repeated else 1, unchanged=int(repeated)
@@ -401,11 +439,15 @@ def test_local_single_table_export_with_three_streams_and_cli_restore(
 
 @pytest.mark.parametrize("module", ["ytclone", "ytclone.parallel"])
 @pytest.mark.parametrize("table_format", ["yson", "skiff"])
-def test_local_installed_export_and_cli_restore(tmp_path, module, table_format):
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_local_installed_export_and_cli_restore(
+    tmp_path, module, table_format, encrypted
+):
     run_id = uuid.uuid4().hex[:12]
     root = "//tmp/ytclone-cli-" + run_id
     source, destination = root + "/source", root + "/restored"
     archive = "s3://yt-backup/cli-smoke-" + run_id
+    encryption_args, encryption = encryption_settings(tmp_path, encrypted)
     client = sdk.YtClient(
         proxy=YT_PROXY,
         config={
@@ -528,6 +570,7 @@ def test_local_installed_export_and_cli_restore(tmp_path, module, table_format):
             directory=tmp_path,
             name="export-repeat" if repeated else "export",
             extra=(
+                *encryption_args,
                 "--table-format",
                 table_format,
                 *(
@@ -555,6 +598,7 @@ def test_local_installed_export_and_cli_restore(tmp_path, module, table_format):
                 source=source + "/table",
                 table_format=table_format,
                 client=client,
+                encryption=encryption,
             )
             empty_manifest = assert_table_archive(
                 archive=archive,
@@ -562,6 +606,7 @@ def test_local_installed_export_and_cli_restore(tmp_path, module, table_format):
                 table_format=table_format,
                 client=client,
                 min_parts=0,
+                encryption=encryption,
             )
             assert empty_manifest.row_count == 0 and not empty_manifest.parts
             assert_table_archive(
@@ -570,6 +615,7 @@ def test_local_installed_export_and_cli_restore(tmp_path, module, table_format):
                 table_format=table_format,
                 client=client,
                 multiple_frames=False,
+                encryption=encryption,
             )
 
         output, _ = run_cli(
@@ -578,6 +624,7 @@ def test_local_installed_export_and_cli_restore(tmp_path, module, table_format):
             destination=destination,
             directory=tmp_path,
             name="restore-repeat" if repeated else "restore",
+            extra=encryption_args,
         )
         assert_summary(
             output=output,
