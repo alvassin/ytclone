@@ -128,6 +128,7 @@ def test_run_passes_nonsecret_config_and_reports_failure(
     assert config["table_format"] == "skiff"
     assert config["compression_level"] == 1
     assert config["compression"] == "zstd"
+    assert "encryption_key_id" not in config
     assert "yt_zstd_passthrough" not in config
     assert "yt_zstd_passthrough" not in captured["discovery_options"]
     assert (

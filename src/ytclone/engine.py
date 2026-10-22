@@ -1,18 +1,22 @@
 """Bounded orchestration; adapters are injected and can be replaced by test doubles."""
 
 import asyncio
+import json
 import logging
 import time
 from contextlib import aclosing
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from uuid import uuid4
 
 import aiomisc
 from aiochannel import Channel
 from yt import yson
 
+from .encryption import ENCRYPTED_MANIFEST_FORMAT, ArchiveEncryption, PlaintextDigest
 from .export_pool import PartPool
 from .format import (
+    ATTRIBUTES_NAME,
+    ENCRYPTED_SUFFIX,
     KINDS,
     MIB,
     DiscoveredNode,
@@ -21,6 +25,8 @@ from .format import (
     ObjectRef,
     Part,
     Range,
+    attributes_hash,
+    attributes_key,
     data_key,
     generation_prefix,
     make_fingerprint,
@@ -60,6 +66,7 @@ class CopyOptions:
     compression_level: int = 3
     table_format: str = "yson"
     compression: str = "zstd"
+    encryption: ArchiveEncryption | None = field(default=None, repr=False)
 
     def __post_init__(self):
         """Validate concurrency, buffer sizes and compression level."""
@@ -248,8 +255,44 @@ class _SourceProgress:
         self.progress.source_skipped_bytes += self.skipped
 
 
+async def _decode_manifest(
+    *,
+    data: bytes,
+    encryption: ArchiveEncryption | None,
+    require_encrypted: bool = False,
+) -> Manifest:
+    """Authenticate encrypted metadata before using its object references."""
+    raw = json.loads(data)
+    encrypted = isinstance(raw, dict) and raw.get("format") == ENCRYPTED_MANIFEST_FORMAT
+    if encrypted:
+        if encryption is None:
+            raise ValueError(
+                "Encrypted archive requires --encrypt and a matching password"
+            )
+        data = await encryption.open_manifest(data)
+    elif require_encrypted:
+        raise ValueError("Expected an authenticated encrypted manifest")
+    manifest = Manifest.from_bytes(data)
+    if encrypted:
+        if manifest.encryption != encryption.policy:
+            raise ValueError(
+                "Archive encryption settings do not match the supplied key"
+            )
+    elif manifest.encryption is not None:
+        raise ValueError("Encrypted archive requires an authenticated manifest")
+    return manifest
+
+
+async def _encode_manifest(
+    *, manifest: Manifest, encryption: ArchiveEncryption | None
+) -> bytes:
+    """Serialize once so conditional publication retries reuse identical bytes."""
+    data = manifest.to_bytes()
+    return data if encryption is None else await encryption.seal_manifest(data)
+
+
 async def _export_manifest(
-    *, storage: ObjectStorage, prefix: str
+    *, storage: ObjectStorage, prefix: str, encryption: ArchiveEncryption | None = None
 ) -> tuple[Manifest | None, str | None]:
     """Read the manifest and its publication guard from the same object version."""
     stored = await storage.read_versioned(
@@ -257,7 +300,7 @@ async def _export_manifest(
     )
     if stored is None:
         return None, None
-    manifest = Manifest.from_bytes(stored.data)
+    manifest = await _decode_manifest(data=stored.data, encryption=encryption)
     validate_manifest_location(manifest=manifest, prefix=prefix)
     return manifest, stored.etag
 
@@ -292,6 +335,7 @@ async def copy_part(
     part: Range,
     compression_level: int,
     chunk_size: int,
+    encryption: ArchiveEncryption | None = None,
 ) -> ObjectRef:
     """Retry a complete part after temporary source failures in the same snapshot."""
     attempt = 0
@@ -319,7 +363,16 @@ async def copy_part(
                     chunk_size=chunk_size,
                 )
             ) as chunks:
-                return await storage.upload(key=key, chunks=chunks)
+                if encryption is None:
+                    return await storage.upload(key=key, chunks=chunks)
+                digest = PlaintextDigest()
+                async with aclosing(
+                    encryption.encrypt_stream(chunks, digest=digest)
+                ) as encoded:
+                    ref = await storage.upload(key=key, chunks=encoded)
+                return replace(
+                    ref, plaintext_size=digest.size, plaintext_sha256=digest.sha256
+                )
         except RetryableReadError as error:
             log.warning(
                 "part_read_failed path=%s part=%d attempt=%d/%d error=%s",
@@ -356,10 +409,12 @@ async def _export_parts(
                 kind=node.kind,
                 index=part.index,
                 table_format=table_format_name(node.table_format),
+                encrypted=options.encryption is not None,
             ),
             part=part,
             compression_level=options.compression_level,
             chunk_size=options.chunk_size,
+            encryption=options.encryption,
         )
         source_progress.advance(part=part)
         log.info(
@@ -391,6 +446,8 @@ async def export_node(
     started = time.monotonic()
     target = node_prefix(prefix=prefix, path=path)
     manifest_key = object_key(prefix=target, name="@manifest.json")
+    encryption = options.encryption
+    policy = encryption.policy if encryption is not None else None
 
     progress = progress if progress is not None else Progress()
     with _SourceProgress(progress=progress) as source_progress:
@@ -405,7 +462,9 @@ async def export_node(
                 source_progress.skip()
                 return "skipped", "dynamic"
 
-            old, etag = await _export_manifest(storage=storage, prefix=target)
+            old, etag = await _export_manifest(
+                storage=storage, prefix=target, encryption=encryption
+            )
             if old is not None and matches_discovery(
                 manifest=old,
                 node=discovered,
@@ -413,6 +472,7 @@ async def export_node(
                 compression_level=options.compression_level,
                 part_size=options.part_size,
                 table_format=options.table_format,
+                encryption=policy,
             ):
                 complete = await _complete(storage=storage, manifest=old)
                 if complete:
@@ -421,7 +481,9 @@ async def export_node(
                     return "skipped", "unchanged"
         else:
             # Bind publication before taking a snapshot, even without discovery.
-            old, etag = await _export_manifest(storage=storage, prefix=target)
+            old, etag = await _export_manifest(
+                storage=storage, prefix=target, encryption=encryption
+            )
 
         unchanged = False
         async with yt.snapshot(path=path) as snapshot:
@@ -442,8 +504,13 @@ async def export_node(
                 compression_level=options.compression_level,
                 part_size=options.part_size,
                 table_format=options.table_format,
+                encryption=policy,
             )
-            if old is not None and old.fingerprint == fingerprint:
+            if (
+                old is not None
+                and old.encryption == policy
+                and old.fingerprint == fingerprint
+            ):
                 if complete is None:
                     complete = await _complete(storage=storage, manifest=old)
                 unchanged = complete
@@ -453,9 +520,19 @@ async def export_node(
                 generation = uuid4().hex
                 staged = generation_prefix(prefix=target, generation=generation)
                 attributes = await storage.put_bytes(
-                    key=object_key(prefix=staged, name="@attributes.yson"),
-                    data=node.attributes,
+                    key=attributes_key(prefix=staged, encrypted=encryption is not None),
+                    data=(
+                        node.attributes
+                        if encryption is None
+                        else await encryption.encrypt_bytes(node.attributes)
+                    ),
                 )
+                if encryption is not None:
+                    attributes = replace(
+                        attributes,
+                        plaintext_size=len(node.attributes),
+                        plaintext_sha256=attributes_hash(node.attributes),
+                    )
                 parts = await _export_parts(
                     pool=pool,
                     snapshot=snapshot,
@@ -471,7 +548,11 @@ async def export_node(
             if node.attribute_revision is not None and old.source != source:
                 refreshed = replace(old, source=source)
                 await storage.put_conditional(
-                    key=manifest_key, data=refreshed.to_bytes(), etag=etag
+                    key=manifest_key,
+                    data=await _encode_manifest(
+                        manifest=refreshed, encryption=encryption
+                    ),
+                    etag=etag,
                 )
                 log.info("manifest_refreshed path=%s", path)
             source_progress.skip()
@@ -488,11 +569,14 @@ async def export_node(
             row_count=node.row_count,
             data_size=node.data_size,
             table_format=node.table_format,
+            encryption=policy,
         )
         # Failed/uncertain publication keeps both generations. Our request may
         # already have committed and been superseded before we see its response.
         await storage.put_conditional(
-            key=manifest_key, data=manifest.to_bytes(), etag=etag
+            key=manifest_key,
+            data=await _encode_manifest(manifest=manifest, encryption=encryption),
+            etag=etag,
         )
         progress.completed_bytes += sum(part.object.size for part in parts)
         source_progress.complete()
@@ -557,14 +641,18 @@ async def export_tree(
         )
 
 
-async def _manifest(*, storage: ObjectStorage, prefix: str) -> Manifest | None:
+async def _manifest(
+    *, storage: ObjectStorage, prefix: str, encryption: ArchiveEncryption | None = None
+) -> Manifest | None:
     """Read and validate a node manifest, or return None if absent."""
     data = await storage.read_bytes(
         key=object_key(prefix=prefix, name="@manifest.json")
     )
     if data is None:
         return None
-    manifest = Manifest.from_bytes(data)
+    manifest = await _decode_manifest(
+        data=data, encryption=encryption, require_encrypted=encryption is not None
+    )
     validate_manifest_location(manifest=manifest, prefix=prefix)
     return manifest
 
@@ -577,6 +665,7 @@ async def _restore_data(
     destination: str,
     node: Node,
     manifest: Manifest,
+    encryption: ArchiveEncryption | None = None,
 ) -> None:
     """Retry all parts in a fresh transaction after a confirmed rollback."""
     async with yt.restore(
@@ -584,7 +673,34 @@ async def _restore_data(
     ) as sink:
         for index, part in enumerate(manifest.parts):
             async with aclosing(storage.download(ref=part.object)) as chunks:
-                await sink.write_part(chunks=chunks)
+                if manifest.encryption is None:
+                    await sink.write_part(chunks=chunks)
+                else:
+                    verified = False
+
+                    async def decrypted(*, chunks, ref: ObjectRef):
+                        nonlocal verified
+                        async with aclosing(
+                            encryption.decrypt_stream(
+                                chunks,
+                                size=ref.plaintext_size,
+                                sha256=ref.plaintext_sha256,
+                            )
+                        ) as decoded:
+                            async for chunk in decoded:
+                                yield chunk
+                        verified = True
+
+                    async with aclosing(
+                        decrypted(chunks=chunks, ref=part.object)
+                    ) as decoded:
+                        await sink.write_part(chunks=decoded)
+                    # Early close is not successful EOF: storage and plaintext
+                    # integrity checks must complete before committing the node.
+                    if not verified:
+                        raise ValueError(
+                            "Restore sink did not consume the encrypted part"
+                        )
             log.info(
                 "part_restored path=%s part=%d bytes=%d",
                 destination,
@@ -601,17 +717,36 @@ async def restore_node(
     destination: str,
     progress: Progress | None = None,
     manifest: Manifest | None = None,
+    encryption: ArchiveEncryption | None = None,
 ):
     """Restore or skip one archive node, verifying data before commit."""
     if manifest is None:
-        manifest = await _manifest(storage=storage, prefix=prefix)
+        manifest = await _manifest(
+            storage=storage, prefix=prefix, encryption=encryption
+        )
     if manifest is None:
         raise ValueError(f"Incomplete archive node (missing manifest): {prefix}")
     validate_manifest_location(manifest=manifest, prefix=prefix)
+    if encryption is not None and manifest.encryption is None:
+        raise ValueError("Expected an authenticated encrypted manifest")
+    if manifest.encryption is not None and (
+        encryption is None or manifest.encryption != encryption.policy
+    ):
+        raise ValueError("Encrypted archive requires a matching password")
     metadata = await storage.read_bytes(key=manifest.attributes.key)
     if metadata is None:
         raise ValueError(f"Missing attributes: {manifest.attributes.key}")
     verify_object(data=metadata, ref=manifest.attributes)
+    if manifest.encryption is not None:
+        metadata = await encryption.decrypt_bytes(metadata)
+        verify_object(
+            data=metadata,
+            ref=ObjectRef(
+                key=manifest.attributes.key,
+                size=manifest.attributes.plaintext_size,
+                sha256=manifest.attributes.plaintext_sha256,
+            ),
+        )
     if not isinstance(yson.loads(string=metadata, encoding=None), dict):
         raise TypeError("Attributes must be a YSON map")
     if await yt.matches(path=destination, fingerprint=manifest.fingerprint):
@@ -633,6 +768,7 @@ async def restore_node(
         destination=destination,
         node=node,
         manifest=manifest,
+        encryption=encryption,
     )
     if progress is not None:
         progress.completed_bytes += sum(part.object.size for part in manifest.parts)
@@ -651,7 +787,8 @@ def _node_from_key(*, key: str, source_prefix: str) -> str | None:
         if name == "@data" and index + 1 < len(components):
             return (base + "/".join(components[:index])).rstrip("/")
         if (
-            name in ("@attributes.yson", "@manifest.json")
+            name
+            in (ATTRIBUTES_NAME, ATTRIBUTES_NAME + ENCRYPTED_SUFFIX, "@manifest.json")
             and index == len(components) - 1
         ):
             return (base + "/".join(components[:index])).rstrip("/")
@@ -685,7 +822,9 @@ async def restore_tree(
     async def select(*, prefix: str) -> Manifest | None:
         """Keep classification and restore on the same archive generation."""
         if prefix not in selected:
-            selected[prefix] = await _manifest(storage=storage, prefix=prefix)
+            selected[prefix] = await _manifest(
+                storage=storage, prefix=prefix, encryption=options.encryption
+            )
         return selected[prefix]
 
     def found(prefix: str) -> None:
@@ -706,6 +845,7 @@ async def restore_tree(
             destination=target,
             progress=progress,
             manifest=item.manifest,
+            encryption=options.encryption,
         )
 
     async def directory(*, prefix: str, yt: YtBackend):
@@ -743,14 +883,15 @@ async def restore_tree(
                     found(prefix)
                     raise ValueError(f"Incomplete archive directory: {prefix}")
             # A virtual parent is legitimate when only a descendant was exported.
-            if (
-                await storage.read_bytes(
-                    key=object_key(prefix=prefix, name="@attributes.yson")
-                )
-                is not None
-            ):
-                found(prefix)
-                raise ValueError(f"Incomplete archive directory: {prefix}")
+            for encrypted in (False, True):
+                if (
+                    await storage.read_bytes(
+                        key=attributes_key(prefix=prefix, encrypted=encrypted)
+                    )
+                    is not None
+                ):
+                    found(prefix)
+                    raise ValueError(f"Incomplete archive directory: {prefix}")
             # Virtual parents have no source metadata to overwrite existing attrs.
             await yt.ensure_directory(path=path)
         directories.add(prefix)

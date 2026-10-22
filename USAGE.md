@@ -44,6 +44,112 @@ does not automatically switch to another generation. Rerun restore to use the
 current manifest. These guarantees apply per node, not to a snapshot of the
 entire directory tree.
 
+## Client-side encryption
+
+Use an explicit opt-in on both export and restore:
+
+```bash
+ytclone //home/analytics/events s3://my-bucket/encrypted-export \
+  --encrypt --encryption-password-file /secure/ytclone-password
+
+ytclone s3://my-bucket/encrypted-export/home/analytics/events \
+  //home/analytics/events_copy \
+  --encrypt --encryption-password-file /secure/ytclone-password
+```
+
+The same flags work with `ytclone-parallel`. Each worker reads the same password
+file or inherits `YTCLONE_ENCRYPTION_PASSWORD`; the coordinator sends only the
+encryption flag, absolute file path, and a nonsecret key identity through its
+control pipe. Workers reject a changed password before starting clients,
+including after a worker restart. Keep the password file unchanged during a run.
+
+The password must contain at least 32 bytes and no NUL, CR, or LF. For a file,
+one final LF or CRLF is removed; spaces are preserved. An explicitly supplied
+file takes precedence over the environment variable. Without `--encrypt`, an
+environment password is ignored, and `--encryption-password-file` is rejected.
+Password values are not parser defaults, log fields, or worker configuration.
+Protect the password file and keep a separate recovery copy of the password.
+The backup process holds a symmetric secret and can decrypt existing backups
+made with that secret.
+
+Encryption happens locally through `cryptography` and its native OpenSSL
+library. It does not launch the `openssl` command. Table data retains the
+Zstandard frames received from YT; encryption adds no decompression or
+recompression. Files and documents retain their existing local Zstandard
+compression before encryption.
+
+All data parts, attributes, and manifest contents are encrypted. Node and directory
+names remain readable. Encrypted data parts require `.enc` after their existing
+suffixes, for example `part-000000.skiff.zst.enc`; encrypted attributes use
+`@attributes.yson.enc`. The authenticated JSON manifest keeps `@manifest.json`.
+Experimental encrypted archives without `.enc` are unsupported and rejected on
+export and restore. Encryption is determined by the authenticated manifest, and
+all referenced data and attribute objects must use the corresponding names.
+Data and attribute objects use the OpenSSL
+`enc` format: `Salted__`, an eight-byte random salt, and AES-256-CBC ciphertext
+with PKCS#7 padding. Key and IV derivation uses PBKDF2-HMAC-SHA256 with 100,000
+iterations. Each object gets a fresh salt.
+
+The manifest is an authenticated JSON envelope containing the base64-encoded
+OpenSSL-compatible ciphertext and an HMAC. Archive references retain SHA-256
+and size checks for the stored ciphertext; the encrypted manifest also records
+checksums of the contents before encryption. For data parts these are the
+already-compressed Zstandard bytes, including the frames received from YT.
+Restore authenticates the manifest and checks both the ciphertext and decrypted
+contents before committing the destination node. Raw `openssl enc` alone does
+not perform these archive integrity checks.
+
+Existing unencrypted v2 archives remain readable without `--encrypt`. On restore,
+`--encrypt` requires authenticated encrypted manifests and rejects plaintext
+nodes. An encrypted manifest needs the matching password; missing or wrong
+credentials fail before replacing that node. Repeated encrypted exports also
+need the matching password to inspect the current manifest.
+
+Prefer a new S3 prefix when enabling encryption. Export can replace an existing
+plaintext archive with encrypted generations, but an interrupted conversion
+leaves a mixed tree that requires separate per-node restore modes. Old S3
+versions and abandoned generations may still contain plaintext; enabling
+encryption does not remove them. Use a new prefix when changing passwords;
+automatic password rotation is not supported. Keep the old password as long as
+its backups are needed. These checks are per node; a tree restore is not one
+transaction.
+
+### Manual data recovery
+
+Keep this format description and the password available independently of the
+backup machine. Also keep [`scripts/recover_openssl.py`](scripts/recover_openssl.py)
+for password-file normalization. This standalone helper needs only Python 3.10+
+and OpenSSL 1.1.1 or newer on Linux or macOS; it does not import ytclone or any
+third-party Python packages. Decrypt one downloaded data part:
+
+```bash
+python3 scripts/recover_openssl.py \
+  --password-file /secure/ytclone-password \
+  --input downloaded-part.zst.enc --output part.zst
+zstd -d part.zst -o part.raw
+```
+
+The helper removes exactly one final LF or CRLF and preserves every other byte,
+including spaces and non-UTF-8 bytes. It passes the password in the OpenSSL
+child's environment, without putting it in command arguments or changing the
+calling shell's environment. Direct `openssl -pass file:...` is not equivalent:
+it retains CR from CRLF and truncates long passwords. The helper supports
+passwords longer than 1023 bytes, subject to the operating system's process
+environment size limit; use normal ytclone restore if an unusually large
+password exceeds that limit. Run recovery under an account whose process
+environment is protected from other users.
+
+The OpenSSL invocation uses `enc -d -aes-256-cbc -pbkdf2 -iter 100000 -md sha256`
+with `-pass env:YTCLONE_RECOVERY_PASSWORD`. The helper detects support for
+`-saltlen 8` and adds it for OpenSSL 3.2 or newer; older versions already use an
+eight-byte salt. Use `--openssl /path/to/openssl` to select an executable.
+The result after Zstandard decompression is the archived YSON or Skiff stream,
+as specified by the manifest. Attribute decryption produces YSON directly, with
+no Zstandard step. The JSON manifest envelope must first be authenticated and
+its base64 ciphertext extracted; it is not itself a raw `openssl enc` file. Use
+`ytclone` for normal restoration and its complete integrity checks. A successful
+OpenSSL exit status is not an integrity check for CBC data.
+
 ## Standalone downloads
 
 Download an archive and its matching `.tar.gz.sha256` file from
@@ -168,8 +274,8 @@ file, ordinary mode writes detailed logs to the console.
 | --- | --- |
 | `copied / unchanged / skipped / errors` | Completed nodes, matching copies, reported skips, and node/discovery errors. |
 | `queued / active` | Pending nodes and active node lifecycles, not export streams. |
-| `uploaded / published` | Compressed bytes sent versus bytes belonging to completed archive nodes. |
-| `downloaded / restored` | Compressed bytes received versus bytes belonging to completed restores. |
+| `uploaded / published` | Stored bytes sent versus bytes belonging to completed archive nodes; includes encryption overhead when enabled. |
+| `downloaded / restored` | Stored bytes received versus bytes belonging to completed restores; includes encryption overhead when enabled. |
 
 Transfer counters can include failed attempts; completion counters do not. Source
 sizes are YT storage weights, including replication and compression, **not S3

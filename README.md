@@ -53,6 +53,26 @@ The restore destination is used exactly as given: the children of `events` go
 directly under `//home/analytics/events_copy`. With `--log-file`, progress appears
 on the console and detailed logs are appended to the file.
 
+## Client-side encryption
+
+Add `--encrypt --encryption-password-file /secure/ytclone-password` to export
+or restore. The password file must contain at least 32 bytes; one trailing LF or
+CRLF is accepted. Alternatively, provide `YTCLONE_ENCRYPTION_PASSWORD` and
+`--encrypt`. No password value is accepted on the command line.
+
+Encryption uses the native OpenSSL library through Python `cryptography`, without
+an external process. Table data is encrypted directly after removing YT's
+transport framing, preserving its Zstandard frames. Files and documents are
+encrypted after their existing local compression. Attributes and manifest
+contents are also encrypted. S3 node names remain readable; encrypted data parts
+end in `.zst.enc` and attributes use `@attributes.yson.enc`. The authenticated
+JSON manifest keeps the name `@manifest.json`.
+
+The same password is needed to resume exports and restore. Keep it separately
+from the archive. Existing unencrypted v2 archives remain supported. See
+[encryption and manual recovery](USAGE.md#client-side-encryption) for the format,
+integrity checks, and password rotation limits.
+
 ## Repeated runs
 
 Rerun the command after an interruption or source update. Completed, unchanged

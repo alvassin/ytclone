@@ -27,6 +27,8 @@ ENCODING = {
 }
 DOCUMENT_KIND = "document"
 KINDS = {"table", "file", "map_node", DOCUMENT_KIND}
+ATTRIBUTES_NAME = "@attributes.yson"
+ENCRYPTED_SUFFIX = ".enc"
 
 
 def node_encoding(kind: str, table_format: dict | None = None) -> dict:
@@ -91,6 +93,9 @@ class ObjectRef:
     key: str
     size: int
     sha256: str
+    # Bytes before encryption (compressed for data parts, raw YSON for attributes).
+    plaintext_size: int | None = None
+    plaintext_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -112,7 +117,29 @@ def _ref(value: dict) -> ObjectRef:
         raise ValueError("Invalid object reference")
     if not isinstance(ref.sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", ref.sha256):
         raise ValueError("Invalid object checksum")
+    if ref.plaintext_size is not None or ref.plaintext_sha256 is not None:
+        if not _integer(ref.plaintext_size) or not isinstance(
+            ref.plaintext_sha256, str
+        ):
+            raise ValueError("Invalid plaintext integrity metadata")
+        if not re.fullmatch(r"[a-f0-9]{64}", ref.plaintext_sha256):
+            raise ValueError("Invalid plaintext checksum")
     return ref
+
+
+def validate_encryption(value: dict) -> dict:
+    """Accept only the fixed, versioned OpenSSL encryption profile."""
+    if not isinstance(value, dict) or set(value) != {"format", "iterations", "key_id"}:
+        raise ValueError("Invalid archive encryption settings")
+    if (
+        value["format"] != "openssl-aes-256-cbc-pbkdf2-sha256-v1"
+        or type(value["iterations"]) is not int
+        or value["iterations"] != 100000
+        or not isinstance(value["key_id"], str)
+        or not re.fullmatch(r"[a-f0-9]{64}", value["key_id"])
+    ):
+        raise ValueError("Unsupported archive encryption settings")
+    return dict(value)
 
 
 class UnsupportedArchiveFormat(ValueError):
@@ -136,10 +163,20 @@ class Manifest:
     row_count: int = 0
     data_size: int = 0
     table_format: dict | None = None
+    encryption: dict | None = None
 
     def to_bytes(self) -> bytes:
         """Serialize the versioned manifest as JSON."""
         record = asdict(self)
+        if self.encryption is None:
+            del record["encryption"]
+        else:
+            record["encryption"] = validate_encryption(self.encryption)
+        # Keep unencrypted v2 records byte-compatible with existing readers.
+        for ref in (record["attributes"], *(p["object"] for p in record["parts"])):
+            if ref["plaintext_size"] is None and ref["plaintext_sha256"] is None:
+                del ref["plaintext_size"]
+                del ref["plaintext_sha256"]
         if self.table_format is None:
             del record["table_format"]
         else:
@@ -176,6 +213,15 @@ class Manifest:
                 for p in raw["parts"]
             )
             result = cls(**raw)
+            if result.encryption is not None:
+                validate_encryption(result.encryption)
+            for ref in (result.attributes, *(p.object for p in result.parts)):
+                if (ref.plaintext_sha256 is not None) != (
+                    result.encryption is not None
+                ):
+                    raise ValueError(
+                        "Object integrity metadata differs from encryption mode"
+                    )
             _validate_generation(result.generation)
             if result.kind not in KINDS:
                 raise ValueError("Unsupported node type")
@@ -263,6 +309,7 @@ def _fingerprint(
     compression_level: int,
     part_size: int,
     table_format: dict | None = None,
+    encryption: dict | None = None,
 ) -> str:
     """Hash source identity, the saved attribute digest and encoding settings."""
     settings = {
@@ -276,6 +323,8 @@ def _fingerprint(
         "compression_level": compression_level,
         "part_size": part_size,
     }
+    if encryption is not None:
+        settings["encryption"] = validate_encryption(encryption)
     if kind == "table":
         settings["table_format"] = (
             make_table_format("yson", b"")
@@ -299,6 +348,7 @@ def make_fingerprint(
     compression_level: int,
     part_size: int,
     table_format: str = "yson",
+    encryption: dict | None = None,
 ) -> str:
     """Identify source state and archive encoding settings."""
     selected = None
@@ -319,6 +369,7 @@ def make_fingerprint(
         compression_level=compression_level,
         part_size=part_size,
         table_format=selected,
+        encryption=encryption,
     )
 
 
@@ -330,9 +381,12 @@ def matches_discovery(
     compression_level: int,
     part_size: int,
     table_format: str = "yson",
+    encryption: dict | None = None,
 ) -> bool:
     """Compare discovery revisions and copy settings without reading attributes."""
     source = manifest.source
+    if manifest.encryption != encryption:
+        return False
     if (
         not isinstance(source, dict)
         or not isinstance(node.kind, str)
@@ -374,11 +428,16 @@ def matches_discovery(
         kind=node.kind,
         node_id=node.node_id,
         content_revision=node.content_revision,
-        attributes_digest=manifest.attributes.sha256,
+        attributes_digest=(
+            manifest.attributes.plaintext_sha256
+            if encryption is not None
+            else manifest.attributes.sha256
+        ),
         cluster=cluster,
         compression_level=compression_level,
         part_size=part_size,
         table_format=manifest.table_format if node.kind == "table" else None,
+        encryption=encryption,
     )
 
 
@@ -413,7 +472,20 @@ def generation_prefix(*, prefix: str, generation: str) -> str:
     return object_key(prefix=prefix, name=f"@generations/{generation}")
 
 
-def data_key(*, prefix: str, kind: str, index: int, table_format: str = "yson") -> str:
+def attributes_key(*, prefix: str, encrypted: bool = False) -> str:
+    """Build the attribute object key, marking encrypted bytes explicitly."""
+    suffix = ENCRYPTED_SUFFIX if encrypted else ""
+    return object_key(prefix=prefix, name=ATTRIBUTES_NAME + suffix)
+
+
+def data_key(
+    *,
+    prefix: str,
+    kind: str,
+    index: int,
+    table_format: str = "yson",
+    encrypted: bool = False,
+) -> str:
     """Build the object key for an ordered data part."""
     if kind == "table":
         if table_format not in TABLE_FORMATS:
@@ -421,13 +493,19 @@ def data_key(*, prefix: str, kind: str, index: int, table_format: str = "yson") 
         extension = table_format
     else:
         extension = "yson" if kind == DOCUMENT_KIND else "bin"
-    return object_key(prefix=prefix, name=f"@data/part-{index:06d}.{extension}.zst")
+    suffix = ENCRYPTED_SUFFIX if encrypted else ""
+    return object_key(
+        prefix=prefix, name=f"@data/part-{index:06d}.{extension}.zst{suffix}"
+    )
 
 
 def validate_manifest_location(*, manifest: Manifest, prefix: str) -> None:
     """Require the exact ordered object keys in the declared node generation."""
     prefix = generation_prefix(prefix=prefix, generation=manifest.generation)
-    if manifest.attributes.key != object_key(prefix=prefix, name="@attributes.yson"):
+    encrypted_names = manifest.encryption is not None
+    if manifest.attributes.key != attributes_key(
+        prefix=prefix, encrypted=encrypted_names
+    ):
         raise ValueError("Attributes reference escapes selected generation")
     for index, part in enumerate(manifest.parts):
         if part.object.key != data_key(
@@ -435,6 +513,7 @@ def validate_manifest_location(*, manifest: Manifest, prefix: str) -> None:
             kind=manifest.kind,
             index=index,
             table_format=table_format_name(manifest.table_format),
+            encrypted=encrypted_names,
         ):
             raise ValueError(
                 "Data reference escapes selected generation or has invalid ordering"

@@ -5,12 +5,13 @@ import logging
 import math
 import sys
 from contextlib import nullcontext
+from pathlib import Path
 
 import aiomisc
 import argclass
 from aiomisc.log import LogFormat
 
-from ..cli import LOG_DATE_FORMAT, direction
+from ..cli import LOG_DATE_FORMAT, direction, load_encryption
 from ..cli import Arguments as CopyArguments
 from ..engine import CopyOptions
 from ..format import MIB
@@ -64,6 +65,10 @@ def validate(arguments: Arguments) -> CopyOptions:
         or arguments.progress_interval <= 0
     ):
         raise ValueError("Progress interval must be positive and finite")
+    if arguments.encryption_password_file is not None:
+        arguments.encryption_password_file = str(
+            Path(arguments.encryption_password_file).resolve()
+        )
     return CopyOptions(
         concurrency=arguments.concurrency,
         max_streams=arguments.max_streams,
@@ -73,6 +78,10 @@ def validate(arguments: Arguments) -> CopyOptions:
         compression_level=arguments.compression_level,
         table_format=arguments.table_format,
         compression=arguments.compression,
+        encryption=load_encryption(
+            enabled=arguments.encrypt,
+            password_file=arguments.encryption_password_file,
+        ),
     )
 
 
@@ -92,6 +101,8 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
         "proxy_discovery": not arguments.no_proxy_discovery,
         "table_format": options.table_format,
         "compression": options.compression,
+        "encrypt": arguments.encrypt,
+        "encryption_password_file": arguments.encryption_password_file,
         "endpoint": arguments.endpoint,
         "region": arguments.region,
         "bucket": bucket,
@@ -107,6 +118,8 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
         "log_file": arguments.log_file,
         "progress_interval": arguments.progress_interval,
     }
+    if options.encryption is not None:
+        config["encryption_key_id"] = options.encryption.policy["key_id"]
     log.info(
         "table_compression format=%s mode=yt-zstd-passthrough level=%d",
         options.table_format,
