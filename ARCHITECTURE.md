@@ -29,6 +29,14 @@ digits. The node manifest declares that generation and references only its exact
 attributes and ordered part keys. Generation objects are immutable; only the
 node's `@manifest.json` is replaced when publishing an update.
 
+With client-side encryption, new data and attribute objects append `.enc`, for
+example `part-000000.yson.zst.enc` and `@attributes.yson.enc`. Node directories
+keep their names. The manifest remains `@manifest.json`: it contains an
+authenticated JSON envelope with encrypted contents, rather than raw encrypted
+bytes. Readers also accept early encrypted generations without `.enc`; unchanged
+exports preserve those generations. Each generation uses one naming scheme for
+all its objects, and the manifest determines whether decryption is required.
+
 Tables use binary YSON row fragments or Skiff streams compressed with Zstandard.
 The table manifest records the format and its complete wire schema; restore
 uses that recorded representation. Skiff data parts use `.skiff.zst` instead of

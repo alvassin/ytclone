@@ -78,10 +78,14 @@ Zstandard frames received from YT; encryption adds no decompression or
 recompression. Files and documents retain their existing local Zstandard
 compression before encryption.
 
-All data parts, attributes, and manifest contents are encrypted. Object keys
-and directory names remain readable and unchanged, including their existing
-suffixes. A data object named with a `.zst` suffix therefore contains encrypted
-bytes when encryption is enabled. Data and attribute objects use the OpenSSL
+All data parts, attributes, and manifest contents are encrypted. Node and directory
+names remain readable. New encrypted data parts add `.enc` to their existing
+suffixes, for example `part-000000.skiff.zst.enc`; encrypted attributes use
+`@attributes.yson.enc`. The authenticated JSON manifest keeps `@manifest.json`.
+Early encrypted archives without `.enc` remain readable; unchanged exports keep
+their existing generation rather than rewriting it solely to rename objects.
+Encryption is determined by the authenticated manifest, not the filename.
+Data and attribute objects use the OpenSSL
 `enc` format: `Salted__`, an eight-byte random salt, and AES-256-CBC ciphertext
 with PKCS#7 padding. Key and IV derivation uses PBKDF2-HMAC-SHA256 with 100,000
 iterations. Each object gets a fresh salt.
@@ -113,22 +117,38 @@ transaction.
 ### Manual data recovery
 
 Keep this format description and the password available independently of the
-backup machine. With OpenSSL 3.2 or newer, decrypt one downloaded data part:
+backup machine. Also keep [`scripts/recover_openssl.py`](scripts/recover_openssl.py)
+for password-file normalization. This standalone helper needs only Python 3.10+
+and OpenSSL 1.1.1 or newer on Linux or macOS; it does not import ytclone or any
+third-party Python packages. Decrypt one downloaded data part:
 
 ```bash
-openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 \
-  -saltlen 8 -pass file:/secure/ytclone-password \
-  -in downloaded-part.zst -out part.zst
+python3 scripts/recover_openssl.py \
+  --password-file /secure/ytclone-password \
+  --input downloaded-part.zst.enc --output part.zst
 zstd -d part.zst -o part.raw
 ```
 
-OpenSSL 1.1.1 and 3.0 use an eight-byte salt by default; omit `-saltlen 8` for
-those versions. The result is the archived YSON or Skiff stream, as specified
-by the manifest. Attribute decryption produces YSON directly, with no Zstandard
-step. The JSON manifest envelope must first be authenticated and its base64
-ciphertext extracted; it is not itself a raw `openssl enc` file. Use `ytclone`
-for normal restoration and its complete integrity checks. A successful OpenSSL
-exit status is not an integrity check for CBC data.
+The helper removes exactly one final LF or CRLF and preserves every other byte,
+including spaces and non-UTF-8 bytes. It passes the password in the OpenSSL
+child's environment, without putting it in command arguments or changing the
+calling shell's environment. Direct `openssl -pass file:...` is not equivalent:
+it retains CR from CRLF and truncates long passwords. The helper supports
+passwords longer than 1023 bytes, subject to the operating system's process
+environment size limit; use normal ytclone restore if an unusually large
+password exceeds that limit. Run recovery under an account whose process
+environment is protected from other users.
+
+The OpenSSL invocation uses `enc -d -aes-256-cbc -pbkdf2 -iter 100000 -md sha256`
+with `-pass env:YTCLONE_RECOVERY_PASSWORD`. The helper detects support for
+`-saltlen 8` and adds it for OpenSSL 3.2 or newer; older versions already use an
+eight-byte salt. Use `--openssl /path/to/openssl` to select an executable.
+The result after Zstandard decompression is the archived YSON or Skiff stream,
+as specified by the manifest. Attribute decryption produces YSON directly, with
+no Zstandard step. The JSON manifest envelope must first be authenticated and
+its base64 ciphertext extracted; it is not itself a raw `openssl enc` file. Use
+`ytclone` for normal restoration and its complete integrity checks. A successful
+OpenSSL exit status is not an integrity check for CBC data.
 
 ## Standalone downloads
 

@@ -27,6 +27,8 @@ ENCODING = {
 }
 DOCUMENT_KIND = "document"
 KINDS = {"table", "file", "map_node", DOCUMENT_KIND}
+ATTRIBUTES_NAME = "@attributes.yson"
+ENCRYPTED_SUFFIX = ".enc"
 
 
 def node_encoding(kind: str, table_format: dict | None = None) -> dict:
@@ -470,7 +472,20 @@ def generation_prefix(*, prefix: str, generation: str) -> str:
     return object_key(prefix=prefix, name=f"@generations/{generation}")
 
 
-def data_key(*, prefix: str, kind: str, index: int, table_format: str = "yson") -> str:
+def attributes_key(*, prefix: str, encrypted: bool = False) -> str:
+    """Build the attribute object key, marking encrypted bytes explicitly."""
+    suffix = ENCRYPTED_SUFFIX if encrypted else ""
+    return object_key(prefix=prefix, name=ATTRIBUTES_NAME + suffix)
+
+
+def data_key(
+    *,
+    prefix: str,
+    kind: str,
+    index: int,
+    table_format: str = "yson",
+    encrypted: bool = False,
+) -> str:
     """Build the object key for an ordered data part."""
     if kind == "table":
         if table_format not in TABLE_FORMATS:
@@ -478,13 +493,23 @@ def data_key(*, prefix: str, kind: str, index: int, table_format: str = "yson") 
         extension = table_format
     else:
         extension = "yson" if kind == DOCUMENT_KIND else "bin"
-    return object_key(prefix=prefix, name=f"@data/part-{index:06d}.{extension}.zst")
+    suffix = ENCRYPTED_SUFFIX if encrypted else ""
+    return object_key(
+        prefix=prefix, name=f"@data/part-{index:06d}.{extension}.zst{suffix}"
+    )
 
 
 def validate_manifest_location(*, manifest: Manifest, prefix: str) -> None:
     """Require the exact ordered object keys in the declared node generation."""
     prefix = generation_prefix(prefix=prefix, generation=manifest.generation)
-    if manifest.attributes.key != object_key(prefix=prefix, name="@attributes.yson"):
+    # Early encrypted archives used the plaintext filenames. Keep those readable,
+    # but require one consistent naming scheme within each generation.
+    encrypted_names = manifest.encryption is not None and manifest.attributes.key == (
+        attributes_key(prefix=prefix, encrypted=True)
+    )
+    if manifest.attributes.key != attributes_key(
+        prefix=prefix, encrypted=encrypted_names
+    ):
         raise ValueError("Attributes reference escapes selected generation")
     for index, part in enumerate(manifest.parts):
         if part.object.key != data_key(
@@ -492,6 +517,7 @@ def validate_manifest_location(*, manifest: Manifest, prefix: str) -> None:
             kind=manifest.kind,
             index=index,
             table_format=table_format_name(manifest.table_format),
+            encrypted=encrypted_names,
         ):
             raise ValueError(
                 "Data reference escapes selected generation or has invalid ordering"

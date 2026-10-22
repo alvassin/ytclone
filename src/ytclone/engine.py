@@ -15,6 +15,8 @@ from yt import yson
 from .encryption import ENCRYPTED_MANIFEST_FORMAT, ArchiveEncryption, PlaintextDigest
 from .export_pool import PartPool
 from .format import (
+    ATTRIBUTES_NAME,
+    ENCRYPTED_SUFFIX,
     KINDS,
     MIB,
     DiscoveredNode,
@@ -24,6 +26,7 @@ from .format import (
     Part,
     Range,
     attributes_hash,
+    attributes_key,
     data_key,
     generation_prefix,
     make_fingerprint,
@@ -406,6 +409,7 @@ async def _export_parts(
                 kind=node.kind,
                 index=part.index,
                 table_format=table_format_name(node.table_format),
+                encrypted=options.encryption is not None,
             ),
             part=part,
             compression_level=options.compression_level,
@@ -516,7 +520,7 @@ async def export_node(
                 generation = uuid4().hex
                 staged = generation_prefix(prefix=target, generation=generation)
                 attributes = await storage.put_bytes(
-                    key=object_key(prefix=staged, name="@attributes.yson"),
+                    key=attributes_key(prefix=staged, encrypted=encryption is not None),
                     data=(
                         node.attributes
                         if encryption is None
@@ -783,7 +787,8 @@ def _node_from_key(*, key: str, source_prefix: str) -> str | None:
         if name == "@data" and index + 1 < len(components):
             return (base + "/".join(components[:index])).rstrip("/")
         if (
-            name in ("@attributes.yson", "@manifest.json")
+            name
+            in (ATTRIBUTES_NAME, ATTRIBUTES_NAME + ENCRYPTED_SUFFIX, "@manifest.json")
             and index == len(components) - 1
         ):
             return (base + "/".join(components[:index])).rstrip("/")
@@ -878,14 +883,15 @@ async def restore_tree(
                     found(prefix)
                     raise ValueError(f"Incomplete archive directory: {prefix}")
             # A virtual parent is legitimate when only a descendant was exported.
-            if (
-                await storage.read_bytes(
-                    key=object_key(prefix=prefix, name="@attributes.yson")
-                )
-                is not None
-            ):
-                found(prefix)
-                raise ValueError(f"Incomplete archive directory: {prefix}")
+            for encrypted in (False, True):
+                if (
+                    await storage.read_bytes(
+                        key=attributes_key(prefix=prefix, encrypted=encrypted)
+                    )
+                    is not None
+                ):
+                    found(prefix)
+                    raise ValueError(f"Incomplete archive directory: {prefix}")
             # Virtual parents have no source metadata to overwrite existing attrs.
             await yt.ensure_directory(path=path)
         directories.add(prefix)

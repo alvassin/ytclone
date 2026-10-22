@@ -241,11 +241,14 @@ def assert_table_archive(
                 manifest_data = await encryption.open_manifest(manifest_data)
             manifest = Manifest.from_bytes(manifest_data)
             assert (manifest.encryption is not None) == (encryption is not None)
+            suffix = ".enc" if encryption is not None else ""
+            assert manifest.attributes.key.endswith("/@attributes.yson" + suffix)
             assert manifest.kind == "table"
             assert manifest.table_format["name"] == table_format
             assert len(manifest.parts) >= min_parts
             decoded = []
             for part in manifest.parts:
+                assert part.object.key.endswith(f".{table_format}.zst{suffix}")
                 remaining = b"".join(
                     [chunk async for chunk in storage.download(ref=part.object)]
                 )

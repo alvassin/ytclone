@@ -16,6 +16,7 @@ from test_engine import (
     SOURCE,
     MemoryStorage,
     MemoryYt,
+    discovered_node,
     export,
     make_node,
     manifest_key,
@@ -136,6 +137,8 @@ def test_real_adapter_encrypted_roundtrip_preserves_data_and_attributes(
                 await encryption.open_manifest(storage.objects[key])
             )
             assert manifest.encryption == encryption.policy
+            assert manifest.attributes.key.endswith("/@attributes.yson.enc")
+            assert all(part.object.key.endswith(".zst.enc") for part in manifest.parts)
             for ref in (manifest.attributes, *(p.object for p in manifest.parts)):
                 ciphertext = storage.objects[ref.key]
                 plaintext = await encryption.decrypt_bytes(ciphertext)
@@ -208,6 +211,73 @@ def test_encryption_upgrades_unchanged_plaintext_generation(encryption):
             for ref in [old.attributes, *(p.object for p in old.parts)]
         )
         assert (await restore(yt, storage, encryption)).completed == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("discovery", [False, True])
+def test_legacy_encrypted_names_restore_and_skip_without_reupload(
+    encryption, discovery
+):
+    async def scenario():
+        yt, storage, events = memory_archive()
+        selected = replace(options(), encryption=encryption)
+        await export(yt=yt, storage=storage, copy_options=selected)
+        current = await open_manifest(storage, encryption)
+
+        def legacy_ref(ref):
+            key = ref.key.removesuffix(".enc")
+            storage.objects[key] = storage.objects.pop(ref.key)
+            return replace(ref, key=key)
+
+        legacy = replace(
+            current,
+            attributes=legacy_ref(current.attributes),
+            parts=tuple(
+                replace(part, object=legacy_ref(part.object)) for part in current.parts
+            ),
+        )
+        storage.objects[manifest_key()] = await encryption.seal_manifest(
+            legacy.to_bytes()
+        )
+        before = dict(storage.objects)
+        events.clear()
+        yt.reads.clear()
+        async with PartPool(yt=yt, concurrency=1) as pool:
+            assert await export_node(
+                pool=pool,
+                yt=yt,
+                storage=storage,
+                path=SOURCE,
+                prefix=PREFIX,
+                cluster=current.source["cluster"],
+                options=selected,
+                discovered=discovered_node(yt.nodes[SOURCE]) if discovery else None,
+            ) == ("skipped", "unchanged")
+        assert storage.objects == before
+        assert yt.reads == []
+        assert not any(event[0] in {"put", "upload", "delete"} for event in events)
+        assert (await restore(yt, storage, encryption)).completed == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("with_child", [False, True])
+def test_orphan_encrypted_attributes_are_an_incomplete_archive(encryption, with_child):
+    async def scenario():
+        yt, storage, _ = memory_archive(node=make_node(path=SOURCE + "/child"))
+        if with_child:
+            await export(
+                yt=yt,
+                storage=storage,
+                copy_options=replace(options(), encryption=encryption),
+            )
+        storage.objects[
+            "archive/source/@attributes.yson.enc"
+        ] = await encryption.encrypt_bytes(b"{}")
+        result = await restore(yt, storage, encryption)
+        assert result.failed > 0 and result.completed == 0
+        assert yt.restored == {}
 
     asyncio.run(scenario())
 
@@ -446,7 +516,7 @@ def test_already_compressed_skiff_stream_is_encrypted_without_recompression(
         assert manifest.table_format == node.table_format
         assert len(manifest.parts) == 1
         ref = manifest.parts[0].object
-        assert ref.key.endswith(".skiff.zst")
+        assert ref.key.endswith(".skiff.zst.enc")
         assert await encryption.decrypt_bytes(storage.objects[ref.key]) == wire
         assert ref.plaintext_size == len(wire)
         assert ref.plaintext_sha256 == hashlib.sha256(wire).hexdigest()

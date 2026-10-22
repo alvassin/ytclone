@@ -64,7 +64,9 @@ Encryption uses the native OpenSSL library through Python `cryptography`, withou
 an external process. Table data is encrypted directly after removing YT's
 transport framing, preserving its Zstandard frames. Files and documents are
 encrypted after their existing local compression. Attributes and manifest
-contents are also encrypted; S3 object names remain readable.
+contents are also encrypted. S3 node names remain readable; encrypted data parts
+end in `.zst.enc` and attributes use `@attributes.yson.enc`. The authenticated
+JSON manifest keeps the name `@manifest.json`.
 
 The same password is needed to resume exports and restore. Keep it separately
 from the archive. Existing unencrypted v2 archives remain supported. See

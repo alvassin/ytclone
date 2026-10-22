@@ -6,7 +6,9 @@ from dataclasses import replace
 import pytest
 from test_format import manifest
 
-from ytclone.format import Manifest
+from ytclone.format import Manifest, validate_manifest_location
+
+PREFIX = "archive/source/table"
 
 POLICY = {
     "format": "openssl-aes-256-cbc-pbkdf2-sha256-v1",
@@ -15,11 +17,16 @@ POLICY = {
 }
 
 
-def encrypted_manifest():
+def encrypted_manifest(*, encrypted_names=False):
     original = manifest()
 
     def encrypted_ref(ref):
-        return replace(ref, plaintext_size=ref.size, plaintext_sha256=ref.sha256)
+        return replace(
+            ref,
+            key=ref.key + ".enc" if encrypted_names else ref.key,
+            plaintext_size=ref.size,
+            plaintext_sha256=ref.sha256,
+        )
 
     return replace(
         original,
@@ -91,3 +98,71 @@ def test_plaintext_manifest_cannot_smuggle_encrypted_object_refs():
     del record["encryption"]
     with pytest.raises(ValueError):
         Manifest.from_bytes(json.dumps(record).encode())
+
+
+@pytest.mark.parametrize("encrypted_names", [False, True])
+def test_encrypted_locations_accept_legacy_and_explicit_names(encrypted_names):
+    value = encrypted_manifest(encrypted_names=encrypted_names)
+    validate_manifest_location(manifest=value, prefix=PREFIX)
+
+
+@pytest.mark.parametrize("encrypted_names", [False, True])
+@pytest.mark.parametrize("target", ["attributes", "part"])
+def test_encrypted_locations_reject_mixed_names(encrypted_names, target):
+    value = encrypted_manifest(encrypted_names=encrypted_names)
+    ref = value.attributes if target == "attributes" else value.parts[0].object
+    changed = replace(ref, key=ref.key[:-4] if encrypted_names else ref.key + ".enc")
+    if target == "attributes":
+        value = replace(value, attributes=changed)
+    else:
+        value = replace(
+            value,
+            parts=(replace(value.parts[0], object=changed), *value.parts[1:]),
+        )
+    with pytest.raises(ValueError, match="escapes selected generation"):
+        validate_manifest_location(manifest=value, prefix=PREFIX)
+
+
+@pytest.mark.parametrize("target", ["attributes", "part", "all"])
+def test_plaintext_locations_reject_encrypted_names(target):
+    value = manifest()
+    if target in {"attributes", "all"}:
+        value = replace(
+            value,
+            attributes=replace(value.attributes, key=value.attributes.key + ".enc"),
+        )
+    if target in {"part", "all"}:
+        value = replace(
+            value,
+            parts=tuple(
+                replace(part, object=replace(part.object, key=part.object.key + ".enc"))
+                for part in value.parts
+            ),
+        )
+    with pytest.raises(ValueError, match="escapes selected generation"):
+        validate_manifest_location(manifest=value, prefix=PREFIX)
+
+
+@pytest.mark.parametrize("encrypted_names", [False, True])
+@pytest.mark.parametrize("target", ["attributes", "part"])
+def test_encrypted_locations_reject_cross_generation_refs(encrypted_names, target):
+    value = encrypted_manifest(encrypted_names=encrypted_names)
+    ref = value.attributes if target == "attributes" else value.parts[0].object
+    changed = replace(ref, key=ref.key.replace(value.generation, "b" * 32))
+    if target == "attributes":
+        value = replace(value, attributes=changed)
+    else:
+        value = replace(
+            value,
+            parts=(replace(value.parts[0], object=changed), *value.parts[1:]),
+        )
+    with pytest.raises(ValueError, match="escapes selected generation"):
+        validate_manifest_location(manifest=value, prefix=PREFIX)
+
+
+@pytest.mark.parametrize("encrypted_names", [False, True])
+def test_encrypted_locations_reject_reordered_parts(encrypted_names):
+    value = encrypted_manifest(encrypted_names=encrypted_names)
+    value = replace(value, parts=tuple(reversed(value.parts)))
+    with pytest.raises(ValueError, match="invalid ordering"):
+        validate_manifest_location(manifest=value, prefix=PREFIX)
