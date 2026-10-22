@@ -502,11 +502,7 @@ def data_key(
 def validate_manifest_location(*, manifest: Manifest, prefix: str) -> None:
     """Require the exact ordered object keys in the declared node generation."""
     prefix = generation_prefix(prefix=prefix, generation=manifest.generation)
-    # Early encrypted archives used the plaintext filenames. Keep those readable,
-    # but require one consistent naming scheme within each generation.
-    encrypted_names = manifest.encryption is not None and manifest.attributes.key == (
-        attributes_key(prefix=prefix, encrypted=True)
-    )
+    encrypted_names = manifest.encryption is not None
     if manifest.attributes.key != attributes_key(
         prefix=prefix, encrypted=encrypted_names
     ):

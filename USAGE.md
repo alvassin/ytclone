@@ -79,12 +79,12 @@ recompression. Files and documents retain their existing local Zstandard
 compression before encryption.
 
 All data parts, attributes, and manifest contents are encrypted. Node and directory
-names remain readable. New encrypted data parts add `.enc` to their existing
+names remain readable. Encrypted data parts require `.enc` after their existing
 suffixes, for example `part-000000.skiff.zst.enc`; encrypted attributes use
 `@attributes.yson.enc`. The authenticated JSON manifest keeps `@manifest.json`.
-Early encrypted archives without `.enc` remain readable; unchanged exports keep
-their existing generation rather than rewriting it solely to rename objects.
-Encryption is determined by the authenticated manifest, not the filename.
+Experimental encrypted archives without `.enc` are unsupported and rejected on
+export and restore. Encryption is determined by the authenticated manifest, and
+all referenced data and attribute objects must use the corresponding names.
 Data and attribute objects use the OpenSSL
 `enc` format: `Salted__`, an eight-byte random salt, and AES-256-CBC ciphertext
 with PKCS#7 padding. Key and IV derivation uses PBKDF2-HMAC-SHA256 with 100,000

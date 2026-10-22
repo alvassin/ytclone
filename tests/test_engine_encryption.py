@@ -216,7 +216,7 @@ def test_encryption_upgrades_unchanged_plaintext_generation(encryption):
 
 
 @pytest.mark.parametrize("discovery", [False, True])
-def test_legacy_encrypted_names_restore_and_skip_without_reupload(
+def test_encrypted_names_without_suffix_fail_before_reads_or_writes(
     encryption, discovery
 ):
     async def scenario():
@@ -243,21 +243,30 @@ def test_legacy_encrypted_names_restore_and_skip_without_reupload(
         before = dict(storage.objects)
         events.clear()
         yt.reads.clear()
+        storage.reads.clear()
+        storage.checked.clear()
         async with PartPool(yt=yt, concurrency=1) as pool:
-            assert await export_node(
-                pool=pool,
-                yt=yt,
-                storage=storage,
-                path=SOURCE,
-                prefix=PREFIX,
-                cluster=current.source["cluster"],
-                options=selected,
-                discovered=discovered_node(yt.nodes[SOURCE]) if discovery else None,
-            ) == ("skipped", "unchanged")
+            with pytest.raises(ValueError, match="Attributes reference"):
+                await export_node(
+                    pool=pool,
+                    yt=yt,
+                    storage=storage,
+                    path=SOURCE,
+                    prefix=PREFIX,
+                    cluster=current.source["cluster"],
+                    options=selected,
+                    discovered=discovered_node(yt.nodes[SOURCE]) if discovery else None,
+                )
+        assert storage.reads == [manifest_key()]
+        result = await restore(yt, storage, encryption)
+        assert result.failed > 0 and result.completed == 0
         assert storage.objects == before
         assert yt.reads == []
-        assert not any(event[0] in {"put", "upload", "delete"} for event in events)
-        assert (await restore(yt, storage, encryption)).completed == 1
+        assert yt.restored == {}
+        assert events == []
+        assert set(storage.reads) == {manifest_key()}
+        assert storage.checked == []
+        assert storage.downloaded == []
 
     asyncio.run(scenario())
 
@@ -587,7 +596,7 @@ def test_encrypted_download_retry_rolls_back_then_replays_complete_node(
 ):
     monkeypatch.setattr(restore_retry, "retry_delay", lambda *, attempt: 0)
     case = make_case(kind=kind)
-    failed_key = case.manifest.parts[1].object.key
+    failed_key = case.manifest.parts[1].object.key + ".enc"
 
     class FlakyEncryptedStorage(EncryptedStorage):
         failed = False
@@ -606,9 +615,11 @@ def test_encrypted_download_retry_rolls_back_then_replays_complete_node(
         async def encrypted_ref(ref):
             plaintext = case.storage.objects[ref.key]
             ciphertext = await encryption.encrypt_bytes(plaintext)
-            storage.objects[ref.key] = ciphertext
+            key = ref.key + ".enc"
+            storage.objects[key] = ciphertext
             return replace(
                 ref,
+                key=key,
                 size=len(ciphertext),
                 sha256=hashlib.sha256(ciphertext).hexdigest(),
                 plaintext_size=len(plaintext),
