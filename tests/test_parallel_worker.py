@@ -522,7 +522,8 @@ def test_unexpected_messages_stop_the_pool(message_type):
     asyncio.run(scenario())
 
 
-def test_run_worker_builds_process_local_resources(monkeypatch):
+@pytest.mark.parametrize("yt_zstd_passthrough", [None, False, True])
+def test_run_worker_builds_process_local_resources(monkeypatch, yt_zstd_passthrough):
     """Resource wiring uses explicit endpoint settings and inherited credentials."""
     seen = {}
 
@@ -575,8 +576,12 @@ def test_run_worker_builds_process_local_resources(monkeypatch):
             "part_size": 256 * 1024**2,
             "chunk_size": 32 * 1024**2,
             "compression_level": 3,
+            "table_format": "skiff",
+            "compression": "zstd",
             "progress_interval": 7,
         }
+        if yt_zstd_passthrough is not None:
+            config["yt_zstd_passthrough"] = yt_zstd_passthrough
         await worker.run_worker(
             reader=asyncio.StreamReader(), writer=MemoryWriter(), config=config
         )
@@ -591,6 +596,10 @@ def test_run_worker_builds_process_local_resources(monkeypatch):
     assert seen["serve"]["prefix"] == "snapshots"
     assert seen["serve"]["cluster"] == "https://yt.test"
     assert seen["yt_options"]["proxy_discovery"] is False
+    assert seen["yt_options"]["table_format"] == "skiff"
+    assert seen["serve"]["options"].table_format == "skiff"
+    assert seen["serve"]["options"].compression == "zstd"
+    assert "yt_zstd_passthrough" not in seen["yt_options"]
 
 
 def test_entrypoint_stdout_contains_only_protocol(tmp_path):

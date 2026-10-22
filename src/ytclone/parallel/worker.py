@@ -196,12 +196,15 @@ async def run_worker(
         part_size=config["part_size"],
         chunk_size=config["chunk_size"],
         compression_level=config["compression_level"],
+        table_format=config.get("table_format", "yson"),
+        compression=config.get("compression", "zstd"),
     )
     progress = Progress()
     yt = YtAdapter(
         proxy=config["yt_proxy"],
         proxy_discovery=config["proxy_discovery"],
         progress=progress,
+        table_format=options.table_format,
     )
 
     async with aiohttp.ClientSession(

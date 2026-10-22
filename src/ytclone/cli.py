@@ -58,6 +58,20 @@ class Arguments(argclass.Parser):
     compression_level: int = argclass.Argument(
         default=3, help="Zstandard level, -7..22"
     )
+    table_format: str = argclass.Argument(
+        default="yson",
+        choices=("yson", "skiff"),
+        help="Export table format; restore uses the archived format and schema",
+    )
+    compression: str = argclass.Argument(
+        default="zstd",
+        choices=("zstd",),
+        help="Archive compression; tables use YT compression without local transcoding",
+    )
+    yt_zstd_passthrough: bool = argclass.Argument(
+        default=False,
+        help="Deprecated export alias: table Zstandard passthrough is always enabled",
+    )
     log_file: str | None = argclass.Argument(
         default=None,
         type=str,
@@ -120,6 +134,11 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
     )
     if export:
         log.info("export_parallelism max_streams=%d", options.stream_limit)
+        log.info(
+            "table_compression format=%s mode=yt-zstd-passthrough level=%d",
+            options.table_format,
+            options.compression_level,
+        )
 
     progress = Progress() if arguments.log_file else None
     if progress is not None:
@@ -146,6 +165,7 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
             proxy=arguments.yt_proxy,
             proxy_discovery=not arguments.no_proxy_discovery,
             progress=progress,
+            table_format=options.table_format,
         )
         estimate_task = (
             asyncio.create_task(estimate_total(yt=yt, path=yt_path, progress=progress))
@@ -234,6 +254,12 @@ def main() -> int:
         )
         if not export and arguments.max_streams != 0:
             raise ValueError("Maximum streams applies to export only")
+        if not export and arguments.yt_zstd_passthrough:
+            raise ValueError("YT Zstandard passthrough applies to export only")
+        if not export and arguments.table_format != "yson":
+            raise ValueError(
+                "Table format applies to export only; restore uses the manifest"
+            )
         options = CopyOptions(
             concurrency=arguments.concurrency,
             max_streams=arguments.max_streams,
@@ -241,6 +267,8 @@ def main() -> int:
             part_size=arguments.part_size_mib * MIB,
             chunk_size=arguments.buffer_size_mib * MIB,
             compression_level=arguments.compression_level,
+            table_format=arguments.table_format,
+            compression=arguments.compression,
         )
     except ValueError as exc:
         arguments.create_parser().error(str(exc))

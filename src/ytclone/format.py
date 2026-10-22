@@ -9,17 +9,17 @@ from urllib.parse import quote, unquote, urlsplit
 
 from yt import yson
 
+from .table_format import (
+    ROW_FORMAT,  # noqa: F401 -- compatibility import for existing callers
+    TABLE_FORMATS,
+    make_table_format,
+    table_format_name,
+    validate_table_format,
+)
+
 MIB = 1024 * 1024
 FORMAT = "yt-s3-v2"
 RESTORE_MARKER = "yt_s3_state"
-ROW_FORMAT = {
-    "format": "binary",
-    "complex_type_mode": "positional",
-    "string_keyed_dict_mode": "positional",
-    "decimal_mode": "binary",
-    "time_mode": "binary",
-    "uuid_mode": "binary",
-}
 ENCODING = {
     "tables": "binary_yson_list_fragment",
     "files": "bytes",
@@ -29,8 +29,13 @@ DOCUMENT_KIND = "document"
 KINDS = {"table", "file", "map_node", DOCUMENT_KIND}
 
 
-def node_encoding(kind: str) -> dict:
+def node_encoding(kind: str, table_format: dict | None = None) -> dict:
     """Describe the encoding used for each supported node kind."""
+    if table_format is not None:
+        if kind != "table":
+            raise ValueError("Table format is only valid for tables")
+        if table_format_name(table_format) == "skiff":
+            return {**ENCODING, "tables": "skiff"}
     if kind == DOCUMENT_KIND:
         return {**ENCODING, "documents": "binary_yson_node"}
     return ENCODING
@@ -63,6 +68,7 @@ class Node:
     dynamic: bool = False
     disk_size: int | None = None
     attribute_revision: int | None = None
+    table_format: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -129,11 +135,21 @@ class Manifest:
     parts: tuple[Part, ...]
     row_count: int = 0
     data_size: int = 0
+    table_format: dict | None = None
 
     def to_bytes(self) -> bytes:
         """Serialize the versioned manifest as JSON."""
+        record = asdict(self)
+        if self.table_format is None:
+            del record["table_format"]
+        else:
+            record["table_format"] = validate_table_format(self.table_format)
         return json.dumps(
-            {"format": FORMAT, "encoding": node_encoding(self.kind), **asdict(self)},
+            {
+                "format": FORMAT,
+                "encoding": node_encoding(self.kind, self.table_format),
+                **record,
+            },
             sort_keys=True,
             indent=2,
         ).encode()
@@ -149,7 +165,10 @@ class Manifest:
                     f"Unsupported archive format {archive_format!r}; expected {FORMAT}. "
                     "Re-export the source to a new archive prefix."
                 )
-            if raw.pop("encoding") != node_encoding(raw["kind"]):
+            table_format = raw.get("table_format")
+            if table_format is not None:
+                raw["table_format"] = validate_table_format(table_format)
+            if raw.pop("encoding") != node_encoding(raw["kind"], table_format):
                 raise ValueError("Unsupported archive encoding")
             raw["attributes"] = _ref(raw["attributes"])
             raw["parts"] = tuple(
@@ -243,21 +262,30 @@ def _fingerprint(
     cluster: str,
     compression_level: int,
     part_size: int,
+    table_format: dict | None = None,
 ) -> str:
     """Hash source identity, the saved attribute digest and encoding settings."""
+    settings = {
+        "format": FORMAT,
+        "encoding": node_encoding(kind, table_format),
+        "cluster": cluster.rstrip("/"),
+        "kind": kind,
+        "node_id": node_id,
+        "content_revision": content_revision if kind != "map_node" else None,
+        "attributes": attributes_digest,
+        "compression_level": compression_level,
+        "part_size": part_size,
+    }
+    if kind == "table":
+        settings["table_format"] = (
+            make_table_format("yson", b"")
+            if table_format is None
+            else validate_table_format(table_format)
+        )
+        settings["table_compression"] = "yt-zstd-passthrough"
     return attributes_hash(
         json.dumps(
-            {
-                "format": FORMAT,
-                "encoding": node_encoding(kind),
-                "cluster": cluster.rstrip("/"),
-                "kind": kind,
-                "node_id": node_id,
-                "content_revision": content_revision if kind != "map_node" else None,
-                "attributes": attributes_digest,
-                "compression_level": compression_level,
-                "part_size": part_size,
-            },
+            settings,
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
@@ -265,9 +293,23 @@ def _fingerprint(
 
 
 def make_fingerprint(
-    *, node: Node, cluster: str, compression_level: int, part_size: int
+    *,
+    node: Node,
+    cluster: str,
+    compression_level: int,
+    part_size: int,
+    table_format: str = "yson",
 ) -> str:
     """Identify source state and archive encoding settings."""
+    selected = None
+    if node.kind == "table":
+        selected = (
+            make_table_format(table_format, node.attributes)
+            if node.table_format is None
+            else validate_table_format(node.table_format)
+        )
+        if selected["name"] != table_format:
+            raise ValueError("Snapshot format does not match requested table format")
     return _fingerprint(
         kind=node.kind,
         node_id=node.node_id,
@@ -276,6 +318,7 @@ def make_fingerprint(
         cluster=cluster,
         compression_level=compression_level,
         part_size=part_size,
+        table_format=selected,
     )
 
 
@@ -286,6 +329,7 @@ def matches_discovery(
     cluster: str,
     compression_level: int,
     part_size: int,
+    table_format: str = "yson",
 ) -> bool:
     """Compare discovery revisions and copy settings without reading attributes."""
     source = manifest.source
@@ -314,6 +358,11 @@ def matches_discovery(
         return False
     if node.kind == "table" and node.dynamic is not False:
         return False
+    if (
+        node.kind == "table"
+        and table_format_name(manifest.table_format) != table_format
+    ):
+        return False
     if node.kind != "map_node":
         revision = source.get("content_revision")
         if not _integer(node.content_revision) or not _integer(revision):
@@ -329,6 +378,7 @@ def matches_discovery(
         cluster=cluster,
         compression_level=compression_level,
         part_size=part_size,
+        table_format=manifest.table_format if node.kind == "table" else None,
     )
 
 
@@ -363,9 +413,14 @@ def generation_prefix(*, prefix: str, generation: str) -> str:
     return object_key(prefix=prefix, name=f"@generations/{generation}")
 
 
-def data_key(*, prefix: str, kind: str, index: int) -> str:
+def data_key(*, prefix: str, kind: str, index: int, table_format: str = "yson") -> str:
     """Build the object key for an ordered data part."""
-    extension = "yson" if kind in ("table", DOCUMENT_KIND) else "bin"
+    if kind == "table":
+        if table_format not in TABLE_FORMATS:
+            raise ValueError("Unsupported table format")
+        extension = table_format
+    else:
+        extension = "yson" if kind == DOCUMENT_KIND else "bin"
     return object_key(prefix=prefix, name=f"@data/part-{index:06d}.{extension}.zst")
 
 
@@ -375,7 +430,12 @@ def validate_manifest_location(*, manifest: Manifest, prefix: str) -> None:
     if manifest.attributes.key != object_key(prefix=prefix, name="@attributes.yson"):
         raise ValueError("Attributes reference escapes selected generation")
     for index, part in enumerate(manifest.parts):
-        if part.object.key != data_key(prefix=prefix, kind=manifest.kind, index=index):
+        if part.object.key != data_key(
+            prefix=prefix,
+            kind=manifest.kind,
+            index=index,
+            table_format=table_format_name(manifest.table_format),
+        ):
             raise ValueError(
                 "Data reference escapes selected generation or has invalid ordering"
             )

@@ -71,6 +71,8 @@ def validate(arguments: Arguments) -> CopyOptions:
         part_size=arguments.part_size_mib * MIB,
         chunk_size=arguments.buffer_size_mib * MIB,
         compression_level=arguments.compression_level,
+        table_format=arguments.table_format,
+        compression=arguments.compression,
     )
 
 
@@ -88,6 +90,8 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
     config = {
         "yt_proxy": arguments.yt_proxy,
         "proxy_discovery": not arguments.no_proxy_discovery,
+        "table_format": options.table_format,
+        "compression": options.compression,
         "endpoint": arguments.endpoint,
         "region": arguments.region,
         "bucket": bucket,
@@ -103,6 +107,11 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
         "log_file": arguments.log_file,
         "progress_interval": arguments.progress_interval,
     }
+    log.info(
+        "table_compression format=%s mode=yt-zstd-passthrough level=%d",
+        options.table_format,
+        options.compression_level,
+    )
     budget = arguments.processes * estimate_memory_mib(
         concurrency=options.stream_limit,
         snapshot_concurrency=options.concurrency,

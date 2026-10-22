@@ -120,7 +120,19 @@ For example, export both `//home/analytics/events` and `//home/analytics` to
 | `--queue-size` | `16` | Pending paths in ordinary mode; control messages per process in parallel mode. |
 | `--part-size-mib` | `256` | Target **uncompressed** bytes per archive object; approximate for tables. |
 | `--buffer-size-mib` | `32` | S3 multipart buffer per active stream, from 5 to 512 MiB. |
-| `--compression-level` | `3` | Zstandard level, from -7 to 22; higher levels use more CPU and memory. |
+| `--table-format` | `yson` | Export table rows as binary YSON or `skiff`. The manifest records the format and wire schema; restore chooses automatically. |
+| `--compression` | `zstd` | Export compression codec. Zstandard is the only supported codec. |
+| `--compression-level` | `3` | Zstandard level, from -7 to 22; higher levels use more CPU and memory. Tables are compressed by the YT proxy; files and documents are compressed locally. |
+| `--yt-zstd-passthrough` | off | Deprecated export-only no-op. All table exports already request Zstandard from YT. |
+
+The supported table combinations are YSON + Zstandard and Skiff + Zstandard.
+Table data arrives compressed from YT in both cases; there is no local table
+compression fallback. Skiff's recorded wire schema includes a YSON catch-all
+field for complex values and columns outside the declared schema. Restore does
+not require these export options, including when reading older YSON manifests.
+Changing the table format or compression level invalidates unchanged detection
+for that table. Use a fresh S3 prefix for timing comparisons so earlier backups
+do not turn a measured run into skipped work.
 
 For example, allow four active nodes to share eight export streams in one process:
 

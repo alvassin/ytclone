@@ -69,6 +69,38 @@ to export large tables through several streams, or
 [`ytclone-parallel`](https://github.com/alvassin/ytclone/blob/main/USAGE.md#parallel-export)
 for multiple copy processes. Both apply to YT → S3; restore with `ytclone`.
 
+### Table format and compression
+
+Both export commands now request Zstandard-compressed table data from the YT
+proxy by default. They remove the `z-zstd_<level>` transport container and upload
+its standard Zstandard frames without local decompression or recompression.
+Files and documents continue to use local Zstandard compression.
+
+The initial supported combinations are `--table-format yson` (the default) or
+`--table-format skiff`, with `--compression zstd` and `--compression-level 3`.
+For example:
+
+```bash
+ytclone //home/analytics/events s3://my-bucket/skiff-export \
+  --table-format skiff --compression-level 3 --log-file export.log
+```
+
+Each table's manifest records its wire format and schema. Restore selects them
+automatically, so no format option is needed. Skiff keeps complex values and
+columns outside the declared schema in its YSON catch-all field. Schemas,
+unsigned integers, binary strings and nulls are preserved.
+
+The deprecated `--yt-zstd-passthrough` export option is accepted as a no-op;
+omitting it now gives the same table compression behavior. Unsupported proxy
+compression fails explicitly, without falling back to local table compression.
+Proxy blocks may compress less efficiently than a continuous local stream.
+Use fresh destination prefixes when comparing formats or compression levels;
+repeated unchanged copies are skipped. Changing a table's format or compression
+level forces a fresh export of that table. Existing v2 YSON archives remain
+readable, but upgrading from local table compression causes a one-time table
+re-export. Use this version or newer to restore newly written manifests; older
+readers do not understand the added format metadata.
+
 ## Before you copy
 
 - Dynamic tables are skipped and reported; links are unsupported.

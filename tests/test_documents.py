@@ -339,7 +339,9 @@ def test_document_snapshot_reads_pinned_value_despite_source_changes():
 @pytest.mark.parametrize(
     "kind,expected",
     [
-        ("table", "e05331e37c1e18c482c29ce9452934e5903989b33d5021d46e2132d44130eeae"),
+        # Table fingerprints include their wire format and proxy compression;
+        # existing local-compression archives must be exported again.
+        ("table", "b52f91e16b8a520689854023548a67c18cdd41584a3b61539b6e5a07d3bc9230"),
         ("file", "20138b68b70da7961e8d28f80900d30f49914e15c679a0405746116d852bf4cf"),
         (
             "map_node",

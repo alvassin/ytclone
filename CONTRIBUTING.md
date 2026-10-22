@@ -82,14 +82,28 @@ production credentials are needed.
 
 Each run creates unique `//tmp/ytclone-main-*`, `//tmp/ytclone-raw-retry-*`, and
 `//tmp/ytclone-cli-*` paths, plus `main-smoke-*`, `raw-retry-*`, `cli-smoke-*`, and `cli-streams-*`
-prefixes in the local `yt-backup` bucket. Tests cover export and restore, repeated
+prefixes in the local `yt-backup` bucket. Format-switch tests also create
+`//tmp/ytclone-cli-settings-*` and `cli-settings-*`. Tests cover export and restore, repeated
 copies, changed metadata, empty nodes, file parts, corruption rollback, and
 table-read retries within a snapshot. Document tests also cover scalar, empty and
 attributed YSON, a value exceeding the default node-list limit, concurrent source
 changes, changed destinations, and corrupt-archive rollback. The CLI roundtrips
-cover six nodes using two real worker processes and a single table using
-`--concurrency 1 --max-streams 3`. Both restore the data and repeat the commands
-to verify unchanged objects are skipped.
+cover a seven-node tree and a 24 MiB table using
+`--concurrency 1 --max-streams 3` with both CLI commands and both
+`--table-format yson` and `--table-format skiff`. The tree includes strict and
+nonstrict schemas, complex typed values, undeclared columns, binary strings,
+unsigned integers, nulls and an empty table. Restores omit the format option;
+repeated commands must skip unchanged objects. Separate cases change the format
+and compression level and require a new generation, then verify repeated runs
+skip it.
+
+The large table exercises multiple archive parts and S3 multipart uploads.
+Tests read the stored objects, verify their checksums, and decode every complete
+Zstandard frame; table parts must retain multiple proxy frames. For Skiff they
+also compare the decompressed archive bytes with an independent YT read using
+the manifest's wire schema. This detects a format option that is accepted but
+not forwarded, even if export and restore would both ignore it. Adapter tests
+exercise source mutation, read retries and rollback for both table formats.
 
 The local S3 acceptance test also checks create-only publication, valid and stale
 ETag replacements, and competing writers with one winner against SeaweedFS. It

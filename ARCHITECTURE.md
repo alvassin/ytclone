@@ -29,7 +29,11 @@ digits. The node manifest declares that generation and references only its exact
 attributes and ordered part keys. Generation objects are immutable; only the
 node's `@manifest.json` is replaced when publishing an update.
 
-Tables use binary YSON row fragments compressed with Zstandard. Files use compressed
+Tables use binary YSON row fragments or Skiff streams compressed with Zstandard.
+The table manifest records the format and its complete wire schema; restore
+uses that recorded representation. Skiff data parts use `.skiff.zst` instead of
+`.yson.zst`. Its wire schema includes `$other_columns` as YSON to retain complex
+values and undeclared columns without projecting fields away. Files use compressed
 byte ranges (`.bin.zst`). Documents use exactly one binary YSON node compressed
 with Zstandard (`@data/part-000000.yson.zst`), including empty maps/lists and entity
 values. Their `data_size` is the serialized uncompressed byte count and `row_count`
@@ -49,8 +53,24 @@ replacing a directory with a table, file or document, or vice versa, is rejected
 The archive format identifier is `yt-s3-v2`; older formats are rejected by both
 export and restore. Re-export the source to a new archive prefix rather than
 updating an old archive in place. The restore completion attribute remains
-`yt_s3_state`, and fingerprints include the new format identifier. Only document
-manifests extend `encoding` with `documents: binary_yson_node`.
+`yt_s3_state`, and fingerprints include the new format identifier. Skiff manifests
+declare `encoding.tables: skiff`; document manifests extend `encoding` with
+`documents: binary_yson_node`. Existing v2 manifests without `table_format` retain
+their original binary YSON meaning.
+
+Table fingerprints also identify proxy passthrough, so tables exported with the
+previous local compressor are copied once after upgrading. New manifests require
+a reader that understands `table_format`; compatibility is new-reader/old-archive,
+not old-reader/new-archive.
+
+Every table export requests `z-zstd_<level>` from the YT HTTP proxy. The transport
+reader removes the block-codec envelope and retains the contained standard
+Zstandard frames. It validates framing, bounded block sizes, end-of-stream and
+late response errors before a generation can be published. There is no local
+table recompression or silent compression fallback. Files and documents still
+use the local compressor. The deprecated `--yt-zstd-passthrough` option does not
+change this behavior. The first supported format/codec matrix is YSON or Skiff
+with Zstandard; other formats and codecs are rejected.
 
 Documents are read through `/@value` under the same snapshot lock as their metadata.
 Node attributes are read separately through `/@`, so attributes on the YSON value
@@ -70,7 +90,8 @@ their own metadata.
 
 If this check cannot establish a match, the worker opens a snapshot and compares
 the full fingerprint: source cluster, node ID, content revision, a hash of the
-saved attributes (including schema), and archive encoding settings. A mismatch
+saved attributes (including schema), and archive encoding settings, including
+the selected table format and compression level. A mismatch
 requires copying. The manifest's revisions come from the snapshot actually copied.
 
 When source revision metadata needs refreshing but the full fingerprint is
@@ -177,8 +198,11 @@ Discover -> bounded queue -> compare metadata -> skip or copy -> complete node
   Discovery holds one directory listing per active tree level. Listings
   are limited to 1,000,000 immediate children; an incomplete listing fails
   explicitly. Restore remembers prepared directory paths and streams S3 listings.
-- Tables stream as binary YSON without client-side row parsing. The engine
-  retries failed table parts; file reads retain the SDK byte-offset retries.
+- Tables stream as binary YSON or Skiff without client-side row parsing or local
+  compression. The proxy's Zstandard frames pass through to S3 after transport
+  validation. The engine retries failed table parts; file reads retain the SDK
+  byte-offset retries. Restore sends the decompressed stream with the table's
+  recorded format to YT rather than converting rows in Python.
 
 ### Runtime: tasks and their clients
 
@@ -219,7 +243,8 @@ Dotted arrows show which clients a task uses.
   copies or skips that node, then takes the next path. It owns the snapshot
   transaction and publishes the manifest only after the snapshot succeeds.
 - A **`YtWorker`** is an async interface to one synchronous YT client.
-  `_Session.call()` runs blocking SDK calls and compression in its dedicated thread.
+  `_Session.call()` runs blocking SDK calls, transport reads, and local
+  file/document compression in its dedicated thread.
 - **`YtAdapter.worker()`** creates and closes this client/thread pair. Node tasks
   keep it across nodes; full checks and copies use separate node transactions, while
   revision-matched export skips need none. The SDK manages HTTP sessions
@@ -275,7 +300,7 @@ sequenceDiagram
             Note over W,S: Keep the previous manifest and generation available
             W->>P: Register lazy ranges and shared snapshot
             loop Concurrent ranges, up to the shared stream limit
-                P->>P: Read snapshot range, compress with zstd
+                P->>P: Read proxy-compressed snapshot range, unwrap zstd frames
                 P->>S: Upload generation part, record size and SHA-256
                 opt Temporary table-read failure
                     P->>S: Abort unfinished multipart upload
@@ -300,10 +325,11 @@ sequenceDiagram
 An archive part is one S3 object. S3 multipart upload chunks are buffers within
 that object. Parts are streamed through bounded buffers.
 
-`YtWorker.read_part()` opens one fresh stream and compressor using the supplied
-snapshot. Table reads use the
-SDK HTTP transport, preserving its framing and trailer error checks, without the
-SDK row parser. `copy_part()` retries only `RetryableReadError`, raised by the YT
+`YtWorker.read_part()` opens one fresh stream using the supplied snapshot.
+Table reads request the manifest's wire format and Zstandard from the proxy,
+preserving SDK framing and trailer error checks without its row parser or
+automatic content decompression. Files and documents create a local compressor.
+`copy_part()` retries only `RetryableReadError`, raised by the YT
 adapter for temporary table-read failures. S3 request retries stay in `S3Storage`;
 cancellation and permanent errors are not retried by `copy_part()`.
 

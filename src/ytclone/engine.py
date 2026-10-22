@@ -41,6 +41,7 @@ from .interfaces import (
 )
 from .progress import Progress
 from .restore_retry import retry as retry_restore
+from .table_format import table_format_name
 
 log = logging.getLogger(__name__)
 PART_READ_ATTEMPTS = 3
@@ -57,6 +58,8 @@ class CopyOptions:
     # S3 multipart buffer; does not split data into separate objects.
     chunk_size: int = 32 * MIB
     compression_level: int = 3
+    table_format: str = "yson"
+    compression: str = "zstd"
 
     def __post_init__(self):
         """Validate concurrency, buffer sizes and compression level."""
@@ -70,6 +73,10 @@ class CopyOptions:
             raise ValueError("Multipart buffer must be between 5 and 512 MiB")
         if not -7 <= self.compression_level <= 22:
             raise ValueError("Zstandard level must be between -7 and 22")
+        if self.table_format not in ("yson", "skiff"):
+            raise ValueError("Table format must be yson or skiff")
+        if self.compression != "zstd":
+            raise ValueError("Only Zstandard archive compression is supported")
 
     @property
     def stream_limit(self) -> int:
@@ -299,7 +306,7 @@ async def copy_part(
         giveup=lambda error: not isinstance(error, RetryableReadError),
     )
     async def transfer() -> ObjectRef:
-        """Open a fresh reader and compressor before each upload attempt."""
+        """Open a fresh encoded reader before each upload attempt."""
         nonlocal attempt
         attempt += 1
 
@@ -344,7 +351,12 @@ async def _export_parts(
             reader=reader,
             snapshot=snapshot,
             storage=storage,
-            key=data_key(prefix=target, kind=node.kind, index=part.index),
+            key=data_key(
+                prefix=target,
+                kind=node.kind,
+                index=part.index,
+                table_format=table_format_name(node.table_format),
+            ),
             part=part,
             compression_level=options.compression_level,
             chunk_size=options.chunk_size,
@@ -400,6 +412,7 @@ async def export_node(
                 cluster=cluster,
                 compression_level=options.compression_level,
                 part_size=options.part_size,
+                table_format=options.table_format,
             ):
                 complete = await _complete(storage=storage, manifest=old)
                 if complete:
@@ -419,11 +432,16 @@ async def export_node(
                 return "skipped", "dynamic"
             if node.kind not in KINDS:
                 raise ValueError(f"Unsupported YT node type: {node.kind}")
+            if node.kind == "table" and (
+                table_format_name(node.table_format) != options.table_format
+            ):
+                raise ValueError("YT snapshot format differs from the requested format")
             fingerprint = make_fingerprint(
                 node=node,
                 cluster=cluster,
                 compression_level=options.compression_level,
                 part_size=options.part_size,
+                table_format=options.table_format,
             )
             if old is not None and old.fingerprint == fingerprint:
                 if complete is None:
@@ -469,6 +487,7 @@ async def export_node(
             parts=tuple(parts),
             row_count=node.row_count,
             data_size=node.data_size,
+            table_format=node.table_format,
         )
         # Failed/uncertain publication keeps both generations. Our request may
         # already have committed and been superseded before we see its response.
@@ -606,6 +625,7 @@ async def restore_node(
         attributes=metadata,
         row_count=manifest.row_count,
         data_size=manifest.data_size,
+        table_format=manifest.table_format,
     )
     await _restore_data(
         yt=yt,

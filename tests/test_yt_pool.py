@@ -8,7 +8,7 @@ import threading
 
 import pytest
 import zstandard
-from test_yt import Client, Store, add_node, run
+from test_yt import Client, EncodedResponse, Store, add_node, fake_zstd_transport, run
 from yt import yson
 from yt.wrapper.config import get_command_param
 
@@ -78,9 +78,13 @@ def shared(monkeypatch):
 
     def make_request(**kwargs):
         assert kwargs["command_name"] == "read_table"
-        return kwargs["client"].read_response(params=kwargs["params"])
+        client = kwargs["client"]
+        return EncodedResponse(
+            client.read_response(params=kwargs["params"]), codec=client.transport_codec
+        )
 
     monkeypatch.setattr(yt_module, "make_request", make_request)
+    monkeypatch.setattr(yt_module, "_zstd_transport", fake_zstd_transport)
     return store, YtAdapter(proxy="test", client_factory=store.factory)
 
 

@@ -39,6 +39,9 @@ def test_defaults_match_engine_and_aiomisc():
     assert parsed.part_size_mib * MIB == defaults.part_size
     assert parsed.buffer_size_mib * MIB == defaults.chunk_size
     assert parsed.compression_level == defaults.compression_level
+    assert parsed.table_format == defaults.table_format == "yson"
+    assert parsed.compression == defaults.compression == "zstd"
+    assert parsed.yt_zstd_passthrough is False
     assert parsed.log_format == LogFormat.default()
     assert not parsed.no_proxy_discovery
 
@@ -86,21 +89,33 @@ def test_invalid_addresses_are_rejected(source, destination):
         cli.direction(source=source, destination=destination)
 
 
-@pytest.mark.parametrize("restore", [False, True])
+@pytest.mark.parametrize(
+    "restore,yt_zstd_passthrough", [(False, False), (False, True), (True, False)]
+)
 @pytest.mark.parametrize("failures", [0, 1])
 def test_run_wires_keyword_only_adapters_and_closes_session(
-    monkeypatch, caplog, restore, failures
+    monkeypatch, caplog, restore, yt_zstd_passthrough, failures
 ):
     """Log the memory budget before constructing transfer resources."""
     calls = {}
+    selected_format = "yson" if restore else "skiff"
     options = CopyOptions(
         concurrency=2,
         max_streams=0 if restore else 6,
         chunk_size=8 * MIB,
         compression_level=7,
+        table_format=selected_format,
     )
     parsed = arguments(
-        restore=restore, extra=("--no-proxy-discovery", "--endpoint", "http://s3.test/")
+        restore=restore,
+        extra=(
+            "--no-proxy-discovery",
+            "--endpoint",
+            "http://s3.test/",
+            "--table-format",
+            selected_format,
+            *(("--yt-zstd-passthrough",) if yt_zstd_passthrough else ()),
+        ),
     )
 
     class Session:
@@ -126,12 +141,12 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
         )
         return 512
 
-    def yt_adapter(*, proxy, proxy_discovery, progress):
+    def yt_adapter(*, proxy, proxy_discovery, progress, table_format):
         """Capture logs at the first resource-construction boundary."""
         calls["startup_logs"] = [
             record for record in caplog.records if record.name == cli.__name__
         ]
-        calls["yt"] = (proxy, proxy_discovery)
+        calls["yt"] = (proxy, proxy_discovery, table_format)
         return "yt-adapter"
 
     def s3_client(*, session, url, region):
@@ -191,9 +206,12 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
     expected_logs = [expected_start, expected_note]
     if not restore:
         expected_logs.append("export_parallelism max_streams=6")
+        expected_logs.append(
+            f"table_compression format={selected_format} mode=yt-zstd-passthrough level=7"
+        )
     assert [record.getMessage() for record in startup] == expected_logs
     assert all(record.levelno == logging.INFO for record in startup)
-    assert calls["yt"] == ("https://yt.example.test", False)
+    assert calls["yt"] == ("https://yt.example.test", False, selected_format)
     assert calls["s3"] == ("http://s3.test/bucket", "us-east-1")
     assert calls["storage"] == ("s3-client", 8 * MIB)
     assert calls["transfer"][:5] == (
@@ -217,6 +235,8 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
         ("--buffer-size-mib", "4"),
         ("--part-size-mib", "0"),
         ("--compression-level", "23"),
+        ("--compression", "gzip"),
+        ("--table-format", "arrow"),
         ("--progress-interval", "0"),
         ("--progress-interval", "nan"),
         ("--progress-interval", "inf"),
@@ -237,7 +257,11 @@ def test_main_rejects_invalid_options_before_starting_resources(monkeypatch, ext
     assert exc.value.code == 2
 
 
-def test_main_rejects_export_stream_setting_for_restore(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    "extra",
+    [("--max-streams", "4"), ("--yt-zstd-passthrough",), ("--table-format", "skiff")],
+)
+def test_main_rejects_export_settings_for_restore(monkeypatch, capsys, extra):
     """Reject an export-only setting instead of silently changing restore limits."""
     monkeypatch.setattr(
         cli.aiomisc,
@@ -253,8 +277,7 @@ def test_main_rejects_export_stream_setting_for_restore(monkeypatch, capsys):
             "//copy",
             "--yt-proxy",
             "test",
-            "--max-streams",
-            "4",
+            *extra,
         ],
     )
     with pytest.raises(SystemExit) as error:
@@ -310,6 +333,12 @@ def test_main_passes_aiomisc_logging_options_and_copy_settings(
             "5",
             "--max-streams",
             "7",
+            "--table-format",
+            "skiff",
+            "--compression",
+            "zstd",
+            "--compression-level",
+            "1",
             "--log-level",
             "debug",
             "--log-format",
@@ -319,6 +348,9 @@ def test_main_passes_aiomisc_logging_options_and_copy_settings(
     assert cli.main() == 1
     assert seen["options"].concurrency == 5
     assert seen["options"].max_streams == 7
+    assert seen["options"].table_format == "skiff"
+    assert seen["options"].compression == "zstd"
+    assert seen["options"].compression_level == 1
     assert seen["runtime"] == (6, "debug", effective_format, date_format)
 
 

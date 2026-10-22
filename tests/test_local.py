@@ -214,7 +214,8 @@ def test_local_allowed_subtree_without_ancestor_read_does_not_follow_links():
             client._cleanup()
 
 
-def test_local_round_trip_restart_changes_and_corruption():
+@pytest.mark.parametrize("table_format", ["yson", "skiff"])
+def test_local_round_trip_restart_changes_and_corruption(table_format):
     run_id = uuid.uuid4().hex[:12]
     root = "//tmp/ytclone-main-" + run_id
     source, target = root + "/source", root + "/restored"
@@ -289,6 +290,7 @@ def test_local_round_trip_restart_changes_and_corruption():
         queue_size=2,
         part_size=256 * 1024,
         chunk_size=5 * MIB,
+        table_format=table_format,
     )
 
     async def scenario():
@@ -296,6 +298,7 @@ def test_local_round_trip_restart_changes_and_corruption():
             proxy="http://localhost:8000",
             proxy_discovery=False,
             client_factory=local_client,
+            table_format=table_format,
         )
         async with aiohttp.ClientSession() as session:
             s3 = S3Client(
@@ -445,7 +448,10 @@ def retry_rows():
 
 
 @pytest.mark.parametrize("failure", ["once", "exhausted", "fatal", "lost_snapshot"])
-def test_local_raw_read_retries_preserve_snapshot(monkeypatch, retry_rows, failure):
+@pytest.mark.parametrize("table_format", ["yson", "skiff"])
+def test_local_raw_read_retries_preserve_snapshot(
+    monkeypatch, retry_rows, failure, table_format
+):
     """Repeat the failed range in one snapshot or leave the archive unpublished."""
     run_id = uuid.uuid4().hex[:12]
     root = "//tmp/ytclone-raw-retry-" + run_id
@@ -529,7 +535,12 @@ def test_local_raw_read_retries_preserve_snapshot(monkeypatch, retry_rows, failu
         return stream
 
     monkeypatch.setattr(yt_adapter, "make_request", interrupted_request)
-    options = CopyOptions(concurrency=1, part_size=8 * MIB, chunk_size=5 * MIB)
+    options = CopyOptions(
+        concurrency=1,
+        part_size=8 * MIB,
+        chunk_size=5 * MIB,
+        table_format=table_format,
+    )
 
     async def scenario():
         """Export through actual adapters and check publication, cleanup and restore."""
@@ -537,6 +548,7 @@ def test_local_raw_read_retries_preserve_snapshot(monkeypatch, retry_rows, failu
             proxy="http://localhost:8000",
             proxy_discovery=False,
             client_factory=traced_client,
+            table_format=table_format,
         )
         trace = aiohttp.TraceConfig()
 
