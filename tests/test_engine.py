@@ -13,6 +13,7 @@ import pytest
 
 from ytclone import engine
 from ytclone.engine import CopyOptions, export_node, export_tree, restore_tree
+from ytclone.exclusions import is_excluded
 from ytclone.export_pool import PartPool
 from ytclone.format import (
     DiscoveredNode,
@@ -193,8 +194,10 @@ class MemoryYt:
                     await self.cleanup_gate.wait()
                 raise OSError("producer cleanup failed")
 
-    async def walk(self, *, path):
+    async def walk(self, *, path, exclude=()):
         for source in self.nodes:
+            if is_excluded(path=source, excludes=exclude):
+                continue
             if source == path or source.startswith(path + "/"):
                 self.discovered.append(source)
                 if len(self.discovered) >= 2:
@@ -283,10 +286,10 @@ class MemoryYtWorker:
         assert not self.closed
         self.calls.append((method, path))
 
-    async def walk(self, *, path):
+    async def walk(self, *, path, exclude=()):
         """Traverse shared nodes through this backend."""
         self.record(method="walk", path=path)
-        async for child in self.owner.walk(path=path):
+        async for child in self.owner.walk(path=path, exclude=exclude):
             yield child
 
     @asynccontextmanager

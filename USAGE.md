@@ -26,6 +26,27 @@ The S3 backend must honor `If-Match` and `If-None-Match: *` on object PUTs and
 provide atomic object visibility with ETags. S3 API compatibility alone does not
 establish these guarantees; verify them for the service you use.
 
+## Excluding subtrees
+
+Use repeatable `--exclude PATH` with `ytclone` or `ytclone-parallel` when
+exporting YT to S3:
+
+```bash
+ytclone //home/analytics s3://my-bucket/export \
+  --exclude tmp --exclude //home/analytics/events/debug
+```
+
+Relative paths are resolved beneath the source; absolute YT paths must also be
+strictly beneath it. Each literal path excludes that node and all descendants;
+`tmp` does not exclude `tmp_old` or `events/tmp`. Trailing slashes are accepted.
+Wildcards, selectors, `.` and `..` components are not supported. Nonexistent
+exclusions have no effect. Excluded directories are not traversed or copied;
+individual files and tables can also be excluded.
+
+Existing copies in S3 are kept, so an older archived subtree can still be
+restored. Exclusions apply to export only. With exclusions, the ordinary CLI
+uses discovery progress instead of the unfiltered source-wide size estimate.
+
 ## Archive compatibility and updates
 
 Only the `yt-s3-v2` archive format is supported. Existing older archives are

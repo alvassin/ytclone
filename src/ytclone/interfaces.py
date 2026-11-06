@@ -59,7 +59,9 @@ class YtBackend(Protocol):
         """Estimate source nodes and disk usage without scanning the subtree."""
         ...
 
-    def walk(self, *, path: str) -> AsyncIterator[DiscoveredNode]:
+    def walk(
+        self, *, path: str, exclude: tuple[str, ...] = ()
+    ) -> AsyncIterator[DiscoveredNode]:
         """Yield source identities and change hints without following links."""
         ...
 

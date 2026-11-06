@@ -73,6 +73,27 @@ from the archive. Existing unencrypted v2 archives remain supported. See
 [encryption and manual recovery](USAGE.md#client-side-encryption) for the format,
 integrity checks, and password rotation limits.
 
+## Excluding subtrees
+
+Use repeatable `--exclude PATH` with `ytclone` or `ytclone-parallel` when
+exporting YT to S3:
+
+```bash
+ytclone //home/analytics s3://my-bucket/export \
+  --exclude tmp --exclude //home/analytics/events/debug
+```
+
+Relative paths are resolved beneath the source; absolute YT paths must also be
+strictly beneath it. Each literal path excludes that node and all descendants;
+`tmp` does not exclude `tmp_old` or `events/tmp`. Trailing slashes are accepted.
+Wildcards, selectors, `.` and `..` components are not supported. Nonexistent
+exclusions have no effect. Excluded directories are not traversed or copied;
+individual files and tables can also be excluded.
+
+Existing copies in S3 are kept, so an older archived subtree can still be
+restored. Exclusions apply to export only. With exclusions, the ordinary CLI
+uses discovery progress instead of the unfiltered source-wide size estimate.
+
 ## Repeated runs
 
 Rerun the command after an interruption or source update. Completed, unchanged

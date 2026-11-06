@@ -24,6 +24,7 @@ from yt.wrapper.http_helpers import _get_session, get_retriable_errors
 from yt.wrapper.ypath import escape_ypath_literal
 
 from .codec import AsyncReader
+from .exclusions import is_excluded, normalize_excludes
 from .format import (
     DOCUMENT_KIND,
     MIB,
@@ -1152,13 +1153,19 @@ class YtWorker(YtBackend):
             pinned="#" + node.node_id,
         )
 
-    async def walk(self, *, path: str) -> AsyncIterator[DiscoveredNode]:
+    async def walk(
+        self, *, path: str, exclude: tuple[str, ...] = ()
+    ) -> AsyncIterator[DiscoveredNode]:
         """Resolve the root once, then list directories by ID without following links."""
+        exclusions = normalize_excludes(source=path, paths=exclude)
         stack = [iter([await self.inspect_node(path=path)])]
         while stack:
             entry = next(stack[-1], None)
             if entry is None:
                 stack.pop()
+                continue
+            if is_excluded(path=entry.path, excludes=exclusions):
+                log.info("subtree_excluded path=%s", entry.path)
                 continue
             yield entry
             if entry.kind != "map_node":

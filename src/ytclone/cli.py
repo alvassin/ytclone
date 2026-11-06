@@ -17,6 +17,7 @@ from aiomisc.log import LogFormat
 
 from .encryption import ArchiveEncryption
 from .engine import CopyOptions, export_tree, restore_tree
+from .exclusions import normalize_excludes
 from .format import MIB, parse_s3_url, path_components
 from .logging import file_logging
 from .memory import estimate_memory_mib
@@ -34,6 +35,13 @@ class Arguments(argclass.Parser):
     )
     destination: str = argclass.Argument(
         "destination", help="Destination in the other storage"
+    )
+    exclude: list[str] = argclass.Argument(
+        action="append",
+        default=[],
+        type=str,
+        metavar="PATH",
+        help="Exclude a source subtree during export; relative or //absolute path; repeatable",
     )
     yt_proxy: str = argclass.Argument(env_var="YT_PROXY", required=True)
     no_proxy_discovery: bool = argclass.Argument(
@@ -212,7 +220,7 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
         )
         estimate_task = (
             asyncio.create_task(estimate_total(yt=yt, path=yt_path, progress=progress))
-            if export and progress is not None
+            if export and progress is not None and not options.exclude
             else None
         )
         try:
@@ -292,9 +300,12 @@ def main() -> int:
             or arguments.progress_interval <= 0
         ):
             raise ValueError("Progress interval must be positive and finite")
-        export, _, _, _ = direction(
+        export, source, _, _ = direction(
             source=arguments.source, destination=arguments.destination
         )
+        if not export and arguments.exclude:
+            raise ValueError("Exclusions apply to export only")
+        exclusions = normalize_excludes(source=source, paths=tuple(arguments.exclude))
         if not export and arguments.max_streams != 0:
             raise ValueError("Maximum streams applies to export only")
         if not export and arguments.yt_zstd_passthrough:
@@ -316,6 +327,7 @@ def main() -> int:
                 enabled=arguments.encrypt,
                 password_file=arguments.encryption_password_file,
             ),
+            exclude=exclusions,
         )
     except ValueError as exc:
         arguments.create_parser().error(str(exc))
