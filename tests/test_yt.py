@@ -903,6 +903,62 @@ def test_walk_no_follow_and_incomplete_listing(adapter, store):
     run(main())
 
 
+@pytest.mark.parametrize("parallel", [False, True], ids=["ordinary", "parallel"])
+@pytest.mark.parametrize("read_denied", [False, True], ids=["readable", "denied"])
+@pytest.mark.parametrize("excluded", [False, True], ids=["included", "excluded"])
+def test_discovery_excludes_children_before_reading_metadata(
+    adapter, store, monkeypatch, parallel, read_denied, excluded
+):
+    """Excluded children need no metadata; included children still require it."""
+    from ytclone.parallel.discovery import DiscoveryError, discover
+
+    add_node(store=store, name="healthy")
+    add_node(store=store, kind="map_node", name="restricted")
+    original = Client.list
+
+    def listing(self, **kwargs):
+        """Model Cypress returning a denied child's name without attributes."""
+        response = yson.loads(string=original(self, **kwargs), encoding=None)
+        for child in response:
+            if read_denied and yt_module._text(child) == "restricted":
+                child.attributes = {}
+        return yson.dumps(object=response, yson_format="binary")
+
+    monkeypatch.setattr(Client, "list", listing)
+    observed = []
+    exclusions = ("restricted",) if excluded else ()
+
+    async def emit(node):
+        observed.append(node.path)
+
+    async def main():
+        if parallel:
+            await discover(
+                yt=adapter,
+                source="//tmp",
+                exclude=exclusions,
+                concurrency=2,
+                emit=emit,
+            )
+        else:
+            async with adapter.worker() as worker:
+                async for node in worker.walk(path="//tmp", exclude=exclusions):
+                    await emit(node)
+
+    if read_denied and not excluded:
+        error = DiscoveryError if parallel else ValueError
+        message = "Failed to list" if parallel else "Discovery omitted node id or type"
+        with pytest.raises(error, match=message):
+            run(main())
+        assert observed == ["//tmp"]
+    else:
+        run(main())
+        expected = {"//tmp", "//tmp/healthy"}
+        if not excluded:
+            expected.add("//tmp/restricted")
+        assert set(observed) == expected
+
+
 @pytest.mark.parametrize("leaf_count", [1, 64])
 def test_walk_requests_scale_with_directories(adapter, store, monkeypatch, leaf_count):
     """Resolve the root once and list each directory once, regardless of leaves."""

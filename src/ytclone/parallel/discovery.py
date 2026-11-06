@@ -65,7 +65,7 @@ async def discover(
             node = await pending.get()
             try:
                 try:
-                    children = await worker.list_children(node=node)
+                    children = await worker.list_children(node=node, exclude=exclusions)
                 except Exception:
                     failed_directories += 1
                     log.exception("directory_discovery_failed path=%s", node.path)
