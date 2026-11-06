@@ -6,6 +6,7 @@ import contextlib
 import pytest
 from yt import yson
 
+from ytclone.exclusions import is_excluded
 from ytclone.format import DiscoveredNode
 from ytclone.parallel.discovery import DiscoveryError, discover
 from ytclone.yt import _discovered_node
@@ -33,7 +34,7 @@ class FakeWorker:
         self.adapter.inspected.append(path)
         return self.adapter.root
 
-    async def list_children(self, *, node):
+    async def list_children(self, *, node, exclude=()):
         """Yield control during each request to exercise actual scanner overlap."""
         assert not self.busy and not self.closed
         self.busy = True
@@ -48,7 +49,11 @@ class FakeWorker:
                 await self.adapter.release.wait()
             if node.path == self.adapter.fail_path:
                 raise ValueError("incomplete listing")
-            return self.adapter.tree[node.path]
+            return [
+                child
+                for child in self.adapter.tree[node.path]
+                if not is_excluded(path=child.path, excludes=exclude)
+            ]
         finally:
             self.busy = False
             self.adapter.active -= 1

@@ -24,6 +24,7 @@ from yt.wrapper.http_helpers import _get_session, get_retriable_errors
 from yt.wrapper.ypath import escape_ypath_literal
 
 from .codec import AsyncReader
+from .exclusions import is_excluded, normalize_excludes
 from .format import (
     DOCUMENT_KIND,
     MIB,
@@ -167,7 +168,9 @@ def _ensure_directory(*, client, path: str) -> str:
     return parent
 
 
-def _list_children(*, client, path: str, pinned: str) -> list[DiscoveredNode]:
+def _list_children(
+    *, client, path: str, pinned: str, exclude: tuple[str, ...] = ()
+) -> list[DiscoveredNode]:
     """List child identities and change hints in one non-following request."""
     data = client.list(
         path=pinned + "&",
@@ -188,6 +191,9 @@ def _list_children(*, client, path: str, pinned: str) -> list[DiscoveredNode]:
             raise ValueError(f"Directory contains unsupported special names: {path}")
         child_path = path + "/" + component
         path_components(child_path)
+        if is_excluded(path=child_path, excludes=exclude):
+            log.info("subtree_excluded path=%s", child_path)
+            continue
 
         children.append(
             _discovered_node(path=child_path, attrs=getattr(name, "attributes", {}))
@@ -1138,8 +1144,10 @@ class YtWorker(YtBackend):
 
         return await session.call(inspect)
 
-    async def list_children(self, *, node: DiscoveredNode) -> list[DiscoveredNode]:
-        """List the complete directory by its discovered ID, never through a link."""
+    async def list_children(
+        self, *, node: DiscoveredNode, exclude: tuple[str, ...] = ()
+    ) -> list[DiscoveredNode]:
+        """List by ID, filtering normalized absolute exclusions before metadata."""
         if node.kind != "map_node":
             raise ValueError(f"Expected a discovered directory: {node.path}")
 
@@ -1150,21 +1158,28 @@ class YtWorker(YtBackend):
             client=session.client,
             path=node.path,
             pinned="#" + node.node_id,
+            exclude=exclude,
         )
 
-    async def walk(self, *, path: str) -> AsyncIterator[DiscoveredNode]:
+    async def walk(
+        self, *, path: str, exclude: tuple[str, ...] = ()
+    ) -> AsyncIterator[DiscoveredNode]:
         """Resolve the root once, then list directories by ID without following links."""
+        exclusions = normalize_excludes(source=path, paths=exclude)
         stack = [iter([await self.inspect_node(path=path)])]
         while stack:
             entry = next(stack[-1], None)
             if entry is None:
                 stack.pop()
                 continue
+            if is_excluded(path=entry.path, excludes=exclusions):
+                log.info("subtree_excluded path=%s", entry.path)
+                continue
             yield entry
             if entry.kind != "map_node":
                 continue
 
-            children = await self.list_children(node=entry)
+            children = await self.list_children(node=entry, exclude=exclusions)
             if children:
                 stack.append(iter(children))
 

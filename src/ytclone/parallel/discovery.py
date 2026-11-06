@@ -4,6 +4,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 
+from ..exclusions import is_excluded, normalize_excludes
 from ..format import DiscoveredNode
 from ..yt import YtAdapter, YtWorker, path_components
 
@@ -25,11 +26,12 @@ async def discover(
     source: str,
     concurrency: int,
     emit: Callable[[DiscoveredNode], Awaitable[None]],
+    exclude: tuple[str, ...] = (),
 ) -> None:
     """Emit the source tree while independent directory listings run concurrently."""
     if type(concurrency) is not int or concurrency < 1:
         raise ValueError("Discovery concurrency must be a positive integer")
-    path_components(source)
+    exclusions = normalize_excludes(source=source, paths=exclude)
 
     # A bounded recursive queue can deadlock when every scanner is producing.
     # This frontier contains metadata only; clients and active RPCs stay bounded.
@@ -48,6 +50,9 @@ async def discover(
             raise ValueError(f"Discovery returned a duplicate path: {node.path}")
 
         seen.add(node.path)
+        if is_excluded(path=node.path, excludes=exclusions):
+            log.info("subtree_excluded path=%s", node.path)
+            return
         await emit(node)
         if node.kind == "map_node":
             pending.put_nowait(node)
@@ -60,7 +65,7 @@ async def discover(
             node = await pending.get()
             try:
                 try:
-                    children = await worker.list_children(node=node)
+                    children = await worker.list_children(node=node, exclude=exclusions)
                 except Exception:
                     failed_directories += 1
                     log.exception("directory_discovery_failed path=%s", node.path)

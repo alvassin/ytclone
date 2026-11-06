@@ -14,6 +14,7 @@ from aiomisc.log import LogFormat
 from ..cli import LOG_DATE_FORMAT, direction, load_encryption
 from ..cli import Arguments as CopyArguments
 from ..engine import CopyOptions
+from ..exclusions import normalize_excludes
 from ..format import MIB
 from ..logging import file_logging
 from ..memory import estimate_memory_mib
@@ -51,7 +52,7 @@ class Arguments(CopyArguments):
 
 def validate(arguments: Arguments) -> CopyOptions:
     """Reject invalid settings before starting clients or child processes."""
-    export, _, _, _ = direction(
+    export, source, _, _ = direction(
         source=arguments.source, destination=arguments.destination
     )
     if not export:
@@ -82,6 +83,7 @@ def validate(arguments: Arguments) -> CopyOptions:
             enabled=arguments.encrypt,
             password_file=arguments.encryption_password_file,
         ),
+        exclude=normalize_excludes(source=source, paths=tuple(arguments.exclude)),
     )
 
 
@@ -152,6 +154,7 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
             source=source,
             concurrency=arguments.discovery_concurrency,
             emit=emit,
+            exclude=options.exclude,
         )
 
     async with ProgressReporter(

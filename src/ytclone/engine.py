@@ -13,6 +13,7 @@ from aiochannel import Channel
 from yt import yson
 
 from .encryption import ENCRYPTED_MANIFEST_FORMAT, ArchiveEncryption, PlaintextDigest
+from .exclusions import normalize_excludes
 from .export_pool import PartPool
 from .format import (
     ATTRIBUTES_NAME,
@@ -67,6 +68,7 @@ class CopyOptions:
     table_format: str = "yson"
     compression: str = "zstd"
     encryption: ArchiveEncryption | None = field(default=None, repr=False)
+    exclude: tuple[str, ...] = ()
 
     def __post_init__(self):
         """Validate concurrency, buffer sizes and compression level."""
@@ -604,11 +606,12 @@ async def export_tree(
     progress: Progress | None = None,
 ) -> CopyResult:
     """Walk a YT subtree and copy its nodes to an S3 prefix."""
+    exclusions = normalize_excludes(source=source, paths=options.exclude)
     progress = progress if progress is not None else Progress()
 
     async def discover(*, channel: Channel[DiscoveredNode], yt: YtBackend):
         """Queue source identities and revisions from directory listings."""
-        async with aclosing(yt.walk(path=source)) as nodes:
+        async with aclosing(yt.walk(path=source, exclude=exclusions)) as nodes:
             async for node in nodes:
                 progress.discovered += 1
                 await channel.put(node)

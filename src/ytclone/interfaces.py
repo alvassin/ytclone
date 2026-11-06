@@ -51,15 +51,19 @@ class YtBackend(Protocol):
         """Resolve one node safely and read its lightweight metadata."""
         ...
 
-    async def list_children(self, *, node: DiscoveredNode) -> list[DiscoveredNode]:
-        """List a discovered directory by ID without following links."""
+    async def list_children(
+        self, *, node: DiscoveredNode, exclude: tuple[str, ...] = ()
+    ) -> list[DiscoveredNode]:
+        """List by ID, filtering normalized absolute exclusions before metadata."""
         ...
 
     async def estimate_source(self, *, path: str) -> SourceEstimate:
         """Estimate source nodes and disk usage without scanning the subtree."""
         ...
 
-    def walk(self, *, path: str) -> AsyncIterator[DiscoveredNode]:
+    def walk(
+        self, *, path: str, exclude: tuple[str, ...] = ()
+    ) -> AsyncIterator[DiscoveredNode]:
         """Yield source identities and change hints without following links."""
         ...
 
