@@ -92,10 +92,16 @@ cover a seven-node tree and a 24 MiB table using
 `--concurrency 1 --max-streams 3` with both CLI commands and both
 `--table-format yson` and `--table-format skiff`. The tree includes strict and
 nonstrict schemas, complex typed values, undeclared columns, binary strings,
-unsigned integers, nulls and an empty table. Restores omit the format option;
-repeated commands must skip unchanged objects. Separate cases change the format
+unsigned integers, narrow signed/unsigned integer boundaries (required and
+optional), nulls and an empty table. Restores omit the format option; repeated
+commands must skip unchanged objects. Separate cases change the format
 and compression level and require a new generation, then verify repeated runs
 skip it.
+
+A wide sparse integer fixture checks that the compact Skiff layout is at least
+ten times smaller than the previous fallback layout, restores both layouts,
+and verifies that unchanged completed archives remain reusable across upgrades.
+It uses unique `//tmp/ytclone-narrow-*` paths and `narrow-smoke-*` S3 prefixes.
 
 The large table exercises multiple archive parts and S3 multipart uploads.
 Tests read the stored objects, verify their checksums, and decode every complete

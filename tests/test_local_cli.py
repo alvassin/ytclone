@@ -499,6 +499,36 @@ def test_local_installed_export_and_cli_restore(
             b"structured": None,
         },
     ]
+    expected_rows.append(
+        {b"id": 3, b"payload": None, b"u": None, b"details": None, b"structured": None}
+    )
+    for unsigned in (False, True):
+        for bits in (8, 16, 32):
+            logical_type = f"{'u' if unsigned else ''}int{bits}"
+            minimum = 0 if unsigned else -(2 ** (bits - 1))
+            maximum = 2**bits - 1 if unsigned else 2 ** (bits - 1) - 1
+            required_name = logical_type + "_required"
+            optional_name = logical_type + "_optional"
+            schema.extend(
+                [
+                    {"name": required_name, "type_v3": logical_type},
+                    {
+                        "name": optional_name,
+                        "type_v3": {"type_name": "optional", "item": logical_type},
+                    },
+                ]
+            )
+            for row, required, optional in zip(
+                expected_rows, (minimum, maximum, 0), (minimum, None, maximum)
+            ):
+                row[required_name.encode()] = (
+                    yson.YsonUint64(required) if unsigned else required
+                )
+                row[optional_name.encode()] = (
+                    yson.YsonUint64(optional)
+                    if unsigned and optional is not None
+                    else optional
+                )
     payload = bytes(range(256)) * 8192
     client.create(
         type="map_node",

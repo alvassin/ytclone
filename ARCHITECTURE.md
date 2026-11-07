@@ -41,8 +41,14 @@ Tables use binary YSON row fragments or Skiff streams compressed with Zstandard.
 The table manifest records the format and its complete wire schema; restore
 uses that recorded representation. Skiff data parts use `.skiff.zst` instead of
 `.yson.zst`. Its wire schema includes `$other_columns` as YSON to retain complex
-values and undeclared columns without projecting fields away. Files use compressed
-byte ranges (`.bin.zst`). Documents use exactly one binary YSON node compressed
+values and undeclared columns without projecting fields away. Signed and unsigned
+8/16/32-bit integers use the corresponding 64-bit Skiff wire fields; the original
+table schema retains their logical width and nullability. Older archives with
+these columns in `$other_columns` remain restorable through their recorded schema;
+unchanged completed archives are reused after upgrading.
+
+Files use compressed byte ranges (`.bin.zst`). Documents use exactly one binary
+YSON node compressed
 with Zstandard (`@data/part-000000.yson.zst`), including empty maps/lists and entity
 values. Their `data_size` is the serialized uncompressed byte count and `row_count`
 is zero; `--part-size-mib` does not split documents. Parts decompress independently.

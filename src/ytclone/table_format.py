@@ -15,7 +15,13 @@ ROW_FORMAT = {
 TABLE_FORMATS = ("yson", "skiff")
 _OTHER_COLUMNS = "$other_columns"
 _SCALAR_TYPES = {
+    "int8": "int64",
+    "int16": "int64",
+    "int32": "int64",
     "int64": "int64",
+    "uint8": "uint64",
+    "uint16": "uint64",
+    "uint32": "uint64",
     "uint64": "uint64",
     "double": "double",
     "boolean": "boolean",

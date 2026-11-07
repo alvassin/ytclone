@@ -1132,8 +1132,8 @@ def test_source_access_is_independent_of_ancestor_read(
     """Read an allowed subtree without requesting access to its parent."""
     client = Client(store)
     parent = client.create(type="map_node", path="//home")
-    source = client.create(type="map_node", path="//home/games")
-    child = client.create(type="file", path="//home/games/file")
+    source = client.create(type="map_node", path="//home/example")
+    child = client.create(type="file", path="//home/example/file")
     denied = {parent} if source_readable else {parent, source}
     original_get = Client.get
     requested_ids = []
@@ -1153,10 +1153,10 @@ def test_source_access_is_independent_of_ancestor_read(
     async def main():
         async with adapter.worker() as worker:
             if operation == "walk":
-                nodes = [node async for node in worker.walk(path="//home/games")]
+                nodes = [node async for node in worker.walk(path="//home/example")]
                 assert [node.node_id for node in nodes] == [source, child]
             else:
-                async with worker.snapshot(path="//home/games") as snapshot:
+                async with worker.snapshot(path="//home/example") as snapshot:
                     assert snapshot.node.node_id == source
 
     if source_readable:
