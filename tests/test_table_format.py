@@ -42,9 +42,26 @@ def test_yson_options_preserve_existing_representation_and_are_not_shared():
 @pytest.mark.parametrize(
     "logical_type,wire_type",
     [
+        ("int8", "int64"),
+        ("int16", "int64"),
+        ("int32", "int64"),
         ("int64", "int64"),
+        ("uint8", "uint64"),
+        ("uint16", "uint64"),
+        ("uint32", "uint64"),
         ("uint64", "uint64"),
+        ("float", "double"),
         ("double", "double"),
+        ("json", "string32"),
+        ("uuid", "string32"),
+        ("date", "uint64"),
+        ("datetime", "uint64"),
+        ("timestamp", "uint64"),
+        ("interval", "int64"),
+        ("date32", "int64"),
+        ("datetime64", "int64"),
+        ("timestamp64", "int64"),
+        ("interval64", "int64"),
         ("bool", "boolean"),
         ("string", "string32"),
         ("utf8", "string32"),
@@ -52,13 +69,20 @@ def test_yson_options_preserve_existing_representation_and_are_not_shared():
     ],
 )
 @pytest.mark.parametrize("optional", [False, True])
-def test_type_v3_scalar_mapping_retains_nullable_boundary(
-    logical_type, wire_type, optional
+@pytest.mark.parametrize("schema_style", ["type", "type_v3"])
+def test_scalar_mapping_retains_nullable_boundary(
+    logical_type, wire_type, optional, schema_style
 ):
-    logical = logical_type.encode()
-    if optional:
-        logical = {b"type_name": b"optional", b"item": logical}
-    attrs = schema_attributes([{b"name": b"value", b"type_v3": logical}])
+    column = {b"name": b"value"}
+    if schema_style == "type_v3":
+        logical = logical_type.encode()
+        if optional:
+            logical = {b"type_name": b"optional", b"item": logical}
+        column[b"type_v3"] = logical
+    else:
+        legacy_type = {"bool": "boolean", "yson": "any"}.get(logical_type, logical_type)
+        column.update({b"type": legacy_type.encode(), b"required": not optional})
+    attrs = schema_attributes([column])
     field, other = skiff_fields(make_table_format("skiff", attrs))
     if optional:
         assert field == {
@@ -69,6 +93,55 @@ def test_type_v3_scalar_mapping_retains_nullable_boundary(
     else:
         assert field == {"name": "value", "wire_type": wire_type}
     assert other == {"name": "$other_columns", "wire_type": "yson32"}
+
+
+@pytest.mark.parametrize("bits", [8, 16, 32])
+@pytest.mark.parametrize("unsigned", [False, True])
+@pytest.mark.parametrize("optional", [False, True])
+@pytest.mark.parametrize("schema_style", ["type", "type_v3"])
+def test_narrow_integer_wire_layout_and_boundary_roundtrip(
+    bits, unsigned, optional, schema_style
+):
+    """Boundary values use fixed-width fields, without names in every row."""
+    logical_type = f"{'u' if unsigned else ''}int{bits}".encode()
+    column = {b"name": b"value"}
+    if schema_style == "type_v3":
+        column[b"type_v3"] = (
+            {b"type_name": b"optional", b"item": logical_type}
+            if optional
+            else logical_type
+        )
+    else:
+        column.update({b"type": logical_type, b"required": not optional})
+    spec = make_table_format("skiff", schema_attributes([column]))
+    # Exercise the JSON representation retained in an archive manifest.
+    codec = SkiffFormat(
+        attributes=validate_table_format(json.loads(json.dumps(spec)))["attributes"]
+    )
+    minimum = 0 if unsigned else -(2 ** (bits - 1))
+    maximum = 2**bits - 1 if unsigned else 2 ** (bits - 1) - 1
+    values = [minimum, 0, maximum]
+    if optional:
+        values.append(None)
+    rows = []
+    for value in values:
+        row = codec.get_schemas()[0].create_record()
+        row["value"] = value
+        rows.append(row)
+    stream = io.BytesIO()
+    codec.dump_rows(rows, stream)
+    # An independent wire description detects a lossless but bloated fallback.
+    expected = bytearray()
+    for value in values:
+        expected.extend(struct.pack("<H", 0))
+        if optional:
+            expected.extend(b"\x00" if value is None else b"\x01")
+        if value is not None:
+            expected.extend(struct.pack("<Q" if unsigned else "<q", value))
+        expected.extend(struct.pack("<I", 2) + b"{}")
+    assert stream.getvalue() == expected
+    decoded = list(codec.load_rows(io.BytesIO(stream.getvalue())))
+    assert [row["value"] for row in decoded] == values
 
 
 @pytest.mark.parametrize("strict", [False, True])
@@ -84,8 +157,8 @@ def test_type_v3_scalar_mapping_retains_nullable_boundary(
             b"item": {b"type_name": b"optional", b"item": b"int64"},
         },
         b"null",
-        b"uuid",
-        b"date",
+        b"void",
+        b"tz_timestamp",
         b"future_type",
     ],
 )

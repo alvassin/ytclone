@@ -12,14 +12,23 @@ import aiohttp
 import pytest
 import yt.wrapper as sdk
 from aiohttp_s3_client import S3Client
+from test_local_cli import add_scalar_boundaries, scalar_boundary_cases
 from yt import yson
 from yt.packages.requests.exceptions import ReadTimeout
 from yt.wrapper.http_helpers import _get_session
 
+import ytclone.table_format as table_formats
 import ytclone.yt as yt_adapter
 from ytclone.engine import CopyOptions, export_node, export_tree, restore_tree
 from ytclone.export_pool import PartPool
-from ytclone.format import MIB, RESTORE_MARKER, ROW_FORMAT, Manifest, node_prefix
+from ytclone.format import (
+    MIB,
+    RESTORE_MARKER,
+    ROW_FORMAT,
+    Manifest,
+    canonical_attributes,
+    node_prefix,
+)
 from ytclone.interfaces import PublicationConflict, RetryableReadError
 from ytclone.progress import Progress
 from ytclone.s3 import S3Storage
@@ -212,6 +221,123 @@ def test_local_allowed_subtree_without_ancestor_read_does_not_follow_links():
         finally:
             reader._cleanup()
             client._cleanup()
+
+
+def test_local_sparse_scalars_restore_old_and_compact_archives(monkeypatch):
+    """Restore both layouts and keep completed fallback archives reusable."""
+    run_id = uuid.uuid4().hex[:12]
+    root = "//tmp/ytclone-narrow-" + run_id
+    source = root + "/source"
+    prefix = "narrow-smoke-" + run_id
+    names = [f"optional_counter_with_long_column_name_{i:04d}" for i in range(1024)]
+    schema = [
+        {"name": name, "type_v3": {"type_name": "optional", "item": "uint32"}}
+        for name in names
+    ]
+    expected = []
+    for index in range(64):
+        row = {name.encode(): None for name in names}
+        row[names[0].encode()] = yson.YsonUint64(2**32 - 1)
+        row[names[-1].encode()] = yson.YsonUint64(index)
+        expected.append(row)
+    add_scalar_boundaries(schema, expected)
+    client = local_client()
+    client.create("table", source, recursive=True, attributes={"schema": schema})
+    client.write_table(
+        table=source,
+        input_stream=yson.dumps(
+            expected, yson_type="list_fragment", yson_format="binary"
+        ),
+        format=sdk.YsonFormat(attributes=ROW_FORMAT),
+        raw=True,
+    )
+    options = CopyOptions(table_format="skiff", compression_level=1)
+
+    async def scenario():
+        adapter = YtAdapter(
+            proxy="http://localhost:8000",
+            proxy_discovery=False,
+            client_factory=local_client,
+            table_format="skiff",
+        )
+        async with aiohttp.ClientSession() as session:
+            s3 = S3Client(
+                session=session,
+                url="http://localhost:8333/yt-backup",
+                access_key_id="local-bench",
+                secret_access_key="local-bench-secret",
+                region="us-east-1",
+            )
+            storage = S3Storage(client=s3, chunk_size=options.chunk_size)
+            export_kwargs = {
+                "yt": adapter,
+                "storage": storage,
+                "source": source,
+                "prefix": prefix,
+                "cluster": "local",
+                "options": options,
+            }
+            source_prefix = node_prefix(prefix=prefix, path=source)
+            # Reproduce a pre-fix archive; only its exporter uses the old mapping.
+            with monkeypatch.context() as legacy:
+                for logical_type, _, _ in scalar_boundary_cases():
+                    legacy.delitem(table_formats._SCALAR_TYPES, logical_type)
+                exported = await export_tree(**export_kwargs)
+            assert (exported.completed, exported.failed) == (1, 0)
+            old = Manifest.from_bytes(
+                await storage.read_bytes(key=source_prefix + "/@manifest.json")
+            )
+            assert old.table_format["attributes"]["table_skiff_schemas"][0][
+                "children"
+            ] == [{"name": "$other_columns", "wire_type": "yson32"}]
+            for layout in ("legacy", "compact"):
+                target = root + "/" + layout
+                restored = await restore_tree(
+                    yt=adapter,
+                    storage=storage,
+                    source_prefix=source_prefix,
+                    destination=target,
+                    options=CopyOptions(),
+                )
+                assert (restored.completed, restored.failed) == (1, 0)
+                assert canonical_attributes(rows(client=client, path=target)) == (
+                    canonical_attributes(expected)
+                )
+                assert canonical_attributes(client.get(target + "/@schema")) == (
+                    canonical_attributes(client.get(source + "/@schema"))
+                )
+                if layout == "legacy":
+                    # An upgrade must not reupload an unchanged completed table.
+                    reused = await export_tree(**export_kwargs)
+                    assert (reused.completed, reused.skipped, reused.failed) == (
+                        0,
+                        1,
+                        0,
+                    )
+                    export_kwargs["prefix"] = prefix + "-compact"
+                    source_prefix = node_prefix(
+                        prefix=export_kwargs["prefix"], path=source
+                    )
+                    exported = await export_tree(**export_kwargs)
+                    assert (exported.completed, exported.failed) == (1, 0)
+                    compact = Manifest.from_bytes(
+                        await storage.read_bytes(key=source_prefix + "/@manifest.json")
+                    )
+                    assert compact.generation != old.generation
+                    fields = compact.table_format["attributes"]["table_skiff_schemas"][
+                        0
+                    ]["children"]
+                    assert len(fields) == len(schema) + 1
+                    assert sum(p.object.size for p in compact.parts) < (
+                        sum(p.object.size for p in old.parts) / 10
+                    )
+            repeated = await export_tree(**export_kwargs)
+            assert (repeated.completed, repeated.skipped, repeated.failed) == (0, 1, 0)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        client._cleanup()
 
 
 @pytest.mark.parametrize("table_format", ["yson", "skiff"])

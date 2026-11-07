@@ -307,6 +307,90 @@ def assert_yson_equal(actual, expected):
     )
 
 
+def scalar_boundary_cases():
+    """Synthetic values for native Skiff fields, shared with archive compatibility tests."""
+    unsigned = yson.YsonUint64
+    cases = []
+    for is_unsigned in (False, True):
+        for bits in (8, 16, 32):
+            logical_type = f"{'u' if is_unsigned else ''}int{bits}"
+            minimum = 0 if is_unsigned else -(2 ** (bits - 1))
+            maximum = 2**bits - 1 if is_unsigned else 2 ** (bits - 1) - 1
+            values = [minimum, 0, maximum]
+            if is_unsigned:
+                values = [unsigned(value) for value in values]
+            cases.append((logical_type, "uint64" if is_unsigned else "int64", values))
+    cases.extend(
+        [
+            (
+                "float",
+                "double",
+                [
+                    -float.fromhex("0x1.fffffep127"),
+                    -float.fromhex("0x1p-126"),
+                    -float.fromhex("0x1p-149"),
+                    -0.0,
+                    0.0,
+                    float.fromhex("0x1p-149"),
+                    float.fromhex("0x1p-126"),
+                    1.25,
+                    float.fromhex("0x1.fffffep127"),
+                    float("inf"),
+                    float("-inf"),
+                    float("nan"),
+                ],
+            ),
+            (
+                "json",
+                "string32",
+                [b"null", b" [1, null, true, -2] ", '{"text":"Привет"}'.encode()],
+            ),
+            ("uuid", "string32", [bytes(16), bytes(range(16)), bytes([255]) * 16]),
+            ("date", "uint64", [unsigned(0), unsigned(49672)]),
+            ("datetime", "uint64", [unsigned(0), unsigned(49673 * 86400 - 1)]),
+            ("timestamp", "uint64", [unsigned(0), unsigned(49673 * 86400 * 10**6 - 1)]),
+            (
+                "interval",
+                "int64",
+                [-49673 * 86400 * 10**6 + 1, 0, 49673 * 86400 * 10**6 - 1],
+            ),
+            ("date32", "int64", [-53375809, 0, 53375807]),
+            ("datetime64", "int64", [-53375809 * 86400, 0, 53375808 * 86400 - 1]),
+            (
+                "timestamp64",
+                "int64",
+                [-53375809 * 86400 * 10**6, 0, 53375808 * 86400 * 10**6 - 1],
+            ),
+            ("interval64", "int64", [-9223339708800000000, 0, 9223339708800000000]),
+        ]
+    )
+    return cases
+
+
+def add_scalar_boundaries(schema, rows):
+    """Cover each value in required/optional columns, plus a distinct null row."""
+    assert len(rows) > max(len(values) for _, _, values in scalar_boundary_cases())
+    for logical_type, _, values in scalar_boundary_cases():
+        for optional in (False, True):
+            name = logical_type + ("_optional" if optional else "_required")
+            schema.append(
+                {
+                    "name": name,
+                    "type_v3": (
+                        {"type_name": "optional", "item": logical_type}
+                        if optional
+                        else logical_type
+                    ),
+                }
+            )
+            for index, row in enumerate(rows):
+                row[name.encode()] = (
+                    None
+                    if optional and index == 0
+                    else values[(index - int(optional)) % len(values)]
+                )
+
+
 @pytest.mark.parametrize("module", ["ytclone", "ytclone.parallel"])
 @pytest.mark.parametrize("table_format", ["yson", "skiff"])
 @pytest.mark.parametrize("encrypted", [False, True])
@@ -499,6 +583,18 @@ def test_local_installed_export_and_cli_restore(
             b"structured": None,
         },
     ]
+    row_count = max(len(values) for _, _, values in scalar_boundary_cases()) + 1
+    for index in range(len(expected_rows), row_count):
+        expected_rows.append(
+            {
+                b"id": index + 1,
+                b"payload": None,
+                b"u": None,
+                b"details": None,
+                b"structured": None,
+            }
+        )
+    add_scalar_boundaries(schema, expected_rows)
     payload = bytes(range(256)) * 8192
     client.create(
         type="map_node",
@@ -596,13 +692,35 @@ def test_local_installed_export_and_cli_restore(
             f"table_compression format={table_format} mode=yt-zstd-passthrough" in logs
         )
         if not repeated:
-            assert_table_archive(
+            table_manifest = assert_table_archive(
                 archive=archive,
                 source=source + "/table",
                 table_format=table_format,
                 client=client,
                 encryption=encryption,
             )
+            if table_format == "skiff":
+                fields = {
+                    field["name"]: field
+                    for field in table_manifest.table_format["attributes"][
+                        "table_skiff_schemas"
+                    ][0]["children"]
+                }
+                for logical_type, wire_type, _ in scalar_boundary_cases():
+                    required = logical_type + "_required"
+                    optional = logical_type + "_optional"
+                    assert fields[required] == {
+                        "name": required,
+                        "wire_type": wire_type,
+                    }
+                    assert fields[optional] == {
+                        "name": optional,
+                        "wire_type": "variant8",
+                        "children": [
+                            {"wire_type": "nothing"},
+                            {"wire_type": wire_type},
+                        ],
+                    }
             empty_manifest = assert_table_archive(
                 archive=archive,
                 source=source + "/empty_table",
