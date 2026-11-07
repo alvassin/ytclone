@@ -42,15 +42,18 @@ The table manifest records the format and its complete wire schema; restore
 uses that recorded representation. Skiff data parts use `.skiff.zst` instead of
 `.yson.zst`. Its wire schema includes `$other_columns` as YSON to retain complex
 values and undeclared columns without projecting fields away. Signed and unsigned
-8/16/32-bit integers use the corresponding 64-bit Skiff wire fields; the original
-table schema retains their logical width and nullability. Older archives with
-these columns in `$other_columns` remain restorable through their recorded schema;
+8/16/32-bit integers use the corresponding 64-bit Skiff wire fields. `float` uses
+`double`; `json` and binary `uuid` use `string32`. `date`, `datetime` and
+`timestamp` use `uint64`; `interval`, `date32`, `datetime64`, `timestamp64` and
+`interval64` use `int64`. The original table schema retains each logical type and
+its nullability. Decimal, compound, nested optional and timezone-aware types
+continue to use the YSON fallback. Older archives with these scalar columns in
+`$other_columns` remain restorable through their recorded schema;
 unchanged completed archives are reused after upgrading.
 
 Files use compressed byte ranges (`.bin.zst`). Documents use exactly one binary
-YSON node compressed
-with Zstandard (`@data/part-000000.yson.zst`), including empty maps/lists and entity
-values. Their `data_size` is the serialized uncompressed byte count and `row_count`
+YSON node compressed with Zstandard (`@data/part-000000.yson.zst`), including
+empty maps/lists and entity values. Their `data_size` is the serialized uncompressed byte count and `row_count`
 is zero; `--part-size-mib` does not split documents. Parts decompress independently.
 Directories and empty tables/files retain metadata without data parts. Node names are percent-encoded
 in S3 keys. Unicode, spaces and literal percent signs are supported. This version

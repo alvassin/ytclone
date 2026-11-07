@@ -12,6 +12,7 @@ import aiohttp
 import pytest
 import yt.wrapper as sdk
 from aiohttp_s3_client import S3Client
+from test_local_cli import add_scalar_boundaries, scalar_boundary_cases
 from yt import yson
 from yt.packages.requests.exceptions import ReadTimeout
 from yt.wrapper.http_helpers import _get_session
@@ -222,7 +223,7 @@ def test_local_allowed_subtree_without_ancestor_read_does_not_follow_links():
             client._cleanup()
 
 
-def test_local_sparse_narrow_integers_restore_old_and_compact_archives(monkeypatch):
+def test_local_sparse_scalars_restore_old_and_compact_archives(monkeypatch):
     """Restore both layouts and keep completed fallback archives reusable."""
     run_id = uuid.uuid4().hex[:12]
     root = "//tmp/ytclone-narrow-" + run_id
@@ -239,6 +240,7 @@ def test_local_sparse_narrow_integers_restore_old_and_compact_archives(monkeypat
         row[names[0].encode()] = yson.YsonUint64(2**32 - 1)
         row[names[-1].encode()] = yson.YsonUint64(index)
         expected.append(row)
+    add_scalar_boundaries(schema, expected)
     client = local_client()
     client.create("table", source, recursive=True, attributes={"schema": schema})
     client.write_table(
@@ -278,7 +280,8 @@ def test_local_sparse_narrow_integers_restore_old_and_compact_archives(monkeypat
             source_prefix = node_prefix(prefix=prefix, path=source)
             # Reproduce a pre-fix archive; only its exporter uses the old mapping.
             with monkeypatch.context() as legacy:
-                legacy.delitem(table_formats._SCALAR_TYPES, "uint32")
+                for logical_type, _, _ in scalar_boundary_cases():
+                    legacy.delitem(table_formats._SCALAR_TYPES, logical_type)
                 exported = await export_tree(**export_kwargs)
             assert (exported.completed, exported.failed) == (1, 0)
             old = Manifest.from_bytes(
@@ -324,7 +327,7 @@ def test_local_sparse_narrow_integers_restore_old_and_compact_archives(monkeypat
                     fields = compact.table_format["attributes"]["table_skiff_schemas"][
                         0
                     ]["children"]
-                    assert len(fields) == len(names) + 1
+                    assert len(fields) == len(schema) + 1
                     assert sum(p.object.size for p in compact.parts) < (
                         sum(p.object.size for p in old.parts) / 10
                     )

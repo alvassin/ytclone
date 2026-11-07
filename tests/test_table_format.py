@@ -50,7 +50,18 @@ def test_yson_options_preserve_existing_representation_and_are_not_shared():
         ("uint16", "uint64"),
         ("uint32", "uint64"),
         ("uint64", "uint64"),
+        ("float", "double"),
         ("double", "double"),
+        ("json", "string32"),
+        ("uuid", "string32"),
+        ("date", "uint64"),
+        ("datetime", "uint64"),
+        ("timestamp", "uint64"),
+        ("interval", "int64"),
+        ("date32", "int64"),
+        ("datetime64", "int64"),
+        ("timestamp64", "int64"),
+        ("interval64", "int64"),
         ("bool", "boolean"),
         ("string", "string32"),
         ("utf8", "string32"),
@@ -58,13 +69,20 @@ def test_yson_options_preserve_existing_representation_and_are_not_shared():
     ],
 )
 @pytest.mark.parametrize("optional", [False, True])
-def test_type_v3_scalar_mapping_retains_nullable_boundary(
-    logical_type, wire_type, optional
+@pytest.mark.parametrize("schema_style", ["type", "type_v3"])
+def test_scalar_mapping_retains_nullable_boundary(
+    logical_type, wire_type, optional, schema_style
 ):
-    logical = logical_type.encode()
-    if optional:
-        logical = {b"type_name": b"optional", b"item": logical}
-    attrs = schema_attributes([{b"name": b"value", b"type_v3": logical}])
+    column = {b"name": b"value"}
+    if schema_style == "type_v3":
+        logical = logical_type.encode()
+        if optional:
+            logical = {b"type_name": b"optional", b"item": logical}
+        column[b"type_v3"] = logical
+    else:
+        legacy_type = {"bool": "boolean", "yson": "any"}.get(logical_type, logical_type)
+        column.update({b"type": legacy_type.encode(), b"required": not optional})
+    attrs = schema_attributes([column])
     field, other = skiff_fields(make_table_format("skiff", attrs))
     if optional:
         assert field == {
@@ -139,8 +157,8 @@ def test_narrow_integer_wire_layout_and_boundary_roundtrip(
             b"item": {b"type_name": b"optional", b"item": b"int64"},
         },
         b"null",
-        b"uuid",
-        b"date",
+        b"void",
+        b"tz_timestamp",
         b"future_type",
     ],
 )
