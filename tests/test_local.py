@@ -12,7 +12,11 @@ import aiohttp
 import pytest
 import yt.wrapper as sdk
 from aiohttp_s3_client import S3Client
-from test_local_cli import add_scalar_boundaries, scalar_boundary_cases
+from test_local_cli import (
+    add_complex_boundaries,
+    add_scalar_boundaries,
+    scalar_boundary_cases,
+)
 from yt import yson
 from yt.packages.requests.exceptions import ReadTimeout
 from yt.wrapper.http_helpers import _get_session
@@ -223,7 +227,10 @@ def test_local_allowed_subtree_without_ancestor_read_does_not_follow_links():
             client._cleanup()
 
 
-def test_local_sparse_scalars_restore_old_and_compact_archives(monkeypatch):
+@pytest.mark.parametrize("include_complex", [False, True])
+def test_local_sparse_scalars_restore_old_and_compact_archives(
+    monkeypatch, include_complex
+):
     """Restore both layouts and keep completed fallback archives reusable."""
     run_id = uuid.uuid4().hex[:12]
     root = "//tmp/ytclone-narrow-" + run_id
@@ -241,6 +248,9 @@ def test_local_sparse_scalars_restore_old_and_compact_archives(monkeypatch):
         row[names[-1].encode()] = yson.YsonUint64(index)
         expected.append(row)
     add_scalar_boundaries(schema, expected)
+    fallback_names = (
+        add_complex_boundaries(schema, expected) if include_complex else set()
+    )
     client = local_client()
     client.create("table", source, recursive=True, attributes={"schema": schema})
     client.write_table(
@@ -327,10 +337,16 @@ def test_local_sparse_scalars_restore_old_and_compact_archives(monkeypatch):
                     fields = compact.table_format["attributes"]["table_skiff_schemas"][
                         0
                     ]["children"]
-                    assert len(fields) == len(schema) + 1
-                    assert sum(p.object.size for p in compact.parts) < (
-                        sum(p.object.size for p in old.parts) / 10
+                    assert len(fields) == len(schema) - len(fallback_names) + 1
+                    assert not fallback_names.intersection(
+                        field["name"] for field in fields
                     )
+                    if not include_complex:
+                        # Keep the original scalar-only size regression: complex
+                        # fields still use YSON and add unchanged archive bytes.
+                        assert sum(p.object.size for p in compact.parts) < (
+                            sum(p.object.size for p in old.parts) / 10
+                        )
             repeated = await export_tree(**export_kwargs)
             assert (repeated.completed, repeated.skipped, repeated.failed) == (0, 1, 0)
 

@@ -391,6 +391,323 @@ def add_scalar_boundaries(schema, rows):
                 )
 
 
+def complex_boundary_cases():
+    """Positional YSON cases that must survive alongside native Skiff fields."""
+    unsigned = yson.YsonUint64
+    optional_uint = {"type_name": "optional", "item": "uint32"}
+    nested_optional = {"type_name": "optional", "item": optional_uint}
+    optional_string = {"type_name": "optional", "item": "string"}
+    nested_strings = {
+        "type_name": "optional",
+        "item": {"type_name": "optional", "item": optional_string},
+    }
+    structure = {
+        "type_name": "struct",
+        "members": [
+            {"name": "label", "type": "string"},
+            {
+                "name": "event",
+                "type": {
+                    "type_name": "tuple",
+                    "elements": [{"type": "uuid"}, {"type": "date32"}],
+                },
+            },
+            {"name": "counts", "type": {"type_name": "list", "item": optional_uint}},
+        ],
+    }
+    structures = [
+        [b"", [bytes(16), 0], []],
+        [
+            b"\x00\xff",
+            [bytes([255]) * 16, -53375809],
+            [None, unsigned(0), unsigned(2**32 - 1)],
+        ],
+    ]
+    cases = []
+    for precision, scale, size in ((9, 2, 4), (18, 0, 8), (38, 18, 16), (76, 38, 32)):
+        limit = 10**precision - 1
+        sign_bit = 1 << (8 * size - 1)
+        # Decimal stores the scaled integer big-endian with its sign bit inverted.
+        # The final three integers encode -inf, +inf and NaN, respectively.
+        integers = [-limit, -1, 0, 1, limit, -sign_bit + 2, sign_bit - 2, sign_bit - 1]
+        cases.append(
+            (
+                f"decimal_{precision}_{scale}",
+                {"type_name": "decimal", "precision": precision, "scale": scale},
+                [(value + sign_bit).to_bytes(size, "big") for value in integers],
+            )
+        )
+    cases.extend(
+        [
+            (
+                "nested_optional",
+                nested_optional,
+                [None, [None], [unsigned(0)], [unsigned(2**32 - 1)]],
+            ),
+            (
+                "nested_strings",
+                nested_strings,
+                [None, [None], [[None]], [[b""]], [[b"\x00\xff"]]],
+            ),
+            (
+                "list_nullable_uuid",
+                {
+                    "type_name": "list",
+                    "item": {"type_name": "optional", "item": "uuid"},
+                },
+                [[], [None], [bytes(16), None, bytes([255]) * 16]],
+            ),
+            ("compound_struct", structure, structures),
+            (
+                "compound_tuple",
+                {
+                    "type_name": "tuple",
+                    "elements": [
+                        {"type": "uint64"},
+                        {"type": {"type_name": "optional", "item": "json"}},
+                        {"type": {"type_name": "list", "item": "float"}},
+                    ],
+                },
+                [
+                    [unsigned(2**64 - 1), None, []],
+                    [unsigned(0), b"null", [-0.0, 1.25]],
+                    [unsigned(42), b"[]", [float("inf"), float("-inf"), float("nan")]],
+                ],
+            ),
+            (
+                "tuple_variant",
+                {
+                    "type_name": "variant",
+                    "elements": [
+                        {"type": "uint16"},
+                        {"type": optional_string},
+                        {"type": {"type_name": "list", "item": "date"}},
+                    ],
+                },
+                [
+                    [0, unsigned(65535)],
+                    [1, None],
+                    [1, b""],
+                    [1, b"\x00\xff"],
+                    [2, []],
+                    [2, [unsigned(0), unsigned(49672)]],
+                ],
+            ),
+            (
+                "named_variant",
+                {
+                    "type_name": "variant",
+                    "members": [
+                        {"name": "json", "type": "json"},
+                        {
+                            "name": "uuid",
+                            "type": {"type_name": "optional", "item": "uuid"},
+                        },
+                        {"name": "record", "type": structure},
+                    ],
+                },
+                [[0, b"null"], [1, None], [1, bytes([255]) * 16], [2, structures[1]]],
+            ),
+            (
+                "string_dict",
+                {"type_name": "dict", "key": "string", "value": optional_uint},
+                [
+                    [],
+                    [[b"", unsigned(0)]],
+                    [
+                        [b"same", None],
+                        [b"same", unsigned(2**32 - 1)],
+                        [b"\x00\xff", unsigned(0)],
+                    ],
+                ],
+            ),
+            (
+                "integer_dict",
+                {
+                    "type_name": "dict",
+                    "key": "int16",
+                    "value": {"type_name": "list", "item": "datetime64"},
+                },
+                [
+                    [],
+                    [
+                        [-32768, []],
+                        [32767, [-1, 0, 53375808 * 86400 - 1]],
+                        [-32768, [1]],
+                    ],
+                ],
+            ),
+            (
+                "tagged_uuid",
+                {"type_name": "tagged", "tag": "opaque-id", "item": "uuid"},
+                [bytes(16), bytes(range(16)), bytes([255]) * 16],
+            ),
+            (
+                "tagged_struct",
+                {"type_name": "tagged", "tag": "event-record", "item": structure},
+                structures,
+            ),
+        ]
+    )
+    return cases
+
+
+def add_complex_boundaries(schema, rows):
+    """Exercise outer nulls separately from empty and nested-optional values."""
+    assert len(rows) > max(len(values) for _, _, values in complex_boundary_cases())
+    names = set()
+    for name, logical_type, values in complex_boundary_cases():
+        for optional in (False, True):
+            column = name + ("_optional" if optional else "")
+            names.add(column)
+            schema.append(
+                {
+                    "name": column,
+                    "type_v3": (
+                        {"type_name": "optional", "item": logical_type}
+                        if optional
+                        else logical_type
+                    ),
+                }
+            )
+            for index, row in enumerate(rows):
+                value = values[(index - int(optional)) % len(values)]
+                if optional and logical_type["type_name"] == "optional":
+                    value = [value]
+                row[column.encode()] = None if optional and index == 0 else value
+    return names
+
+
+@pytest.mark.parametrize("module", ["ytclone", "ytclone.parallel"])
+@pytest.mark.parametrize("table_format", ["yson", "skiff"])
+@pytest.mark.parametrize("encrypted", [False, True])
+@pytest.mark.parametrize("strict", [False, True])
+def test_local_mixed_scalar_and_complex_types_restore(
+    tmp_path, module, table_format, encrypted, strict
+):
+    run_id = uuid.uuid4().hex[:12]
+    root = "//tmp/ytclone-mixed-types-" + run_id
+    source, destination = root + "/source", root + "/restored"
+    archive = "s3://yt-backup/mixed-types-" + run_id
+    encryption_args, encryption = encryption_settings(tmp_path, encrypted)
+    row_count = (
+        max(
+            len(values)
+            for _, _, values in scalar_boundary_cases() + complex_boundary_cases()
+        )
+        + 1
+    )
+    expected = [{b"id": index} for index in range(row_count)]
+    schema = yson.to_yson_type(
+        [{"name": "id", "type_v3": "int64", "sort_order": "ascending"}],
+        attributes={"strict": strict, "unique_keys": True},
+    )
+    add_scalar_boundaries(schema, expected)
+    fallback_names = add_complex_boundaries(schema, expected)
+    if not strict:
+        for index, row in enumerate(expected):
+            row[b"undeclared"] = {
+                b"nested": [None, [], b"", b"\x00\xff", yson.YsonUint64(2**64 - 1)],
+                b"row": index,
+            }
+        fallback_names.add("undeclared")
+    client = sdk.YtClient(
+        proxy=YT_PROXY,
+        config={
+            "enable_token": False,
+            "proxy": {"enable_proxy_discovery": False, "retries": {"count": 1}},
+        },
+    )
+    try:
+        client.create("table", source, recursive=True, attributes={"schema": schema})
+        client.write_table(
+            table=source,
+            input_stream=yson.dumps(
+                expected, yson_type="list_fragment", yson_format="binary"
+            ),
+            format=sdk.YsonFormat(attributes=ROW_FORMAT),
+            raw=True,
+        )
+        # Verify the fixture itself before exercising either archive format.
+        with contextlib.closing(
+            client.read_table(
+                source, format=sdk.YsonFormat(attributes=ROW_FORMAT), raw=True
+            )
+        ) as stream:
+            assert_yson_equal(
+                list(
+                    yson.load(stream=stream, yson_type="list_fragment", encoding=None)
+                ),
+                expected,
+            )
+        output, _ = run_cli(
+            module=module,
+            source=source,
+            destination=archive,
+            directory=tmp_path,
+            name="export",
+            extra=(
+                *encryption_args,
+                "--table-format",
+                table_format,
+                *(("--processes", "2") if module == "ytclone.parallel" else ()),
+            ),
+        )
+        assert_summary(output=output, copied=1, unchanged=0)
+        manifest = assert_table_archive(
+            archive=archive,
+            source=source,
+            table_format=table_format,
+            client=client,
+            encryption=encryption,
+            multiple_frames=False,
+        )
+        if table_format == "skiff":
+            fields = manifest.table_format["attributes"]["table_skiff_schemas"][0][
+                "children"
+            ]
+            assert fields[-1] == {"name": "$other_columns", "wire_type": "yson32"}
+            dense = {field["name"] for field in fields[:-1]}
+            assert dense == {"id"} | {
+                logical_type + suffix
+                for logical_type, _, _ in scalar_boundary_cases()
+                for suffix in ("_required", "_optional")
+            }
+            assert dense.isdisjoint(fallback_names)
+        output, _ = run_cli(
+            module="ytclone",
+            source=archive + "/" + source.removeprefix("//"),
+            destination=destination,
+            directory=tmp_path,
+            name="restore",
+            extra=encryption_args,
+        )
+        assert_summary(output=output, copied=1, unchanged=0)
+        assert_yson_equal(
+            client.get(destination + "/@schema"), client.get(source + "/@schema")
+        )
+        with contextlib.closing(
+            client.read_table(
+                destination, format=sdk.YsonFormat(attributes=ROW_FORMAT), raw=True
+            )
+        ) as stream:
+            restored = list(
+                yson.load(stream=stream, yson_type="list_fragment", encoding=None)
+            )
+        assert len(restored) == len(expected)
+        for index, (actual, original) in enumerate(zip(restored, expected)):
+            assert actual.keys() == original.keys(), index
+            for column in original:
+                # Compare YSON bytes so None, [], [None], unsigned values, -0.0,
+                # duplicate dict keys and variant discriminators stay distinct.
+                try:
+                    assert_yson_equal(actual[column], original[column])
+                except AssertionError as error:
+                    raise AssertionError(f"Row {index}, column {column!r}") from error
+    finally:
+        client._cleanup()
+
+
 @pytest.mark.parametrize("module", ["ytclone", "ytclone.parallel"])
 @pytest.mark.parametrize("table_format", ["yson", "skiff"])
 @pytest.mark.parametrize("encrypted", [False, True])
