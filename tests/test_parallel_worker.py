@@ -607,6 +607,37 @@ def test_run_worker_builds_process_local_resources(monkeypatch, yt_zstd_passthro
     assert "yt_zstd_passthrough" not in seen["yt_options"]
 
 
+def test_portable_check_config_starts_real_worker(tmp_path):
+    """The portable smoke check must provide the current worker protocol fields."""
+    import runpy
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    portable = runpy.run_path(str(root / "scripts" / "check_portable.py"))
+    config = portable["worker_config"]()
+    payload = b"".join(
+        encode_message(message=message)
+        for message in ({"type": "config", "config": config}, {"type": "stop"})
+    )
+    result = subprocess.run(
+        args=[sys.executable, "-m", "ytclone.parallel.worker"],
+        input=payload,
+        capture_output=True,
+        timeout=portable["STARTUP_TIMEOUT"],
+        check=False,
+        cwd=tmp_path,
+        env={
+            **portable["environment"](tmp_path),
+            "PYTHONPATH": str(root / "src"),
+        },
+    )
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert portable["protocol"](result.stdout) == [{"type": "ready"}]
+    assert not result.stderr
+
+
 def test_entrypoint_stdout_contains_only_protocol(tmp_path):
     """Real subprocess pipes isolate logs and accidental prints from JSON output."""
     import os
