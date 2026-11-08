@@ -99,7 +99,8 @@ class Store:
 
     def factory(self, *, proxy, config):
         client = Client(self)
-        client.config = config
+        client.config = copy.deepcopy(config)
+        client.config["proxy"].setdefault("connect_timeout", 5000)
         self.clients.append(client)
         return client
 
@@ -402,7 +403,14 @@ def adapter(store, monkeypatch):
     """Connect the adapter to a raw request fake bound to its transaction."""
 
     def make_request(
-        *, command_name, params, return_content, use_heavy_proxy, allow_retries, client
+        *,
+        command_name,
+        params,
+        return_content,
+        use_heavy_proxy,
+        allow_retries,
+        timeout,
+        client,
     ):
         """Return raw row bytes from the active simulated snapshot."""
         assert command_name == "read_table"
@@ -2613,7 +2621,7 @@ def test_raw_table_request_preserves_snapshot_and_flags(monkeypatch):
 
     captured = {}
     response = object()
-    client = object()
+    client = SimpleNamespace(config={"proxy": {"connect_timeout": 2500}})
 
     def make_request(**kwargs):
         """Capture the low-level request without invoking SDK row parsing."""
@@ -2633,6 +2641,7 @@ def test_raw_table_request_preserves_snapshot_and_flags(monkeypatch):
     assert captured["return_content"] is False
     assert captured["use_heavy_proxy"] is True
     assert captured["allow_retries"] is False
+    assert captured["timeout"] == (2500, 180000)
     params = captured["params"]
     assert params["transaction_id"] == "external-snapshot"
     assert str(params["path"]) == "#node-id"

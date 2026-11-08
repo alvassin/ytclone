@@ -244,6 +244,8 @@ For example, export both `//home/analytics/events` and `//home/analytics` to
 | --- | --- | --- |
 | `--concurrency` | `4` | Concurrent node lifecycles; per process in parallel mode. |
 | `--max-streams` | `0` | Shared export stream count per process; `0` uses `--concurrency`. Export only; restore rejects nonzero values. |
+| `--yt-read-timeout` | `180` | Socket read timeout in seconds for exported tables; positive and finite. Does not limit the total range duration or change connect/metadata/write timeouts. |
+| `--yt-read-attempts` | `10` | Total attempts per exported table part, including the first; positive integer. |
 | `--queue-size` | `16` | Pending paths in ordinary mode; control messages per process in parallel mode. |
 | `--part-size-mib` | `256` | Target **uncompressed** bytes per archive object; approximate for tables. |
 | `--buffer-size-mib` | `32` | S3 multipart buffer per active stream, from 5 to 512 MiB. |
@@ -338,8 +340,15 @@ invocation.
 
 Temporary failures are retried automatically and logged:
 
-- **Table reads:** retry the failed archive part within the same snapshot, up to
-  three attempts. A lost snapshot fails the node.
+- **Table reads:** retry only the failed archive part within the same snapshot,
+  up to `--yt-read-attempts` attempts (default 10). `--yt-read-timeout` controls
+  idle socket waits (default 180 seconds), not the total transfer duration.
+  Retries use exponential backoff with jitter: 0.5–1 seconds initially, doubling
+  to a maximum of 30 seconds. Completed parts remain available within that export.
+  A lost snapshot or permanent source error fails the node without retrying it.
+  These export-only options do not change archive identity, so adjusting them
+  does not re-export unchanged completed nodes. They do not add progress recovery
+  for unfinished nodes after a process restart.
 - **S3 requests:** up to 30 attempts, with a 45-minute budget per retried request.
   Conditional publication conflicts stop that node rather than rebasing its
   snapshot onto a newer manifest. A lost publication acknowledgement is checked

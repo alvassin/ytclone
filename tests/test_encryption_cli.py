@@ -176,6 +176,8 @@ def test_worker_reloads_credentials_before_constructing_clients(monkeypatch):
         "part_size": 256 * 1024**2,
         "chunk_size": 32 * 1024**2,
         "compression_level": 3,
+        "yt_read_timeout": 180.0,
+        "yt_read_attempts": 10,
         "encrypt": True,
     }
 
@@ -244,6 +246,8 @@ def test_worker_loads_matching_password_off_loop_before_clients(monkeypatch):
         "part_size": 256 * 1024**2,
         "chunk_size": 32 * 1024**2,
         "compression_level": 3,
+        "yt_read_timeout": 180.0,
+        "yt_read_attempts": 10,
         "yt_proxy": "yt.invalid",
         "proxy_discovery": False,
         "encrypt": True,

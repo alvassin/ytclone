@@ -441,17 +441,20 @@ def test_failed_export_has_no_manifest_and_can_be_retried(failure):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("failures", [1, 9])
 @pytest.mark.parametrize("kind", ["table", "file"])
 def test_part_retry_restarts_only_failed_range_in_same_snapshot(
-    kind, monkeypatch, caplog
+    kind, failures, monkeypatch, caplog
 ):
     """Retry a partial read without redoing prior ranges or doubling progress."""
-    monkeypatch.setattr(engine, "PART_RETRY_PAUSE", 0)
+    monkeypatch.setattr(engine, "retry_delay", lambda **kwargs: 0)
 
     async def scenario():
-        """Fail the second range once, then publish one complete archive."""
+        """Recover the second range without repeating completed ranges."""
         yt, storage, events = setup(nodes=[make_node(kind=kind, disk_size=240)])
-        yt.read_failures[(SOURCE, 1)] = [RetryableReadError("connection reset")]
+        yt.read_failures[(SOURCE, 1)] = [
+            RetryableReadError("connection reset") for _ in range(failures)
+        ]
         progress = Progress()
         original_upload = storage.upload
         observations = []
@@ -468,12 +471,14 @@ def test_part_retry_restarts_only_failed_range_in_same_snapshot(
         result = await export(yt=yt, storage=storage, progress=progress)
 
         assert (result.completed, result.failed) == (1, 0)
-        assert yt.reads == [(SOURCE, index) for index in (0, 1, 1, 2)]
+        assert yt.reads == [(SOURCE, 0)] + [(SOURCE, 1)] * (failures + 1) + [
+            (SOURCE, 2)
+        ]
         assert yt.closed_reads == yt.reads
         assert events.count(("snapshot_enter", SOURCE)) == 1
         assert events.count(("snapshot_exit", SOURCE)) == 1
         assert observations == pytest.approx(
-            [(0, 0), (80, 1 / 3), (80, 1 / 3), (160, 2 / 3)]
+            [(0, 0)] + [(80, 1 / 3)] * (failures + 1) + [(160, 2 / 3)]
         )
         assert progress.source_copied_bytes == 240
         assert progress.source_partial_nodes == 0
@@ -503,28 +508,41 @@ def test_part_retry_restarts_only_failed_range_in_same_snapshot(
         for record in caplog.records
         if "part_read_failed" in record.getMessage()
     ]
-    assert len(retries) == 1
+    assert len(retries) == failures
     assert f"path={SOURCE}" in retries[0]
     assert "part=1" in retries[0]
-    assert "attempt=1/3" in retries[0]
+    assert "attempt=1/10" in retries[0]
     assert "connection reset" in retries[0]
 
 
-def test_part_retry_exhaustion_fails_without_manifest(monkeypatch):
-    """Three failed attempts leave prior objects but never a completed node."""
-    monkeypatch.setattr(engine, "PART_RETRY_PAUSE", 0)
+@pytest.mark.parametrize("attempts", [1, 4, 10])
+def test_part_retry_exhaustion_fails_without_manifest(monkeypatch, attempts):
+    """Exhausted attempts leave prior objects but never a completed node."""
+    delays = []
+
+    def delay(*, attempt):
+        delays.append(attempt)
+        return 0
+
+    monkeypatch.setattr(engine, "retry_delay", delay)
 
     async def scenario():
         """Exhaust the second part and roll back the first part's ETA credit."""
         yt, storage, events = setup(nodes=[make_node(disk_size=240)])
         yt.read_failures[(SOURCE, 1)] = [
-            RetryableReadError("connection reset") for _ in range(3)
+            RetryableReadError("connection reset") for _ in range(10)
         ]
         progress = Progress()
-        result = await export(yt=yt, storage=storage, progress=progress)
+        result = await export(
+            yt=yt,
+            storage=storage,
+            progress=progress,
+            copy_options=replace(options(), yt_read_attempts=attempts),
+        )
 
         assert (result.completed, result.failed) == (0, 1)
-        assert yt.reads == [(SOURCE, index) for index in (0, 1, 1, 1)]
+        assert yt.reads == [(SOURCE, 0)] + [(SOURCE, 1)] * attempts
+        assert delays == list(range(1, attempts))
         assert yt.closed_reads == yt.reads
         assert events.count(("snapshot_enter", SOURCE)) == 1
         assert events.count(("snapshot_exit", SOURCE)) == 1
@@ -544,7 +562,7 @@ def test_part_retry_exhaustion_fails_without_manifest(monkeypatch):
 @pytest.mark.parametrize("failure", ["permanent_read", "cancelled_read", "s3_timeout"])
 def test_part_copy_does_not_retry_unmarked_errors_or_cancellation(failure, monkeypatch):
     """Only explicitly retryable YT read failures can restart an entire part."""
-    monkeypatch.setattr(engine, "PART_RETRY_PAUSE", 0)
+    monkeypatch.setattr(engine, "retry_delay", lambda **kwargs: 0)
 
     async def scenario():
         """Propagate the original error and close the consumed source stream."""
@@ -1926,5 +1944,67 @@ def test_copy_rejects_link_replacing_source_after_discovery():
         assert ("snapshot_enter", SOURCE) in events
         assert yt.reads == [] and storage.objects == {}
         assert not any(action in {"put", "delete", "upload"} for action, _ in events)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("use_discovery", [False, True])
+def test_retry_settings_reuse_completed_archive(use_discovery):
+    """Changing runtime retry settings does not invalidate a published generation."""
+
+    async def scenario():
+        yt, storage, events = setup(nodes=[make_node(kind="table")])
+        old_options = replace(options(), yt_read_timeout=60, yt_read_attempts=3)
+        result = await export(yt=yt, storage=storage, copy_options=old_options)
+        assert result.completed == 1
+        old_objects = dict(storage.objects)
+        old_reads = list(yt.reads)
+        events.clear()
+        async with PartPool(yt=yt, concurrency=1) as pool:
+            result = await export_node(
+                pool=pool,
+                yt=yt,
+                storage=storage,
+                path=SOURCE,
+                prefix=PREFIX,
+                cluster="local-test",
+                options=options(),
+                discovered=discovered_node(yt.nodes[SOURCE]) if use_discovery else None,
+            )
+        assert result == ("skipped", "unchanged")
+        assert storage.objects == old_objects
+        assert yt.reads == old_reads
+        assert not any(event[0] in ("put", "upload", "delete") for event in events)
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_during_read_backoff_closes_snapshot(monkeypatch):
+    """Cancellation during the pause neither starts a new read nor publishes."""
+
+    async def scenario():
+        yt, storage, events = setup(nodes=[make_node(kind="table")])
+        yt.read_failures[(SOURCE, 1)] = [RetryableReadError("temporary stall")]
+        waiting = asyncio.Event()
+
+        def delay(*, attempt):
+            assert attempt == 1
+            assert yt.reads == yt.closed_reads
+            waiting.set()
+            return 3600
+
+        monkeypatch.setattr(engine, "retry_delay", delay)
+        task = asyncio.create_task(export(yt=yt, storage=storage))
+        try:
+            await asyncio.wait_for(waiting.wait(), timeout=2)
+            assert yt.active == 1
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=2)
+        assert yt.active == 0
+        assert yt.reads == yt.closed_reads == [(SOURCE, 0), (SOURCE, 1)]
+        assert manifest_key() not in storage.objects
+        assert events.count(("snapshot_exit", SOURCE)) == 1
 
     asyncio.run(scenario())

@@ -3,6 +3,7 @@
 import copy
 import io
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 from test_yt import Client, add_node, compressed, run
@@ -143,7 +144,7 @@ def test_raw_request_uses_the_complete_saved_skiff_schema(monkeypatch):
 
     monkeypatch.setattr(yt_module, "make_request", make_request)
     response = yt_module._read_table(
-        client=object(),
+        client=SimpleNamespace(config={"proxy": {"connect_timeout": 5000}}),
         pinned="#pinned",
         part=Range(index=0, start=3, stop=9),
         transaction_id="snapshot",

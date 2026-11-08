@@ -47,6 +47,7 @@ from .interfaces import (
     YtBackend,
     YtWorkerFactory,
 )
+from .read_retry import DEFAULT_TIMEOUT, validate_timeout
 from .table_format import make_table_format, validate_table_format
 from .yt_zstd import ZstdBlockReader, yt_zstd_codec
 
@@ -405,6 +406,7 @@ def _read_table(
     transaction_id: str,
     encoding: str | None = None,
     table_format: dict | None = None,
+    read_timeout: float = DEFAULT_TIMEOUT,
 ):
     """Open the selected raw format in the snapshot without SDK row parsing."""
     if not transaction_id or transaction_id == YT_NULL_TRANSACTION_ID:
@@ -436,6 +438,9 @@ def _read_table(
             return_content=False,
             use_heavy_proxy=True,
             allow_retries=False,
+            # SDK request timeouts are milliseconds. Preserve its connect limit
+            # and scope the longer idle read timeout to this table request only.
+            timeout=(client.config["proxy"]["connect_timeout"], read_timeout * 1000),
             client=client,
         )
 
@@ -660,6 +665,7 @@ class _PartReader:
                 transaction_id=self.snapshot.session.transaction.transaction_id,
                 encoding=encoding,
                 table_format=self.node.table_format,
+                read_timeout=self.session.adapter.read_timeout,
             )
         elif self.node.kind == "file":
             if self.session is not self.snapshot.session:
@@ -996,10 +1002,13 @@ class YtAdapter(YtWorkerFactory):
         proxy_discovery: bool = True,
         yt_zstd_passthrough: bool = False,
         table_format: str = "yson",
+        read_timeout: float = DEFAULT_TIMEOUT,
         client_factory=None,
         progress: "Progress | None" = None,
     ):
         """Configure persistent workers for one cluster."""
+        validate_timeout(read_timeout)
+        self.read_timeout = read_timeout
         self.proxy = proxy
         self.proxy_discovery = proxy_discovery
         # Retain the old keyword for callers; tables always use YT compression.

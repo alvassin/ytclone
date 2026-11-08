@@ -576,6 +576,8 @@ def test_run_worker_builds_process_local_resources(monkeypatch, yt_zstd_passthro
             "part_size": 256 * 1024**2,
             "chunk_size": 32 * 1024**2,
             "compression_level": 3,
+            "yt_read_timeout": 240.5,
+            "yt_read_attempts": 7,
             "table_format": "skiff",
             "compression": "zstd",
             "progress_interval": 7,
@@ -599,6 +601,9 @@ def test_run_worker_builds_process_local_resources(monkeypatch, yt_zstd_passthro
     assert seen["yt_options"]["table_format"] == "skiff"
     assert seen["serve"]["options"].table_format == "skiff"
     assert seen["serve"]["options"].compression == "zstd"
+    assert seen["yt_options"]["read_timeout"] == 240.5
+    assert seen["serve"]["options"].yt_read_timeout == 240.5
+    assert seen["serve"]["options"].yt_read_attempts == 7
     assert "yt_zstd_passthrough" not in seen["yt_options"]
 
 
@@ -647,6 +652,8 @@ raise SystemExit(worker.main())
         "part_size": 256 * 1024**2,
         "chunk_size": 32 * 1024**2,
         "compression_level": 3,
+        "yt_read_timeout": 240.5,
+        "yt_read_attempts": 7,
         "progress_interval": 100,
         "log_file": None,
         "log_level": "info",

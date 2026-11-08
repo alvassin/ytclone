@@ -322,7 +322,7 @@ sequenceDiagram
                 opt Temporary table-read failure
                     P->>S: Abort unfinished multipart upload
                     P->>P: Reopen the same range in the same snapshot
-                    Note over P,S: Retry the whole part, up to 3 attempts
+                    Note over P,S: Retry this part in the same snapshot, with backoff (default 10 attempts)
                 end
             end
             P-->>W: All ranges complete, results in range order
