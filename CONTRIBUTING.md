@@ -100,9 +100,22 @@ commands must skip unchanged objects. Separate cases change the format
 and compression level and require a new generation, then verify repeated runs
 skip it.
 
+The mixed-type CLI matrix puts scalar boundary cases beside decimal (4/8/16/32-byte
+representations), nested optionals, lists, structs, tuples, named/unnamed variants,
+string/integer-keyed dicts, and tagged scalar/compound values. It runs both commands
+and formats, encrypted/plain archives, and strict/nonstrict schemas. Cases distinguish
+outer nulls, nested nulls and empty values, preserve duplicate dict keys and their
+order, cover every variant branch, and include decimal limits, NaN and infinities.
+The fixture is read back before export; restored columns are compared as binary
+YSON and the full schema is compared with the source. Skiff manifests must contain
+native scalar fields plus the YSON fallback. These cases use unique
+`//tmp/ytclone-mixed-types-*` paths and `mixed-types-*` S3 prefixes.
+
 A wide sparse scalar fixture checks that the compact Skiff layout is at least
 ten times smaller than the previous fallback layout, restores both layouts,
 and verifies that unchanged completed archives remain reusable across upgrades.
+A separate mixed variant adds the same complex cases and restores both legacy
+and compact archives; the size threshold applies to the scalar-only fixture.
 It uses unique `//tmp/ytclone-narrow-*` paths and `narrow-smoke-*` S3 prefixes.
 
 The large table exercises multiple archive parts and S3 multipart uploads.
