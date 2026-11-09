@@ -47,12 +47,11 @@ from .interfaces import (
     YtWorkerFactory,
 )
 from .progress import Progress
+from .read_retry import DEFAULT_ATTEMPTS, DEFAULT_TIMEOUT, retry_delay, validate_timeout
 from .restore_retry import retry as retry_restore
 from .table_format import table_format_name
 
 log = logging.getLogger(__name__)
-PART_READ_ATTEMPTS = 3
-PART_RETRY_PAUSE = 1
 
 
 @dataclass(frozen=True)
@@ -69,9 +68,14 @@ class CopyOptions:
     compression: str = "zstd"
     encryption: ArchiveEncryption | None = field(default=None, repr=False)
     exclude: tuple[str, ...] = ()
+    yt_read_timeout: float = DEFAULT_TIMEOUT
+    yt_read_attempts: int = DEFAULT_ATTEMPTS
 
     def __post_init__(self):
-        """Validate concurrency, buffer sizes and compression level."""
+        """Validate concurrency, buffer sizes, compression and source retries."""
+        validate_timeout(self.yt_read_timeout)
+        if type(self.yt_read_attempts) is not int or self.yt_read_attempts < 1:
+            raise ValueError("YT read attempts must be a positive integer")
         if min(self.concurrency, self.queue_size, self.part_size) < 1:
             raise ValueError(
                 "Concurrency, queue and archive part size must be positive"
@@ -338,6 +342,7 @@ async def copy_part(
     compression_level: int,
     chunk_size: int,
     encryption: ArchiveEncryption | None = None,
+    read_attempts: int = DEFAULT_ATTEMPTS,
 ) -> ObjectRef:
     """Retry a complete part after temporary source failures in the same snapshot."""
     attempt = 0
@@ -345,8 +350,8 @@ async def copy_part(
     @aiomisc.asyncbackoff(
         attempt_timeout=None,
         deadline=None,
-        pause=PART_RETRY_PAUSE,
-        max_tries=PART_READ_ATTEMPTS,
+        pause=0,
+        max_tries=read_attempts,
         exceptions=(RetryableReadError,),
         # aiomisc also catches TimeoutError; S3 owns its request retries.
         giveup=lambda error: not isinstance(error, RetryableReadError),
@@ -354,6 +359,18 @@ async def copy_part(
     async def transfer() -> ObjectRef:
         """Open a fresh encoded reader before each upload attempt."""
         nonlocal attempt
+        if attempt:
+            delay = retry_delay(attempt=attempt)
+            log.warning(
+                "part_read_retry path=%s part=%d attempt=%d/%d delay=%.3fs",
+                snapshot.node.path,
+                part.index,
+                attempt + 1,
+                read_attempts,
+                delay,
+            )
+            await asyncio.sleep(delay=delay)
+
         attempt += 1
 
         try:
@@ -381,7 +398,7 @@ async def copy_part(
                 snapshot.node.path,
                 part.index,
                 attempt,
-                PART_READ_ATTEMPTS,
+                read_attempts,
                 error,
             )
             raise
@@ -417,6 +434,7 @@ async def _export_parts(
             compression_level=options.compression_level,
             chunk_size=options.chunk_size,
             encryption=options.encryption,
+            read_attempts=options.yt_read_attempts,
         )
         source_progress.advance(part=part)
         log.info(

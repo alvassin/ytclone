@@ -98,6 +98,8 @@ def worker_config() -> dict:
         "part_size": 1024**2,
         "chunk_size": 5 * 1024**2,
         "compression_level": 3,
+        "yt_read_timeout": 180.0,
+        "yt_read_attempts": 10,
         "progress_interval": 60,
         "log_file": None,
         "log_level": "info",

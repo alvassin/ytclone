@@ -39,6 +39,7 @@ class _HTTP:
     def __init__(self):
         self.replies = deque()
         self.requests = []
+        self.timeouts = []
         self.responses = []
         self.closed_responses = []
 
@@ -47,6 +48,7 @@ class _HTTP:
 
     def send(self, adapter, request, **kwargs):
         self.requests.append(request)
+        self.timeouts.append((urlsplit(request.url).path, kwargs["timeout"]))
         path = urlsplit(request.url).path
         if path == "/api/v4":
             body = json.dumps(
@@ -145,13 +147,14 @@ def http_sdk(monkeypatch):
         response.close()
 
 
-def _open(client):
+def _open(client, **kwargs):
     return _read_table(
         client=client,
         pinned="#a-b-c-d",
         part=Range(index=0, start=0, stop=2),
         transaction_id=TRANSACTION,
         encoding=CODEC,
+        **kwargs,
     )
 
 
@@ -371,3 +374,33 @@ def test_passthrough_rejects_rpc_before_any_request(http_sdk):
     with pytest.raises(ValueError, match="requires the HTTP backend"):
         _open(client)
     assert http.requests == []
+
+
+@pytest.mark.parametrize(
+    "settings,expected", [({}, 180.0), ({"read_timeout": 240.5}, 240.5)]
+)
+def test_read_timeout_changes_only_table_socket_wait(http_sdk, settings, expected):
+    """Preserve connect, metadata and other heavy-request timeouts in seconds."""
+    http, client = http_sdk
+    client.config["proxy"].update(
+        connect_timeout=1250, request_timeout=23000, heavy_request_timeout=67000
+    )
+    body, _ = _transport(b"payload")
+    http.enqueue(body, headers={"Content-Encoding": CODEC})
+    stream = _open(client, **settings)
+    try:
+        assert stream.read() == body
+    finally:
+        stream.close()
+    assert ("/api/v4/read_table", (1.25, expected)) in http.timeouts
+    assert client.config["proxy"]["heavy_request_timeout"] == 67000
+    for command, timeout in (("get", 23), ("read_file", 67)):
+        http.enqueue(b"ordinary")
+        make_request(
+            command_name=command,
+            params={"path": "//test"},
+            return_content=True,
+            allow_retries=False,
+            client=client,
+        )
+        assert http.timeouts[-1] == (f"/api/v4/{command}", (1.25, timeout))

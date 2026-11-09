@@ -23,6 +23,7 @@ from yt.wrapper.http_helpers import _get_session
 
 import ytclone.table_format as table_formats
 import ytclone.yt as yt_adapter
+from ytclone import engine
 from ytclone.engine import CopyOptions, export_node, export_tree, restore_tree
 from ytclone.export_pool import PartPool
 from ytclone.format import (
@@ -589,12 +590,17 @@ def retry_rows():
     ]
 
 
-@pytest.mark.parametrize("failure", ["once", "exhausted", "fatal", "lost_snapshot"])
+@pytest.mark.parametrize(
+    "failure", ["once", "repeated", "exhausted", "fatal", "lost_snapshot"]
+)
 @pytest.mark.parametrize("table_format", ["yson", "skiff"])
 def test_local_raw_read_retries_preserve_snapshot(
     monkeypatch, retry_rows, failure, table_format
 ):
     """Repeat the failed range in one snapshot or leave the archive unpublished."""
+    monkeypatch.setattr(engine, "retry_delay", lambda **kwargs: 0)
+    recoverable = failure in ("once", "repeated")
+    expected_failures = 4 if failure == "repeated" else 1
     run_id = uuid.uuid4().hex[:12]
     root = "//tmp/ytclone-raw-retry-" + run_id
     source, target = root + "/source", root + "/restored"
@@ -614,7 +620,7 @@ def test_local_raw_read_retries_preserve_snapshot(
     )
     client.write_table(table=source, input_stream=retry_rows)
 
-    commands, reads, streams, failures, s3_requests = [], [], [], [], []
+    commands, reads, streams, failures, s3_requests, timeouts = [], [], [], [], [], []
 
     def traced_client(*, proxy, config):
         """Record real HTTP commands from copier clients, excluding the writer."""
@@ -624,7 +630,10 @@ def test_local_raw_read_retries_preserve_snapshot(
 
         def traced_send(request, **kwargs):
             """Observe one HTTP attempt without recording headers or credentials."""
-            commands.append(request.url.rsplit("/", 1)[-1].split("?", 1)[0])
+            command = request.url.rsplit("/", 1)[-1].split("?", 1)[0]
+            commands.append(command)
+            if command == "read_table":
+                timeouts.append(kwargs["timeout"])
             return send(request=request, **kwargs)
 
         session.send = traced_send
@@ -638,7 +647,7 @@ def test_local_raw_read_retries_preserve_snapshot(
         stream = make_request(command_name=command_name, params=params, **kwargs)
         streams.append(stream)
         start = params["path"].attributes["ranges"][0]["lower_limit"]["row_index"]
-        if start == 0 or (failure == "once" and failures):
+        if start == 0 or (recoverable and len(failures) >= expected_failures):
             return stream
 
         original_read = stream.read
@@ -649,10 +658,13 @@ def test_local_raw_read_retries_preserve_snapshot(
             nonlocal delivered
             if delivered >= 6 * MIB:
                 failures.append(delivered)
-                if failure in ("once", "lost_snapshot"):
+                if (
+                    failure in ("once", "repeated", "lost_snapshot")
+                    and len(failures) == 1
+                ):
                     writer = local_client()
                     try:
-                        if failure == "once":
+                        if recoverable:
                             writer.write_table(
                                 table=source,
                                 input_stream=[
@@ -682,6 +694,8 @@ def test_local_raw_read_retries_preserve_snapshot(
         part_size=8 * MIB,
         chunk_size=5 * MIB,
         table_format=table_format,
+        yt_read_timeout=240.5,
+        yt_read_attempts=5 if failure == "repeated" else 3,
     )
 
     async def scenario():
@@ -691,6 +705,7 @@ def test_local_raw_read_retries_preserve_snapshot(
             proxy_discovery=False,
             client_factory=traced_client,
             table_format=table_format,
+            read_timeout=options.yt_read_timeout,
         )
         trace = aiohttp.TraceConfig()
 
@@ -724,7 +739,7 @@ def test_local_raw_read_retries_preserve_snapshot(
                     options=options,
                     progress=Progress(),
                 )
-                if failure == "once":
+                if recoverable:
                     assert await transfer == ("completed", "copied")
                 else:
                     expected_error = {
@@ -740,6 +755,7 @@ def test_local_raw_read_retries_preserve_snapshot(
             )
             assert commands.count("lock") == 1
             assert commands.count("read_table") == len(reads)
+            assert all(timeout[1] == 240.5 for timeout in timeouts)
             assert len({str(params["transaction_id"]) for params in reads}) == 1
             assert all(stream.closed for stream in streams)
             assert all(size >= 6 * MIB for size in failures)
@@ -757,7 +773,7 @@ def test_local_raw_read_retries_preserve_snapshot(
             else:
                 assert ranges[1] == ranges[2]
             manifest_data = await storage.read_bytes(key=manifest_key)
-            if failure != "once":
+            if not recoverable:
                 assert manifest_data is None
                 assert (
                     len(reads)
@@ -766,8 +782,8 @@ def test_local_raw_read_retries_preserve_snapshot(
                 return
 
             manifest = Manifest.from_bytes(manifest_data)
-            assert len(reads) == len(manifest.parts) + 1
-            assert len(failures) == 1
+            assert len(reads) == len(manifest.parts) + expected_failures
+            assert len(failures) == expected_failures
             restored = await restore_tree(
                 yt=yt,
                 storage=storage,

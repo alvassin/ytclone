@@ -84,6 +84,8 @@ def validate(arguments: Arguments) -> CopyOptions:
             password_file=arguments.encryption_password_file,
         ),
         exclude=normalize_excludes(source=source, paths=tuple(arguments.exclude)),
+        yt_read_timeout=arguments.yt_read_timeout,
+        yt_read_attempts=arguments.yt_read_attempts,
     )
 
 
@@ -115,6 +117,8 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
         "part_size": options.part_size,
         "chunk_size": options.chunk_size,
         "compression_level": options.compression_level,
+        "yt_read_timeout": options.yt_read_timeout,
+        "yt_read_attempts": options.yt_read_attempts,
         "log_level": arguments.log_level,
         "log_format": arguments.log_format,
         "log_file": arguments.log_file,
@@ -126,6 +130,11 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
         "table_compression format=%s mode=yt-zstd-passthrough level=%d",
         options.table_format,
         options.compression_level,
+    )
+    log.info(
+        "yt_read_policy timeout=%.3fs attempts=%d",
+        options.yt_read_timeout,
+        options.yt_read_attempts,
     )
     budget = arguments.processes * estimate_memory_mib(
         concurrency=options.stream_limit,

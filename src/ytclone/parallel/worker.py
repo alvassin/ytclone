@@ -208,6 +208,8 @@ async def run_worker(
         table_format=config.get("table_format", "yson"),
         compression=config.get("compression", "zstd"),
         encryption=encryption,
+        yt_read_timeout=config["yt_read_timeout"],
+        yt_read_attempts=config["yt_read_attempts"],
     )
     progress = Progress()
     yt = YtAdapter(
@@ -215,6 +217,7 @@ async def run_worker(
         proxy_discovery=config["proxy_discovery"],
         progress=progress,
         table_format=options.table_format,
+        read_timeout=options.yt_read_timeout,
     )
 
     async with aiohttp.ClientSession(

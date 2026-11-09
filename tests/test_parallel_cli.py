@@ -35,6 +35,12 @@ def arguments(*extra):
         ("--progress-interval", "nan"),
         ("--concurrency", "0"),
         ("--max-streams", "-1"),
+        ("--yt-read-timeout", "0"),
+        ("--yt-read-timeout", "-1"),
+        ("--yt-read-timeout", "nan"),
+        ("--yt-read-timeout", "inf"),
+        ("--yt-read-attempts", "0"),
+        ("--yt-read-attempts", "-1"),
     ],
 )
 def test_invalid_settings(flag, value):
@@ -100,6 +106,10 @@ def test_run_passes_nonsecret_config_and_reports_failure(
         "skiff",
         "--compression-level",
         "1",
+        "--yt-read-timeout",
+        "240.5",
+        "--yt-read-attempts",
+        "7",
         *(("--yt-zstd-passthrough",) if yt_zstd_passthrough else ()),
     )
     assert args.yt_zstd_passthrough is yt_zstd_passthrough
@@ -127,6 +137,8 @@ def test_run_passes_nonsecret_config_and_reports_failure(
     assert config["max_streams"] == 7
     assert config["table_format"] == "skiff"
     assert config["compression_level"] == 1
+    assert config["yt_read_timeout"] == 240.5
+    assert config["yt_read_attempts"] == 7
     assert config["compression"] == "zstd"
     assert "encryption_key_id" not in config
     assert "yt_zstd_passthrough" not in config

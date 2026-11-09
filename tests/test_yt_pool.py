@@ -25,7 +25,8 @@ class SharedStore(Store):
 
     def factory(self, *, proxy, config):
         client = SharedClient(self)
-        client.config = config
+        client.config = copy.deepcopy(config)
+        client.config["proxy"].setdefault("connect_timeout", 5000)
         self.clients.append(client)
         return client
 
@@ -484,3 +485,29 @@ def test_failed_poisoned_client_reset_is_a_worker_lifecycle_error(
             assert not snapshot.readers
 
     run(main())
+
+
+def test_custom_read_timeout_reaches_borrowed_snapshot_readers(shared, monkeypatch):
+    """Each data-worker request receives the timeout of its owning adapter."""
+    store, _ = shared
+    add_node(store=store)
+    adapter = YtAdapter(proxy="test", client_factory=store.factory, read_timeout=240.5)
+    original_request = yt_module.make_request
+    timeouts = []
+
+    def make_request(**kwargs):
+        timeouts.append(kwargs["timeout"])
+        return original_request(**kwargs)
+
+    monkeypatch.setattr(yt_module, "make_request", make_request)
+
+    async def scenario():
+        async with (
+            adapter.worker() as owner,
+            adapter.worker() as reader,
+            owner.snapshot(path="//tmp/source") as snapshot,
+        ):
+            assert await read_range(worker=reader, snapshot=snapshot)
+
+    run(scenario())
+    assert timeouts == [(5000, 240500)]

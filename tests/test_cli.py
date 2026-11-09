@@ -41,6 +41,8 @@ def test_defaults_match_engine_and_aiomisc():
     assert parsed.compression_level == defaults.compression_level
     assert parsed.table_format == defaults.table_format == "yson"
     assert parsed.compression == defaults.compression == "zstd"
+    assert parsed.yt_read_timeout == defaults.yt_read_timeout == 180.0
+    assert parsed.yt_read_attempts == defaults.yt_read_attempts == 10
     assert parsed.yt_zstd_passthrough is False
     assert parsed.log_format == LogFormat.default()
     assert not parsed.no_proxy_discovery
@@ -105,6 +107,8 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
         chunk_size=8 * MIB,
         compression_level=7,
         table_format=selected_format,
+        yt_read_timeout=240.5,
+        yt_read_attempts=7,
     )
     parsed = arguments(
         restore=restore,
@@ -141,12 +145,13 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
         )
         return 512
 
-    def yt_adapter(*, proxy, proxy_discovery, progress, table_format):
+    def yt_adapter(*, proxy, proxy_discovery, progress, table_format, read_timeout):
         """Capture logs at the first resource-construction boundary."""
         calls["startup_logs"] = [
             record for record in caplog.records if record.name == cli.__name__
         ]
         calls["yt"] = (proxy, proxy_discovery, table_format)
+        calls["yt_read_timeout"] = read_timeout
         return "yt-adapter"
 
     def s3_client(*, session, url, region):
@@ -209,9 +214,11 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
         expected_logs.append(
             f"table_compression format={selected_format} mode=yt-zstd-passthrough level=7"
         )
+        expected_logs.append("yt_read_policy timeout=240.500s attempts=7")
     assert [record.getMessage() for record in startup] == expected_logs
     assert all(record.levelno == logging.INFO for record in startup)
     assert calls["yt"] == ("https://yt.example.test", False, selected_format)
+    assert calls["yt_read_timeout"] == 240.5
     assert calls["s3"] == ("http://s3.test/bucket", "us-east-1")
     assert calls["storage"] == ("s3-client", 8 * MIB)
     assert calls["transfer"][:5] == (
@@ -240,6 +247,12 @@ def test_run_wires_keyword_only_adapters_and_closes_session(
         ("--progress-interval", "0"),
         ("--progress-interval", "nan"),
         ("--progress-interval", "inf"),
+        ("--yt-read-timeout", "0"),
+        ("--yt-read-timeout", "-1"),
+        ("--yt-read-timeout", "nan"),
+        ("--yt-read-timeout", "inf"),
+        ("--yt-read-attempts", "0"),
+        ("--yt-read-attempts", "-1"),
     ],
 )
 def test_main_rejects_invalid_options_before_starting_resources(monkeypatch, extra):
@@ -259,7 +272,13 @@ def test_main_rejects_invalid_options_before_starting_resources(monkeypatch, ext
 
 @pytest.mark.parametrize(
     "extra",
-    [("--max-streams", "4"), ("--yt-zstd-passthrough",), ("--table-format", "skiff")],
+    [
+        ("--max-streams", "4"),
+        ("--yt-zstd-passthrough",),
+        ("--table-format", "skiff"),
+        ("--yt-read-timeout", "60"),
+        ("--yt-read-attempts", "3"),
+    ],
 )
 def test_main_rejects_export_settings_for_restore(monkeypatch, capsys, extra):
     """Reject an export-only setting instead of silently changing restore limits."""
@@ -339,6 +358,10 @@ def test_main_passes_aiomisc_logging_options_and_copy_settings(
             "zstd",
             "--compression-level",
             "1",
+            "--yt-read-timeout",
+            "240.5",
+            "--yt-read-attempts",
+            "7",
             "--log-level",
             "debug",
             "--log-format",
@@ -351,6 +374,8 @@ def test_main_passes_aiomisc_logging_options_and_copy_settings(
     assert seen["options"].table_format == "skiff"
     assert seen["options"].compression == "zstd"
     assert seen["options"].compression_level == 1
+    assert seen["options"].yt_read_timeout == 240.5
+    assert seen["options"].yt_read_attempts == 7
     assert seen["runtime"] == (6, "debug", effective_format, date_format)
 
 

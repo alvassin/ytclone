@@ -576,6 +576,8 @@ def test_run_worker_builds_process_local_resources(monkeypatch, yt_zstd_passthro
             "part_size": 256 * 1024**2,
             "chunk_size": 32 * 1024**2,
             "compression_level": 3,
+            "yt_read_timeout": 240.5,
+            "yt_read_attempts": 7,
             "table_format": "skiff",
             "compression": "zstd",
             "progress_interval": 7,
@@ -599,7 +601,41 @@ def test_run_worker_builds_process_local_resources(monkeypatch, yt_zstd_passthro
     assert seen["yt_options"]["table_format"] == "skiff"
     assert seen["serve"]["options"].table_format == "skiff"
     assert seen["serve"]["options"].compression == "zstd"
+    assert seen["yt_options"]["read_timeout"] == 240.5
+    assert seen["serve"]["options"].yt_read_timeout == 240.5
+    assert seen["serve"]["options"].yt_read_attempts == 7
     assert "yt_zstd_passthrough" not in seen["yt_options"]
+
+
+def test_portable_check_config_starts_real_worker(tmp_path):
+    """The portable smoke check must provide the current worker protocol fields."""
+    import runpy
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    portable = runpy.run_path(str(root / "scripts" / "check_portable.py"))
+    config = portable["worker_config"]()
+    payload = b"".join(
+        encode_message(message=message)
+        for message in ({"type": "config", "config": config}, {"type": "stop"})
+    )
+    result = subprocess.run(
+        args=[sys.executable, "-m", "ytclone.parallel.worker"],
+        input=payload,
+        capture_output=True,
+        timeout=portable["STARTUP_TIMEOUT"],
+        check=False,
+        cwd=tmp_path,
+        env={
+            **portable["environment"](tmp_path),
+            "PYTHONPATH": str(root / "src"),
+        },
+    )
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert portable["protocol"](result.stdout) == [{"type": "ready"}]
+    assert not result.stderr
 
 
 def test_entrypoint_stdout_contains_only_protocol(tmp_path):
@@ -647,6 +683,8 @@ raise SystemExit(worker.main())
         "part_size": 256 * 1024**2,
         "chunk_size": 32 * 1024**2,
         "compression_level": 3,
+        "yt_read_timeout": 240.5,
+        "yt_read_attempts": 7,
         "progress_interval": 100,
         "log_file": None,
         "log_level": "info",

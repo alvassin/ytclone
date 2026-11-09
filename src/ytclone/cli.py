@@ -22,6 +22,7 @@ from .format import MIB, parse_s3_url, path_components
 from .logging import file_logging
 from .memory import estimate_memory_mib
 from .progress import Progress, ProgressReporter
+from .read_retry import DEFAULT_ATTEMPTS, DEFAULT_TIMEOUT
 from .s3 import S3Storage
 from .yt import YtAdapter
 
@@ -46,6 +47,14 @@ class Arguments(argclass.Parser):
     yt_proxy: str = argclass.Argument(env_var="YT_PROXY", required=True)
     no_proxy_discovery: bool = argclass.Argument(
         default=False, help="Use only the supplied YT proxy (for local Docker)"
+    )
+    yt_read_timeout: float = argclass.Argument(
+        default=DEFAULT_TIMEOUT,
+        help="Export table socket read timeout in seconds; not a whole-part deadline",
+    )
+    yt_read_attempts: int = argclass.Argument(
+        default=DEFAULT_ATTEMPTS,
+        help="Maximum attempts per exported table part, including the first",
     )
     endpoint: str = argclass.Argument(
         env_var="S3_ENDPOINT", default="https://s3.amazonaws.com"
@@ -190,6 +199,11 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
             options.table_format,
             options.compression_level,
         )
+        log.info(
+            "yt_read_policy timeout=%.3fs attempts=%d",
+            options.yt_read_timeout,
+            options.yt_read_attempts,
+        )
 
     progress = Progress() if arguments.log_file else None
     if progress is not None:
@@ -217,6 +231,7 @@ async def run(*, arguments: Arguments, options: CopyOptions) -> int:
             proxy_discovery=not arguments.no_proxy_discovery,
             progress=progress,
             table_format=options.table_format,
+            read_timeout=options.yt_read_timeout,
         )
         estimate_task = (
             asyncio.create_task(estimate_total(yt=yt, path=yt_path, progress=progress))
@@ -314,6 +329,11 @@ def main() -> int:
             raise ValueError(
                 "Table format applies to export only; restore uses the manifest"
             )
+        if not export and (
+            arguments.yt_read_timeout != DEFAULT_TIMEOUT
+            or arguments.yt_read_attempts != DEFAULT_ATTEMPTS
+        ):
+            raise ValueError("YT read settings apply to export only")
         options = CopyOptions(
             concurrency=arguments.concurrency,
             max_streams=arguments.max_streams,
@@ -328,6 +348,8 @@ def main() -> int:
                 password_file=arguments.encryption_password_file,
             ),
             exclude=exclusions,
+            yt_read_timeout=arguments.yt_read_timeout,
+            yt_read_attempts=arguments.yt_read_attempts,
         )
     except ValueError as exc:
         arguments.create_parser().error(str(exc))

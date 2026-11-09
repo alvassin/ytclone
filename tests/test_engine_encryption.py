@@ -445,7 +445,7 @@ def test_attribute_plaintext_checksum_is_checked_before_parsing_or_restore(encry
 
 
 def test_retry_restarts_encryption_for_only_failed_range(encryption, monkeypatch):
-    monkeypatch.setattr(engine, "PART_RETRY_PAUSE", 0)
+    monkeypatch.setattr(engine, "retry_delay", lambda **kwargs: 0)
 
     async def scenario():
         yt, storage, events = memory_archive()
@@ -472,7 +472,7 @@ def test_retry_restarts_encryption_for_only_failed_range(encryption, monkeypatch
 def test_failed_encrypted_reexport_preserves_previous_generation(
     encryption, monkeypatch
 ):
-    monkeypatch.setattr(engine, "PART_RETRY_PAUSE", 0)
+    monkeypatch.setattr(engine, "retry_delay", lambda **kwargs: 0)
 
     async def scenario():
         yt, storage, _ = memory_archive()
@@ -481,7 +481,7 @@ def test_failed_encrypted_reexport_preserves_previous_generation(
         before = dict(storage.objects)
         yt.nodes[SOURCE] = replace(yt.nodes[SOURCE], content_revision=2)
         yt.read_failures[(SOURCE, 1)] = [
-            RetryableReadError("read interrupted") for _ in range(3)
+            RetryableReadError("read interrupted") for _ in range(10)
         ]
         result = await export(yt=yt, storage=storage, copy_options=selected)
         assert (result.completed, result.failed) == (0, 1)
